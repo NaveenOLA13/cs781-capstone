@@ -1,0 +1,8 @@
+*.bin
+*.pt
+data/
+runs/
+tok/
+__pycache__/
+.ipynb_checkpoints/
+*.zip
