@@ -71,6 +71,8 @@ def generate_batch(model, prompts_ids, eos_id, max_seq_len, a, tok, device):
         ctx = x[:, -max_seq_len:]
         with amp:
             logits = model(ctx)[:, -1, :]
+        if a.ban_eos:                                      # we always want 128 words -> never stop early
+            logits[:, eos_id] = float("-inf")
         nxt = sample_next(logits, ctx, a)
         nxt = torch.where(done, torch.full_like(nxt, eos_id), nxt)
         done |= nxt == eos_id
@@ -91,12 +93,13 @@ def main():
     ap.add_argument("--test", default=TEST_HF)
     ap.add_argument("--out", required=True)
     ap.add_argument("--words", type=int, default=128)
-    ap.add_argument("--max_new_tokens", type=int, default=200)
+    ap.add_argument("--max_new_tokens", type=int, default=256)
     ap.add_argument("--batch_size", type=int, default=24)
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top_k", type=int, default=0)
     ap.add_argument("--top_p", type=float, default=0.9)
     ap.add_argument("--repetition_penalty", type=float, default=1.1)
+    ap.add_argument("--ban_eos", type=int, default=1, help="1 = never emit <eos> (always reach 128 words)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0, help="only first N prompts (quick test)")
     a = ap.parse_args()
