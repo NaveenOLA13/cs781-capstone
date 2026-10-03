@@ -1,0 +1,43 @@
+# Architecture 1: decoder-only Transformer (my A3 Q1 code), ~80M params with 12k vocab.
+# Values below are standard GPT-style STARTING points -- adjust them as your own experiments.
+run_name: decoder_80m_v1
+arch: decoder
+out_dir: runs
+
+model:                       # passed straight into models/decoder.py::LMConfig
+  d_model: 768
+  n_layers: 10
+  n_heads: 12
+  n_kv_heads: 12             # unused by the Q1 MHA code (kept for config compatibility)
+  d_ff: 3072
+  max_seq_len: 1024
+  dropout: 0.0               # single pass over data -> overfitting unlikely
+  pos_emb_type: sinusoidal
+  norm_first: true           # pre-norm: more stable for deeper models than post-norm
+
+data:
+  dir: /kaggle/input/cs781-prep/data_v1      # <-- change to where your prep output is attached
+  block_size: 1024
+  weights:                   # sampling mix (proportional to file size); change freely
+    acts: 0.04
+    supreme_court: 0.07
+    high_courts: 0.55
+    tribunals: 0.34
+
+train:
+  seed: 1337
+  init_std: 0.02            # GPT-2 init (see models/__init__.py::init_weights)
+  batch_size: 8              # sequences per micro-batch (lower it if CUDA OOM)
+  grad_accum: 8              # 8 x 8 x 1024 = 65,536 tokens per optimizer step
+  max_steps: 6000            # set from your measured tok/s and available hours
+  lr: 6.0e-4
+  min_lr: 6.0e-5
+  warmup_steps: 300
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+  amp: true                  # fp16 mixed precision on T4
+  log_every: 20
+  eval_every: 500
+  eval_batches: 40
+  time_limit_hours: 11.0     # stop + save before Kaggle's 12h limit

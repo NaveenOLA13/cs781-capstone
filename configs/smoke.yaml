@@ -1,0 +1,13 @@
+# Tiny config to test the whole pipeline in ~1 minute (CPU or GPU). Not for submission.
+run_name: smoke
+arch: decoder
+out_dir: runs
+allow_any_size: true
+model: {d_model: 64, n_layers: 2, n_heads: 4, n_kv_heads: 4, d_ff: 256, max_seq_len: 128, dropout: 0.0, pos_emb_type: sinusoidal, norm_first: true}
+data:
+  dir: data_test
+  block_size: 128
+  weights: {acts: 1, supreme_court: 1, high_courts: 1, tribunals: 1}
+train: {seed: 0, init_std: 0.02, batch_size: 4, grad_accum: 2, max_steps: 40, lr: 1.0e-3, min_lr: 1.0e-4, warmup_steps: 5,
+        weight_decay: 0.1, betas: [0.9, 0.95], grad_clip: 1.0, amp: true, log_every: 10, eval_every: 20,
+        eval_batches: 4, time_limit_hours: 1.0}
