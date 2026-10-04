@@ -58,6 +58,14 @@ def make_optimizer(model, t):
                              **({"fused": True} if fused else {}))
 
 
+def lm_loss(model, x, y):
+    """Models with their own objective (e.g. encoder-decoder) define compute_loss."""
+    if hasattr(model, "compute_loss"):
+        return model.compute_loss(x, y)
+    logits = model(x)
+    return F.cross_entropy(logits.float().view(-1, logits.size(-1)), y.view(-1))
+
+
 @torch.no_grad()
 def evaluate(model, data, t, device, amp_ctx):
     """Mean val loss over a FIXED set of val batches (same every eval -> comparable)."""
@@ -68,8 +76,7 @@ def evaluate(model, data, t, device, amp_ctx):
     for _ in range(t["eval_batches"]):
         x, y = data.get_batch("val", t["batch_size"], device)
         with amp_ctx:
-            logits = model(x)
-        losses.append(F.cross_entropy(logits.float().view(-1, logits.size(-1)), y.view(-1)).item())
+            losses.append(lm_loss(model, x, y).item())
     data.rng = saved
     model.train()
     return float(np.mean(losses))
@@ -150,8 +157,7 @@ def main():
         for _ in range(t["grad_accum"]):
             x, y = data.get_batch("train", t["batch_size"], device)
             with amp_ctx:
-                logits = model(x)
-                loss = F.cross_entropy(logits.float().view(-1, logits.size(-1)), y.view(-1))
+                loss = lm_loss(model, x, y)
             scaler.scale(loss / t["grad_accum"]).backward()
             loss_acc += loss.item() / t["grad_accum"]
         scaler.unscale_(opt)

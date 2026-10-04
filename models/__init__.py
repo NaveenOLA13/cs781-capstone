@@ -9,7 +9,9 @@ def build_model(arch: str, model_cfg: dict, vocab_size: int):
     if arch == "decoder":
         from models.decoder import LMConfig, DecoderLM
         return DecoderLM(LMConfig(vocab_size=vocab_size, **model_cfg))
-    # elif arch == "encdec":   from models.encdec import ...
+    if arch == "encdec":
+        from models.encdec import EncDecConfig, EncDecLM
+        return EncDecLM(EncDecConfig(vocab_size=vocab_size, **model_cfg))
     # elif arch == "hybrid":   from models.hybrid import ...
     raise ValueError(f"unknown arch {arch!r}")
 

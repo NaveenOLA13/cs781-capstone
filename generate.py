@@ -67,10 +67,19 @@ def generate_batch(model, prompts_ids, eos_id, max_seq_len, a, tok, device):
     done = torch.zeros(B, dtype=torch.bool, device=device)
     new = [[] for _ in range(B)]
     amp = torch.autocast("cuda", dtype=torch.float16) if device == "cuda" else torch.autocast("cpu", enabled=False)
+    seq2seq = hasattr(model, "encode")                     # encoder-decoder: encode prompt once
+    if seq2seq:
+        with amp:
+            enc_out, h = model.encode(x)
+        cur = x[:, -1:]                                    # last prompt token starts decoding
     for step in range(a.max_new_tokens):
         ctx = x[:, -max_seq_len:]
         with amp:
-            logits = model(ctx)[:, -1, :]
+            if seq2seq:
+                logits, h = model.decode(cur, h, enc_out)  # one recurrent step, O(1)
+                logits = logits[:, -1, :]
+            else:
+                logits = model(ctx)[:, -1, :]
         if a.ban_eos:                                      # we always want 128 words -> never stop early
             logits[:, eos_id] = float("-inf")
         nxt = sample_next(logits, ctx, a)
@@ -80,6 +89,7 @@ def generate_batch(model, prompts_ids, eos_id, max_seq_len, a, tok, device):
             if t != eos_id:
                 new[i].append(t)
         x = torch.cat([x, nxt[:, None]], dim=1)
+        cur = nxt[:, None]
         if step % 16 == 15:                                # stop early once all rows have enough words
             if all(done[i] or len(tok.decode(new[i]).split()) >= a.words for i in range(B)):
                 break
@@ -93,7 +103,9 @@ def main():
     ap.add_argument("--test", default=TEST_HF)
     ap.add_argument("--out", required=True)
     ap.add_argument("--words", type=int, default=128)
-    ap.add_argument("--max_new_tokens", type=int, default=256)
+    ap.add_argument("--max_new_tokens", type=int, default=600, help="upper bound; stops at 128 words")
+    ap.add_argument("--prompt_tokens", type=int, default=0,
+                    help="keep last N prompt tokens (0 = auto: encdec src_len, decoder 768)")
     ap.add_argument("--batch_size", type=int, default=24)
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top_k", type=int, default=0)
@@ -118,7 +130,7 @@ def main():
 
     prompts = load_prompts(a.test)
     ids = list(prompts.keys())[: a.limit or None]
-    keep = max_seq_len - a.max_new_tokens
+    keep = a.prompt_tokens or cfg["model"].get("src_len") or (max_seq_len - 256)
     enc = {k: tok.encode(prompts[k]["text"])[-keep:] for k in ids}
     order = sorted(ids, key=lambda k: len(enc[k]))
     print(f"[gen] {len(ids)} prompts, keep last {keep} prompt tokens, device={device}")
