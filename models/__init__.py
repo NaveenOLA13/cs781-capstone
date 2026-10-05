@@ -9,6 +9,14 @@ def build_model(arch: str, model_cfg: dict, vocab_size: int):
     if arch == "decoder":
         from models.decoder import LMConfig, DecoderLM
         return DecoderLM(LMConfig(vocab_size=vocab_size, **model_cfg))
+    if arch == "llama":
+        from models.layers import ModernConfig
+        from models.llama import LlamaLM
+        return LlamaLM(ModernConfig(vocab_size=vocab_size, **model_cfg))
+    if arch == "moe":
+        from models.layers import ModernConfig
+        from models.moe import MoELM
+        return MoELM(ModernConfig(vocab_size=vocab_size, **model_cfg))
     if arch == "encdec":
         from models.encdec import EncDecConfig, EncDecLM
         return EncDecLM(EncDecConfig(vocab_size=vocab_size, **model_cfg))
