@@ -34,6 +34,7 @@ def main():
     ap.add_argument("--runs", nargs="+", required=True)
     ap.add_argument("--weights", nargs="*", type=float)
     ap.add_argument("--out", default="ens")
+    ap.add_argument("--sub_name", default="predictions.json")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 
@@ -90,8 +91,10 @@ def main():
     test = combine("test")
     if test:
         docs = [d for d in test_docs if d.id in test]
-        C.write_predictions(os.path.join(a.out, "submission.jsonl"), docs, C.predict_spans(test, scheme, rules, pp))
-        print(f"wrote {os.path.join(a.out, 'submission.jsonl')} ({len(docs)} docs)")
+        missing = [d.id for d in test_docs if d.id not in test]
+        if missing:
+            print(f"WARNING: {len(missing)} test docs have no predictions in any run: {missing[:5]}")
+        C.write_predictions(a.out, test_docs, C.predict_spans(test, scheme, rules, pp), a.sub_name)
 
 
 if __name__ == "__main__":

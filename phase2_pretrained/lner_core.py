@@ -138,6 +138,32 @@ def find_files(data_dir):
     return dict(found)
 
 
+def _load_group(paths, fold):
+    """Loads a set of files that belong together. Handles Phase_2_LNER's split layout
+    (fold*-text.json = {doc_id: text}, fold*-gold.json = {doc_id: [[s, e, LABEL, text], ...]})
+    by joining on doc_id, and falls back to load_file() for one-file-per-split formats."""
+    texts, golds, docs = {}, {}, []
+    for p in paths:
+        obj = None
+        if p.lower().endswith(".json"):
+            with open(p, encoding="utf-8") as f:
+                obj = json.load(f)
+        if isinstance(obj, dict) and obj and all(isinstance(v, str) for v in obj.values()):
+            texts.update(obj)
+        elif isinstance(obj, dict) and obj and all(isinstance(v, list) for v in obj.values()):
+            golds.update(obj)
+        else:
+            docs += load_file(p, fold)
+    for did, text in texts.items():
+        ents = _parse_entities(golds.get(did, []))
+        docs.append(Doc(str(did), text, [Span(s, e, l) for s, e, l, _ in ents], fold, [t for *_, t in ents]))
+    if golds and texts:
+        missing = set(golds) - set(texts)
+        if missing:
+            print(f"WARNING [{fold}]: {len(missing)} gold docs have no text, e.g. {sorted(missing)[:3]}")
+    return docs
+
+
 def load_data(data_dir=None, train_files=None, test_files=None):
     """Returns (train_docs, test_docs, files). Explicit file lists override data_dir."""
     files = find_files(data_dir) if data_dir else {}
@@ -148,9 +174,8 @@ def load_data(data_dir=None, train_files=None, test_files=None):
         files["test"] = list(test_files)
     train = []
     for key in ("fold1", "fold2", "train"):
-        for p in files.get(key, []):
-            train += load_file(p, key if key != "train" else None)
-    test = [d for p in files.get("test", []) for d in load_file(p, "test")]
+        train += _load_group(files.get(key, []), key if key != "train" else None)
+    test = _load_group(files.get("test", []), "test")
     if not train:
         raise FileNotFoundError(f"No training files found. Detected: {files}. Use --train_files.")
     for docs in (train, test):  # make ids unique
@@ -632,11 +657,18 @@ def load_probs(path):
         return pickle.load(f)
 
 
-def write_predictions(path, docs, preds):
-    """JSONL: {"id", "entities": [{"start","end","label","text"}]}. Adapt this one
-    function to the exact Codabench submission format."""
-    with open(path, "w", encoding="utf-8") as f:
-        for d in docs:
-            ents = [{"start": s.start, "end": s.end, "label": s.label, "text": d.text[s.start:s.end]}
-                    for s in preds.get(d.id, [])]
-            f.write(json.dumps({"id": d.id, "entities": ents}, ensure_ascii=False) + "\n")
+def write_predictions(out_dir, docs, preds, sub_name="predictions.json"):
+    """Codabench format from phase2/ner_data.py: {doc_id: [[start, end, LABEL, text], ...]}
+    (end exclusive). Writes <out_dir>/<sub_name> and <out_dir>/submission.zip containing it.
+    Every document gets an entry, even with no predictions."""
+    import zipfile
+    sub = {d.id: [[s.start, s.end, s.label, d.text[s.start:s.end]] for s in preds.get(d.id, [])] for d in docs}
+    jpath = os.path.join(out_dir, sub_name)
+    with open(jpath, "w", encoding="utf-8") as f:
+        json.dump(sub, f, ensure_ascii=False)
+    zpath = os.path.join(out_dir, "submission.zip")
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(jpath, arcname=sub_name)
+    n = sum(len(v) for v in sub.values())
+    print(f"wrote {zpath} ({sub_name} inside): {len(sub)} docs, {n} entities")
+    return zpath

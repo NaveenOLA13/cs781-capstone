@@ -6,13 +6,16 @@ Kaggle (GPU T4 x2 or P100, Internet ON), from the folder holding lner_core.py:
   !python train_lner.py --data_dir <data folder> --model microsoft/deberta-v3-small \
         --limit_docs 40 --epochs 1 --out runs/smoke
 
-  # 2) main run: train on 6/7 of the training docs, validate on 1/7 (~14%)
-  !python train_lner.py --data_dir <data folder> --model microsoft/deberta-v3-large \
-        --grad_ckpt --out runs/dl_f0
+  # 2) main: 5-fold CV, one run per fold (each validates on 1/5 of the 70 docs)
+  for f in range(5):
+      !python train_lner.py --data_dir <data folder> --model microsoft/deberta-v3-large \
+            --grad_ckpt --fold {f} --out runs/dl_f{f}
+  # 3) combine the 5 folds: tune on all out-of-fold predictions, average on test
+  !python ensemble.py --data_dir <data folder> --runs runs/dl_f0 runs/dl_f1 runs/dl_f2 runs/dl_f3 runs/dl_f4 --out ens
 
-Outputs in --out: model/ (best checkpoint), val_probs.pkl, test_probs.pkl,
-postproc.json (tuned per-label thresholds + post-processing), val_report.json,
-submission.jsonl.
+Outputs in --out: val_probs.pkl, test_probs.pkl (for ensemble.py), postproc.json
+(tuned per-label thresholds + post-processing), val_report.json, predictions.json and
+submission.zip (Codabench format). model/ is deleted at the end unless --keep_model.
 """
 import argparse
 import json
@@ -41,7 +44,7 @@ def parse():
     ap.add_argument("--out", default="runs/run")
     ap.add_argument("--max_len", type=int, default=512)
     ap.add_argument("--stride", type=int, default=384, help="step between windows (overlap = max_len - stride)")
-    ap.add_argument("--epochs", type=int, default=4)
+    ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--lr", type=float, default=None, help="default: 1.5e-5 for large models, 3e-5 otherwise")
     ap.add_argument("--head_lr", type=float, default=None, help="default: 10 x lr")
     ap.add_argument("--llrd", type=float, default=0.9, help="layer-wise lr decay per layer from the top")
@@ -55,13 +58,15 @@ def parse():
     ap.add_argument("--ema", type=float, default=0.995, help="0 disables")
     ap.add_argument("--fgm", type=float, default=0.0, help="adversarial epsilon on embeddings, e.g. 0.5; 0 disables")
     ap.add_argument("--grad_ckpt", action="store_true", help="gradient checkpointing (needed for large on 16 GB)")
-    ap.add_argument("--n_folds", type=int, default=7)
+    ap.add_argument("--n_folds", type=int, default=5)
     ap.add_argument("--fold", type=int, default=0, help="-1 = train on ALL docs (no validation)")
     ap.add_argument("--fold_seed", type=int, default=42, help="keep fixed so folds match across runs")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--postproc", help="postproc.json to use for test decoding when --fold -1")
     ap.add_argument("--limit_docs", type=int, default=0)
     ap.add_argument("--no_test", action="store_true")
+    ap.add_argument("--sub_name", default="predictions.json", help="file name inside submission.zip")
+    ap.add_argument("--keep_model", action="store_true", help="keep the checkpoint (1.7 GB for large) after predicting")
     return ap.parse_args()
 
 
@@ -379,9 +384,11 @@ def main():
         C.save_probs(os.path.join(a.out, "test_probs.pkl"),
                      {d.id: (e["offs"], p) for d, e, p in zip(test_docs, te_enc, probs)})
         prep = {d.id: C.Prepared(d.text, e["offs"], p, scheme) for d, e, p in zip(test_docs, te_enc, probs)}
-        C.write_predictions(os.path.join(a.out, "submission.jsonl"), test_docs,
-                            C.predict_spans(prep, scheme, rules, pp))
-        print(f"wrote {os.path.join(a.out, 'submission.jsonl')}")
+        C.write_predictions(a.out, test_docs, C.predict_spans(prep, scheme, rules, pp), a.sub_name)
+    if not a.keep_model and os.path.isdir(os.path.join(a.out, "model")):
+        import shutil
+        shutil.rmtree(os.path.join(a.out, "model"))
+        print("deleted model checkpoint (predictions are saved; use --keep_model to keep it)")
     print(f"done in {(time.time() - t0) / 60:.1f} min; best val macro-F1 (before tuning) {best['f1']:.4f}")
 
 

@@ -204,6 +204,46 @@ def test_loader_formats():
         assert len(tr) == 2 and len({d.id for d in tr}) == 2 and len(te) == 1
 
 
+def make_phase2_folder(root, n_per_fold=35, seed=0):
+    """Same layout and JSON shapes as HF Exploration-Lab/CS-781-Capstone/Phase_2_LNER."""
+    docs = legal_docs(3 * n_per_fold, seed=seed)
+    os.makedirs(os.path.join(root, "Train"))
+    os.makedirs(os.path.join(root, "Test"))
+    for k, fold in enumerate(("fold1", "fold2", "fold3")):
+        part = docs[k * n_per_fold:(k + 1) * n_per_fold]
+        sub = "Test" if fold == "fold3" else "Train"
+        with open(os.path.join(root, sub, f"{fold}-text.json"), "w") as f:
+            json.dump({f"{1000 * k + i}": d.text for i, d in enumerate(part)}, f)
+        if fold != "fold3":
+            with open(os.path.join(root, sub, f"{fold}-gold.json"), "w") as f:
+                json.dump({f"{1000 * k + i}": [[s.start, s.end, s.label, d.text[s.start:s.end]] for s in d.spans]
+                           for i, d in enumerate(part)}, f)
+    with open(os.path.join(root, "Train", "labels.txt"), "w") as f:
+        f.write("\n".join(TYPES))
+    return docs
+
+
+def test_phase2_layout_and_submission_zip():
+    import zipfile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, "Phase_2_LNER")
+        src = make_phase2_folder(root)
+        tr, te, files = C.load_data(root)
+        assert set(files) == {"fold1", "fold2", "test"}, files
+        assert len(tr) == 70 and len(te) == 35
+        assert {d.fold for d in tr} == {"fold1", "fold2"} and all(not d.spans for d in te)
+        assert C.check_entity_text(tr)["mismatch"] == 0
+        assert sum(len(d.spans) for d in tr) == sum(len(d.spans) for d in src[:70])
+        preds = {d.id: d.spans[:2] for d in tr[:3]}
+        zp = C.write_predictions(tmp, tr[:3] + te[:2], preds)
+        with zipfile.ZipFile(zp) as z:
+            assert z.namelist() == ["predictions.json"]
+            sub = json.loads(z.read("predictions.json"))
+        assert len(sub) == 5 and sub[te[0].id] == []
+        s0 = tr[0].spans[0]
+        assert sub[tr[0].id][0] == [s0.start, s0.end, s0.label, tr[0].text[s0.start:s0.end]]
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):
