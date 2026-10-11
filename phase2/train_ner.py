@@ -45,7 +45,8 @@ def get_args():
     ap.add_argument("--data_dir", default=None, help="local copy of Phase_2_LNER (else HF stream)")
     ap.add_argument("--tokenizer", default=os.path.join(ROOT, "tok/bpe12k/tokenizer.json"))
     # model / adaptation
-    ap.add_argument("--method", default="full", choices=["full", "head", "lora", "lorma_plus", "lorma_pi"])
+    ap.add_argument("--method", default="full", choices=["full", "top", "head", "lora", "lorma_plus", "lorma_pi"])
+    ap.add_argument("--top_k", type=int, default=1, help="--method top: number of top layers to train")
     ap.add_argument("--head", default="linear", choices=["linear", "bigru"])
     ap.add_argument("--echo", type=int, default=0, help="1 = echo input (decoder-only archs)")
     ap.add_argument("--bidir", type=int, default=0, help="1 = remove causal mask (decoder/llama/moe)")

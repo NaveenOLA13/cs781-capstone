@@ -29,16 +29,19 @@ def finalize(dev_probs, test_probs, enc, tenc, texts, gold, test, train_ids, dev
         report["viterbi"] = scv["macro_F1"]
         if scv["macro_F1"] >= sc["macro_F1"]:
             use_vit, pred, sc = True, pv, scv
-    choice, gaz = None, {}
+    choice, ctx = None, None
     if postproc:
         gaz = PP.learn_gazetteer(texts, gold, train_ids)
+        hdr, hdr_hits, n_hdr = PP.learn_header_policy(texts, gold, train_ids)
+        print(f"[post] header rule: {n_hdr} train headers, hits per variant {hdr_hits} -> policy {hdr}")
+        ctx = {"gaz": gaz, "hdr": hdr}
         dev_texts = {k: texts[k] for k in dev_ids}
-        choice, sc, var_scores = PP.choose_per_label(pred, dev_texts, dev_gold, gaz, labels, D.strict_scores)
+        choice, sc, var_scores = PP.choose_per_label(pred, dev_texts, dev_gold, ctx, labels, D.strict_scores)
         for v, s in var_scores.items():
             report[f"variant:{v}"] = s["macro_F1"]
-        pred = PP.combine({v: PP.run_variant(v, pred, dev_texts, gaz) for v in set(choice.values())}, choice)
+        pred = PP.combine({v: PP.run_variant(v, pred, dev_texts, ctx) for v in set(choice.values())}, choice)
         report["final(per-label choice)"] = sc["macro_F1"]
-        print(f"[post] gazetteer: {len(gaz)} strings | viterbi={use_vit} | per-label choice: {choice}")
+        print(f"[post] gazetteer: {len(ctx['gaz'])} strings | viterbi={use_vit} | per-label choice: {choice}")
     print("[post] dev macro-F1 by step:", json.dumps({k: round(v, 4) for k, v in report.items()}))
     print(f"[ner] DEV strict macro-F1={sc['macro_F1']:.4f} P={sc['macro_P']:.4f} R={sc['macro_R']:.4f}")
     for lab, v in sc["per_label"].items():
@@ -51,7 +54,7 @@ def finalize(dev_probs, test_probs, enc, tenc, texts, gold, test, train_ids, dev
     if test_probs is not None:
         tpred = decode(test_probs, tenc, test, use_vit)
         if choice:
-            tpred = PP.apply_choice(tpred, test, gaz, choice)
+            tpred = PP.apply_choice(tpred, test, ctx, choice)
         pj = D.write_submission(tpred, test, os.path.join(out, "sub"))
         n = sum(len(v) for v in tpred.values())
         print(f"[ner] wrote {pj} + submission.zip | {len(test)} test docs, {n} entities")

@@ -131,14 +131,91 @@ def apply_gazetteer(spans, text, gaz, labels=None):
     return _add_nonoverlapping(spans, extra)
 
 
+# ------------------------------------------------------------------ 3b. party roles (header + doc-level)
+HDR_RE = re.compile(r"(?:PETITIONER|APPELLANT)S?\s*:\s*(?P<APP>.+?)\s*(?:\bV(?:s|S|ersus|ERSUS)?\.?\s+)?"
+                    r"RESPONDENTS?\s*:\s*(?P<RESP>.+?)\s*(?:DATE OF JUDGMENT|BENCH|$)", re.S)
+SUFFIX_RE = re.compile(r"\s*,?\s*(?:and|AND|&)\s+(?:Ors|ORS|Others|OTHERS|Anr|ANR|Another|ANOTHER|"
+                       r"Etc|ETC|Others?\s+Etc)\.?\s*$")
+
+
+def _hdr_variants(text, s, e):
+    """Candidate entity spans for a header party field (s, e): raw, suffix-stripped,
+    suffix-stripped without trailing dot."""
+    raw = (s, e)
+    m = SUFFIX_RE.search(text[s:e])
+    strip = (s, s + m.start()) if m else raw
+    nodot = (strip[0], strip[1] - 1) if text[strip[0]:strip[1]].endswith(".") else strip
+    return {"raw": raw, "strip": strip, "nodot": nodot}
+
+
+def header_parties(text, policy=None, head=4000):
+    m = HDR_RE.search(text[:head])
+    if not m:
+        return []
+    out = []
+    for lab in ("APP", "RESP"):
+        s, e = m.span(lab)
+        v = _hdr_variants(text, s, e)
+        if policy is None:
+            continue
+        pick = policy.get(lab)
+        if pick:
+            a, b = v[pick]
+            if b - a >= 2:
+                out.append((a, b, lab))
+    return out
+
+
+def learn_header_policy(texts, gold, doc_ids):
+    """For APP / RESP pick the header-span variant that most often equals a gold span (train docs).
+    A role gets no header rule if its best variant hits in < 30% of headers."""
+    hits = {lab: Counter() for lab in ("APP", "RESP")}
+    n = 0
+    for k in doc_ids:
+        m = HDR_RE.search(texts[k][:4000])
+        if not m:
+            continue
+        n += 1
+        g = {(s, e, l) for s, e, l in gold.get(k, [])}
+        for lab in ("APP", "RESP"):
+            for name, (a, b) in _hdr_variants(texts[k], *m.span(lab)).items():
+                if (a, b, lab) in g:
+                    hits[lab][name] += 1
+    pol = {}
+    for lab, c in hits.items():
+        if c and n and c.most_common(1)[0][1] / n >= 0.3:
+            pol[lab] = c.most_common(1)[0][0]
+    return pol, {lab: dict(c) for lab, c in hits.items()}, n
+
+
+def roles(spans, text, policy, min_len=3):
+    """Party-role consistency: header spans first; every string's label = label of its first mention
+    (header counts as first); all other mentions get that label (exact-span relabel + add missing)."""
+    hdr = header_parties(text, policy)
+    base = [x for x in spans if not any(x[0] < e and s < x[1] for s, e, _ in hdr)] + hdr
+    role = {}
+    for s, e, l in sorted(base):
+        st = text[s:e]
+        if len(st.strip()) >= min_len and st not in role:
+            role[st] = l
+    for s, e, l in hdr:                          # header always wins
+        role[text[s:e]] = l
+    relab = [(s, e, role.get(text[s:e], l)) for s, e, l in base]
+    extra = [(a, b, lab) for st, lab in role.items() for a, b in _occurrences(text, st)]
+    return _add_nonoverlapping(relab, extra)
+
+
 # ------------------------------------------------------------------ 4. per-label selection on dev
-VARIANTS = ["base", "prop", "gaz", "prop+gaz"]
+VARIANTS = ["base", "prop", "gaz", "prop+gaz", "roles", "roles+gaz"]
 
 
-def run_variant(name, base_spans, texts, gaz):
+def run_variant(name, base_spans, texts, ctx):
+    gaz = ctx["gaz"]
     out = {}
     for k, sp in base_spans.items():
         x = list(sp)
+        if "roles" in name:
+            x = roles(x, texts[k], ctx["hdr"])
         if "prop" in name:
             x = propagate(x, texts[k])
         if "gaz" in name:
@@ -147,10 +224,10 @@ def run_variant(name, base_spans, texts, gaz):
     return out
 
 
-def choose_per_label(dev_base, dev_texts, dev_gold, gaz, labels, scorer):
+def choose_per_label(dev_base, dev_texts, dev_gold, ctx, labels, scorer):
     """-> ({label: variant}, combined dev score dict)."""
     per = {}
-    preds = {v: run_variant(v, dev_base, dev_texts, gaz) for v in VARIANTS}
+    preds = {v: run_variant(v, dev_base, dev_texts, ctx) for v in VARIANTS}
     scores = {v: scorer(preds[v], dev_gold, labels) for v in VARIANTS}
     choice = {}
     for lab in labels:
@@ -165,7 +242,7 @@ def combine(preds_by_variant, choice):
     return {k: [x for lab, v in choice.items() for x in preds_by_variant[v][k] if x[2] == lab] for k in docs}
 
 
-def apply_choice(base, texts, gaz, choice):
+def apply_choice(base, texts, ctx, choice):
     used = set(choice.values())
-    preds = {v: run_variant(v, base, texts, gaz) for v in used}
+    preds = {v: run_variant(v, base, texts, ctx) for v in used}
     return combine(preds, choice)

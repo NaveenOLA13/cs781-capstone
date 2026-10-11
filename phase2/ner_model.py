@@ -139,6 +139,23 @@ def build_ner_model(args, phase1, n_tags, load_weights=True):
                        args.get("lora_dropout", 0.0))
         assert n > 0, f"{method}: no nn.Linear matched {targets} in arch={arch} (use --method full/head)"
         print(f"[model] {method}: wrapped {n} Linear layers ({targets})")
+    elif method == "top":                                      # partial FT: only the top k layers
+        k = args.get("top_k", 1)
+        for p in lm.parameters():
+            p.requires_grad = False
+        if arch == "encdec":                                   # nn.GRU params: weight_ih_l{i}[_reverse]
+            L = mcfg["enc_layers"]
+            keep = [f"_l{i}" for i in range(L - k, L)]
+            for n, p in lm.encoder.rnn.named_parameters():
+                if any(n.endswith(t) or n.endswith(t + "_reverse") for t in keep):
+                    p.requires_grad = True
+        else:
+            for b in lm.blocks[-k:]:
+                for p in b.parameters():
+                    p.requires_grad = True
+            for p in (lm.ln_f if arch == "decoder" else lm.norm_f).parameters():
+                p.requires_grad = True
+        print(f"[model] partial fine-tuning: top {k} layer(s) trainable")
     elif method == "head":                                     # frozen backbone (linear probe)
         for p in lm.parameters():
             p.requires_grad = False
