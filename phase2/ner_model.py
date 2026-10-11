@@ -46,6 +46,40 @@ def backbone_features(lm, arch, idx):
     raise ValueError(arch)
 
 
+def _gqa_forward_bidir(self, x):
+    """Same as models/layers.py::GQAttention.forward but WITHOUT the causal mask."""
+    from models.layers import apply_rope
+    B, T, _ = x.shape
+    q = self.q_proj(x).view(B, T, self.h, self.dh).transpose(1, 2)
+    k = self.k_proj(x).view(B, T, self.kv, self.dh).transpose(1, 2)
+    v = self.v_proj(x).view(B, T, self.kv, self.dh).transpose(1, 2)
+    cos, sin = self.cos[:T], self.sin[:T]
+    q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+    rep = self.h // self.kv
+    k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
+    y = F.scaled_dot_product_attention(q, k, v, is_causal=False,
+                                       dropout_p=self.dropout if self.training else 0.0)
+    return self.out_proj(y.transpose(1, 2).reshape(B, T, self.h * self.dh))
+
+
+def make_bidirectional(lm, arch):
+    """LLM2Vec-style (BehnamGhader et al. 2024): drop the causal mask so every token attends to
+    the whole window; fine-tuning then teaches the left-to-right pretrained weights to use right
+    context. Phase 1 files are untouched: decoder -> all-True mask buffer, llama/moe -> patched
+    attention forward. Returns number of attention layers changed."""
+    import types
+    n = 0
+    for b in lm.blocks:
+        if arch == "decoder":
+            b.attn.causal_mask.fill_(True)
+        elif arch in ("llama", "moe"):
+            b.attn.forward = types.MethodType(_gqa_forward_bidir, b.attn)
+        else:
+            raise ValueError(f"--bidir not applicable to arch={arch}")
+        n += 1
+    return n
+
+
 class TagHead(nn.Module):
     def __init__(self, d_in, n_tags, kind="linear", rnn_hidden=256, dropout=0.1):
         super().__init__()
@@ -96,6 +130,8 @@ def build_ner_model(args, phase1, n_tags, load_weights=True):
     k = args.get("keep_layers") or 0
     if k and hasattr(lm, "blocks"):                            # smaller student for distillation
         lm.blocks = lm.blocks[:k]
+    if args.get("bidir"):
+        print(f"[model] bidirectional attention in {make_bidirectional(lm, arch)} layers")
     method = args.get("method", "full")
     if method in ("lora", "lorma_plus", "lorma_pi"):
         targets = args.get("targets") or DEFAULT_TARGETS[arch]

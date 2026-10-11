@@ -47,6 +47,7 @@ def get_args():
     ap.add_argument("--method", default="full", choices=["full", "head", "lora", "lorma_plus", "lorma_pi"])
     ap.add_argument("--head", default="linear", choices=["linear", "bigru"])
     ap.add_argument("--echo", type=int, default=0, help="1 = echo input (decoder-only archs)")
+    ap.add_argument("--bidir", type=int, default=0, help="1 = remove causal mask (decoder/llama/moe)")
     ap.add_argument("--keep_layers", type=int, default=0, help="truncate backbone to first k blocks")
     ap.add_argument("--scratch", type=int, default=0, help="1 = random init backbone (ablation)")
     ap.add_argument("--r", type=int, default=8)
@@ -165,7 +166,7 @@ def main():
         assert a.window * (2 if a.echo else 1) <= maxlen or p1cfg["arch"] == "encdec", \
             f"window{'*2 (echo)' if a.echo else ''} exceeds the backbone max_seq_len={maxlen}"
         tr, tot = count_trainable(model)
-        print(f"[ner] arch={p1cfg['arch']} method={a.method} head={a.head} echo={a.echo} "
+        print(f"[ner] arch={p1cfg['arch']} method={a.method} head={a.head} echo={a.echo} bidir={a.bidir} "
               f"trainable={tr/1e6:.3f}M / total={tot/1e6:.2f}M ({100*tr/tot:.2f}%) device={device}")
         json.dump({**vars(a), "trainable_params": tr, "total_params": tot},
                   open(os.path.join(out, "args.json"), "w"), indent=1)
