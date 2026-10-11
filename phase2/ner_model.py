@@ -1,0 +1,131 @@
+"""Token-classification model = Phase 1 backbone (+ optional PEFT) + tagging head.
+
+Backbone features (the LM output head is NOT used):
+  decoder : tok_emb + sinusoidal PE -> blocks -> ln_f           (d_model)
+  llama/moe: tok_emb -> blocks -> norm_f                         (d_model)
+  encdec  : bidirectional GRU encoder outputs                    (2 * hidden_size)
+
+Decoder-only backbones are causal (token t sees only <= t). Two optional fixes:
+  * head="bigru": a small BiGRU over the features gives right context to every token
+  * echo=True   : feed [window ; window] and read features from the 2nd copy, so each token of
+                  the 2nd copy has already "seen" the whole window (Springer et al. 2024, echo
+                  embeddings). Costs 2x sequence length.
+"""
+import os
+import sys
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from models import build_model, init_weights                      # noqa: E402
+from phase2.peft import apply_peft, DEFAULT_TARGETS               # noqa: E402
+
+
+def feat_dim(arch, mcfg):
+    return 2 * mcfg["hidden_size"] if arch == "encdec" else mcfg["d_model"]
+
+
+def backbone_features(lm, arch, idx):
+    if arch == "decoder":
+        x = lm.tok_emb(idx)
+        if lm.cfg.pos_emb_type == "sinusoidal":
+            x = x + lm.pos_emb[: idx.size(1)]
+        for b in lm.blocks:
+            x = b(x)
+        return lm.ln_f(x)
+    if arch in ("llama", "moe"):
+        x = lm.tok_emb(idx)
+        for b in lm.blocks:
+            x = b(x)
+        return lm.norm_f(x)
+    if arch == "encdec":
+        out, _ = lm.encoder(idx)
+        return out
+    raise ValueError(arch)
+
+
+class TagHead(nn.Module):
+    def __init__(self, d_in, n_tags, kind="linear", rnn_hidden=256, dropout=0.1):
+        super().__init__()
+        self.kind = kind
+        self.drop = nn.Dropout(dropout)
+        if kind == "bigru":
+            self.rnn = nn.GRU(d_in, rnn_hidden, batch_first=True, bidirectional=True)
+            d_in = 2 * rnn_hidden
+        self.out = nn.Linear(d_in, n_tags)
+
+    def forward(self, h):
+        h = self.drop(h)
+        if self.kind == "bigru":
+            h, _ = self.rnn(h.float())
+            h = self.drop(h)
+        return self.out(h)
+
+
+class NERModel(nn.Module):
+    def __init__(self, lm, arch, mcfg, n_tags, head="linear", echo=False, rnn_hidden=256,
+                 dropout=0.1):
+        super().__init__()
+        self.lm, self.arch, self.echo = lm, arch, echo
+        self.head = TagHead(feat_dim(arch, mcfg), n_tags, head, rnn_hidden, dropout)
+
+    def forward(self, idx):
+        T = idx.size(1)
+        if self.echo:
+            h = backbone_features(self.lm, self.arch, torch.cat([idx, idx], 1))[:, T:]
+        else:
+            h = backbone_features(self.lm, self.arch, idx)
+        return self.head(h)
+
+
+def build_ner_model(args, phase1, n_tags, load_weights=True):
+    """phase1: path to a Phase 1 best.pt, or a dict {"config", "vocab_size"(, "model")}.
+    args: dict with keys method, head, echo, keep_layers, r, alpha, lora_dropout, targets,
+    scratch, rnn_hidden, dropout. Returns (model, phase1_config, vocab_size)."""
+    ck = torch.load(phase1, map_location="cpu", weights_only=False) if isinstance(phase1, str) else phase1
+    cfg, V = ck["config"], ck["vocab_size"]
+    arch, mcfg = cfg["arch"], dict(cfg["model"])
+    lm = build_model(arch, mcfg, V)
+    if load_weights and not args.get("scratch"):
+        lm.load_state_dict(ck["model"])
+    elif args.get("scratch"):
+        init_weights(lm, 0.02)                                 # "no pretraining" ablation
+    del ck
+    k = args.get("keep_layers") or 0
+    if k and hasattr(lm, "blocks"):                            # smaller student for distillation
+        lm.blocks = lm.blocks[:k]
+    method = args.get("method", "full")
+    if method in ("lora", "lorma_plus", "lorma_pi"):
+        targets = args.get("targets") or DEFAULT_TARGETS[arch]
+        n = apply_peft(lm, method, targets, args.get("r", 8), args.get("alpha", 16),
+                       args.get("lora_dropout", 0.0))
+        assert n > 0, f"{method}: no nn.Linear matched {targets} in arch={arch} (use --method full/head)"
+        print(f"[model] {method}: wrapped {n} Linear layers ({targets})")
+    elif method == "head":                                     # frozen backbone (linear probe)
+        for p in lm.parameters():
+            p.requires_grad = False
+    elif method != "full":
+        raise ValueError(method)
+    model = NERModel(lm, arch, mcfg, n_tags, args.get("head", "linear"), args.get("echo", False),
+                     args.get("rnn_hidden", 256), args.get("dropout", 0.1))
+    return model, cfg, V
+
+
+def load_ner_checkpoint(path, device="cpu"):
+    """Rebuild a fine-tuned NER model saved by train_ner.py."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    a = ck["args"]
+    p1 = {"config": ck["phase1_config"], "vocab_size": ck["vocab_size"]}
+    model, _, _ = build_ner_model(a, p1, len(ck["tags"]), load_weights=False)
+    model.load_state_dict(ck["model"])
+    return model.to(device).eval(), ck
+
+
+def kd_loss(student_logits, teacher_logits, labels, T=2.0):
+    """Hinton KD: T^2 * KL(teacher_T || student_T), averaged over non-ignored tokens."""
+    m = labels != -100
+    s = F.log_softmax(student_logits[m].float() / T, -1)
+    t = F.softmax(teacher_logits[m].float() / T, -1)
+    return F.kl_div(s, t, reduction="batchmean") * T * T
