@@ -34,6 +34,7 @@ from bpe import BPETokenizer                                              # noqa
 from phase2 import ner_data as D                                          # noqa: E402
 from phase2.ner_model import build_ner_model, load_ner_checkpoint, kd_loss  # noqa: E402
 from phase2.peft import count_trainable                                   # noqa: E402
+from phase2.finalize import finalize                                      # noqa: E402
 
 
 def get_args():
@@ -71,6 +72,7 @@ def get_args():
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--warmup_frac", type=float, default=0.06)
     ap.add_argument("--grad_clip", type=float, default=1.0)
+    ap.add_argument("--label_smoothing", type=float, default=0.0, help="soft gold targets, e.g. 0.1")
     ap.add_argument("--o_weight", type=float, default=1.0, help="CE weight of the O tag")
     ap.add_argument("--amp", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
@@ -80,6 +82,7 @@ def get_args():
     ap.add_argument("--kd_alpha", type=float, default=0.5)
     ap.add_argument("--kd_T", type=float, default=2.0)
     # predict
+    ap.add_argument("--postproc", type=int, default=1, help="viterbi + propagation + gazetteer (dev-selected)")
     ap.add_argument("--boundary_fix", type=int, default=1, help="learned in-token boundary repair")
     ap.add_argument("--predict_only", default=None, help="NER checkpoint: skip training")
     ap.add_argument("--no_test", action="store_true", help="skip fold3 prediction")
@@ -157,6 +160,8 @@ def main():
         model, ck = load_ner_checkpoint(a.predict_only, device)
         sa = ck["args"]
         a.window, a.stride, a.split_seed, a.dev_frac = sa["window"], sa["stride"], sa["split_seed"], sa["dev_frac"]
+        json.dump({**sa, "predict_only_from": a.predict_only, "postproc": a.postproc},
+                  open(os.path.join(out, "args.json"), "w"), indent=1)
     else:
         margs = vars(a).copy()
         model, p1cfg, V = build_ner_model(margs, a.phase1, len(tags))
@@ -200,23 +205,19 @@ def main():
               out, p1cfg, V)
         model, _ = load_ner_checkpoint(os.path.join(out, "best_ner.pt"), device)
 
-    sc, pred = evaluate()
-    print(f"[ner] DEV strict macro-F1={sc['macro_F1']:.4f} P={sc['macro_P']:.4f} R={sc['macro_R']:.4f}")
-    for lab, v in sc["per_label"].items():
-        print(f"    {lab:10s} F1={v['F1']:.3f} P={v['P']:.3f} R={v['R']:.3f} (tp={v['tp']} fp={v['fp']} fn={v['fn']})")
-    json.dump(sc, open(os.path.join(out, "dev_scores.json"), "w"), indent=1)
-    json.dump({k: [list(x) for x in v] for k, v in pred.items()},
-              open(os.path.join(out, "dev_pred.json"), "w"))
-
+    dev_probs = predict_docs(model, enc, dev_ids, len(tags), a.window, a.stride, pad_id, device,
+                             amp, a.eval_batch_size)
+    test = tenc = test_probs = None
     if not a.no_test:
         test = D.load_test(a.data_dir)
         tenc = D.encode_docs(tok, test)
-        probs = predict_docs(model, tenc, list(test), len(tags), a.window, a.stride, pad_id, device,
-                             amp, a.eval_batch_size)
-        tpred = probs_to_spans(probs, tenc, id2tag, test, table)
-        pj = D.write_submission(tpred, test, os.path.join(out, "sub"))
-        n = sum(len(v) for v in tpred.values())
-        print(f"[ner] wrote {pj} + submission.zip | {len(test)} test docs, {n} entities")
+        test_probs = predict_docs(model, tenc, list(test), len(tags), a.window, a.stride, pad_id,
+                                  device, amp, a.eval_batch_size)
+    np.savez_compressed(os.path.join(out, "probs.npz"),
+                        **{f"dev/{k}": v.astype(np.float16) for k, v in dev_probs.items()},
+                        **({f"test/{k}": v.astype(np.float16) for k, v in test_probs.items()} if test_probs else {}))
+    finalize(dev_probs, test_probs, enc, tenc, texts, gold, test, train_ids, dev_ids, labels, tags,
+             id2tag, table, out, postproc=a.postproc)
 
 
 def train(a, model, enc, train_ids, evaluate, tags, tag2id, labels, pad_id, device, amp, use_amp,
@@ -265,7 +266,7 @@ def train(a, model, enc, train_ids, evaluate, tags, tag2id, labels, pad_id, devi
             with amp:
                 logits = model(x)
             loss = F.cross_entropy(logits.float().view(-1, len(tags)), y.view(-1),
-                                   weight=cw, ignore_index=D.IGNORE)
+                                   weight=cw, ignore_index=D.IGNORE, label_smoothing=a.label_smoothing)
             if teacher is not None:
                 with torch.no_grad(), amp:
                     tl = teacher(x)
