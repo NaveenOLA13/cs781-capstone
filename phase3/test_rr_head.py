@@ -81,6 +81,12 @@ def test_finds_tied_lm_head_and_skips_it():
     assert not calls                            # LM head never executed
 
 
+def test_untied_head_not_confused_with_feed_forward():
+    m = ToyGPT()
+    m.lm_head = nn.Linear(D, V, bias=False)      # untied; position table (64) == feed-forward width (64)
+    assert find_lm_head(m) == "lm_head", find_lm_head(m)
+
+
 def test_classifier_shapes_and_width_inference():
     for pooling in Pooler.KINDS:
         clf = SentenceClassifier(ToyGPT(), NL, pooling=pooling).eval()

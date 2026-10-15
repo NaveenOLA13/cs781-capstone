@@ -243,7 +243,11 @@ def describe(model: nn.Module, tokenizer=None) -> None:
 
 
 def vocab_size(model: nn.Module) -> int | None:
-    """Largest nn.Embedding in the model (an upper bound for valid token ids)."""
+    """Token vocabulary size: the LM head's output size if there is one, else the largest
+    nn.Embedding (an upper bound for valid token ids)."""
+    lm = find_lm_head(model)
+    if lm:
+        return model.get_submodule(lm).out_features
     sizes = [m.num_embeddings for m in model.modules() if isinstance(m, nn.Embedding)]
     return max(sizes) if sizes else None
 
