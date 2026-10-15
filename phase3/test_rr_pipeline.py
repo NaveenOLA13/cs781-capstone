@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rr_backbone import make_backbone, make_encode, special_ids  # noqa: E402
 from rr_head import count_params  # noqa: E402
 from rr_train import run  # noqa: E402
+from rr_cv import VARIANTS, run_cv  # noqa: E402
 from test_rr_data import make_fake_data  # noqa: E402
 
 torch.manual_seed(0)
@@ -274,8 +275,8 @@ def test_full_run_decoder():
                   b_epochs=4, batch_size=16, max_len=32, lr_backbone=3e-3, lr_head=3e-3, log_every=0)
         m = _check_run(res, data, model, before)
         assert m["config"]["exact_batches"] is False            # causal decoder: padding has no effect
-        print(f"      dev macro-F1: stage A {m['stage_a']['best_dev_macro_f1']:.3f}, "
-              f"stage B {m['stage_b']['best_dev_macro_f1']:.3f} (fake data)")
+        print(f"      dev macro-F1: stage A {m['stage_a']['best_dev_score']:.3f}, "
+              f"stage B {m['stage_b']['best_dev_score']:.3f} (fake data)")
 
 
 def test_full_and_frozen_run_encdec():
@@ -318,6 +319,38 @@ def test_limit_and_bad_setting():
             assert False
         except ValueError as e:
             assert "unknown settings" in str(e)
+
+
+def test_out_of_fold_run():
+    for model_cls, name in ((ToyGPT, "gpt"), (ToyEncDec, "encdec")):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = make_fake_data(os.path.join(tmp, "data"), n_train=6)
+            model = model_cls()
+            before = {k: v.clone() for k, v in model.state_dict().items()}
+            bb = _bb(model)
+            res = run_cv(bb, data_root=data, out_dir=os.path.join(tmp, "runs"), run_name=name, folds=3, epochs=2,
+                         b_epochs=4, batch_size=16, max_len=32, lr_backbone=3e-3, lr_head=3e-3, log_every=0)
+            out, m = res["out_dir"], res["metrics"]
+            assert res["chosen"] in VARIANTS and m["chosen"] == res["chosen"]
+            test = {}
+            for f in ("CL_test.json", "IT_test.json"):
+                test.update(json.load(open(os.path.join(data, "Test", f))))
+            for v in VARIANTS:
+                with zipfile.ZipFile(os.path.join(out, v, "submission.zip")) as z:
+                    pred = json.loads(z.read("prediction.json"))
+                assert set(pred) == set(test) and all(len(pred[k]) == len(test[k]) for k in test), v
+                assert set(m["dev"][v]) == {"all", "CL", "IT"} and set(m["oof_train"][v]) == {"all", "CL", "IT"}
+            assert len(m["folds"]) == 3 and sorted(sum(m["folds"], [])) == sorted(m["folds"][0] + m["folds"][1] + m["folds"][2])
+            assert len({d for f in m["folds"] for d in f}) == 12                       # every judgment held out once
+            assert m["bias"]["oof_13avg"]["per_domain"] >= m["bias"]["oof_13avg"]["none"] - 1e-9
+            for f in ("oof.pt", "metrics.json", "log.txt", "stageA_fold1.pt", "stageA_fold3.pt", "stageB_fold2.pt"):
+                assert os.path.exists(os.path.join(out, f)), f
+            saved = torch.load(os.path.join(out, "stageA_fold1.pt"), map_location="cpu", weights_only=False)
+            assert not any("decoder" in k or "lm_head" in k for k in saved["trained_weights"]) or name == "gpt"
+            for k, v in model.state_dict().items():
+                assert torch.equal(v.cpu(), before[k]), f"original weights changed: {k}"
+            print(f"      {name}: chosen {res['chosen']}, dev 13-role avg "
+                  + ", ".join(f"{v} {m['dev'][v]['all']['macro_f1_all13']:.3f}" for v in VARIANTS))
 
 
 if __name__ == "__main__":

@@ -42,14 +42,17 @@ DEFAULTS = dict(
     max_len=128, pos_buckets=10, pos_dim=32,
     # Stage A
     method="full",               # "full" fine-tuning or "frozen" backbone (head only)
-    head="linear", dropout=0.1, epochs=5, batch_size=64, eval_batch_size=128,
+    head="linear", dropout=0.1, epochs=3, batch_size=64, eval_batch_size=128,
     lr_backbone=5e-5, lr_head=1e-3, weight_decay=0.01, warmup=0.06, grad_clip=1.0, amp=True,
     weight_cap=10.0, weight_power=0.5, log_every=100,
     exact_batches=None,          # None: automatic (True if padding changes the model's outputs)
     # Stage B
     b_epochs=40, b_patience=10, b_lr=1e-3, b_weight_decay=0.01, b_hidden=256, b_dropout=0.3, b_layers=1,
     save_model=True,
+    select_metric="macro_f1_all13",  # what picks the best epoch: 13-role average (Codabench) or "macro_f1"
 )
+
+METRIC_NAMES = {"macro_f1_all13": "13-role avg", "macro_f1": "macro-F1"}
 
 
 # --------------------------------------------------------------------------- helpers
@@ -199,6 +202,9 @@ def freeze_unused(clf, docs, cfg, device, pad_id, log=print, n_batches=3):
 
 
 def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=print):
+    """Fine-tune Stage A. With dev_docs, every epoch is scored on dev and the best epoch is kept;
+    with dev_docs=None (cross-validation) it trains a fixed number of epochs and keeps the last."""
+    sel, mname = cfg["select_metric"], METRIC_NAMES[cfg["select_metric"]]
     li = {l: i for i, l in enumerate(labels)}
     items = flat(train_docs, cfg["pos_buckets"])
     y_all = [li[train_docs[di]["labels"][si]] for di, si, _ in items]
@@ -244,25 +250,32 @@ def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=pr
             seen += len(b)
             if cfg["log_every"] and step % cfg["log_every"] == 0:
                 log(f"  epoch {ep} step {step}/{steps}  loss {tot / max(1, seen):.4f}")
-        dev_out = run_sentences(clf, dev_docs, cfg, device, pad_id)
-        rep = D.evaluate(dev_docs, to_preds(dev_docs, dev_out, labels), labels)
-        f = rep["all"]["macro_f1"]
-        rec = dict(epoch=ep, loss=tot / max(1, seen), dev_macro_f1=f, seconds=time.time() - t0,
-                   skipped_steps=skipped, **{f"dev_{k}": v["macro_f1"] for k, v in rep.items() if k != "all"})
-        history.append(rec)
-        mark = ""
-        if f > best:
-            best, best_epoch, mark = f, ep, "  <- best so far"
-            best_state = {k: v.detach().to("cpu", copy=True) for k, v in clf.state_dict().items()}
-        doms = ", ".join(f"{k} {v['macro_f1']:.4f}" for k, v in rep.items() if k != "all")
+        rec = dict(epoch=ep, loss=tot / max(1, seen), seconds=time.time() - t0, skipped_steps=skipped)
         extra = f"  ({skipped} steps skipped: non-finite loss)" if skipped else ""
-        log(f"[stage A] epoch {ep}/{cfg['epochs']}  loss {rec['loss']:.4f}  dev macro-F1 {f:.4f} ({doms})"
-            f"  {rec['seconds']:.0f}s{mark}{extra}")
-    clf.load_state_dict(best_state)
-    log(f"[stage A] using epoch {best_epoch} (dev macro-F1 {best:.4f})")
-    return dict(history=history, best_epoch=best_epoch, best_dev_macro_f1=best, class_weights=w,
-                train_counts=dict(zip(labels, counts)), train_seconds=time.time() - t_start,
-                weight_tensor=weight)
+        if dev_docs:
+            dev_out = run_sentences(clf, dev_docs, cfg, device, pad_id)
+            rep = D.evaluate(dev_docs, to_preds(dev_docs, dev_out, labels), labels)
+            f = rep["all"][sel]
+            rec.update(dev=f, **{f"dev_{k}": v[sel] for k, v in rep.items() if k != "all"})
+            mark = ""
+            if f > best:
+                best, best_epoch, mark = f, ep, "  <- best so far"
+                best_state = {k: v.detach().to("cpu", copy=True) for k, v in clf.state_dict().items()}
+            doms = ", ".join(f"{k} {v[sel]:.4f}" for k, v in rep.items() if k != "all")
+            log(f"[stage A] epoch {ep}/{cfg['epochs']}  loss {rec['loss']:.4f}  dev {mname} {f:.4f} ({doms})"
+                f"  {rec['seconds']:.0f}s{mark}{extra}")
+        else:
+            best_epoch = ep
+            log(f"[stage A] epoch {ep}/{cfg['epochs']}  loss {rec['loss']:.4f}  {rec['seconds']:.0f}s{extra}")
+        history.append(rec)
+    if best_state is not None:
+        clf.load_state_dict(best_state)
+        log(f"[stage A] using epoch {best_epoch} (dev {mname} {best:.4f})")
+    else:
+        log(f"[stage A] using the last epoch ({best_epoch}); dev was not looked at")
+    return dict(history=history, best_epoch=best_epoch, best_dev_score=best if best_state is not None else None,
+                select_metric=sel, class_weights=w, train_counts=dict(zip(labels, counts)),
+                train_seconds=time.time() - t_start, weight_tensor=weight)
 
 
 # --------------------------------------------------------------------------- Stage B
@@ -273,6 +286,8 @@ def predict_stage_b(model, feats, device):
 
 
 def train_stage_b(feats, ys, dev_feats, dev_docs, labels, cfg, device, weight, log=print):
+    """Train the BiGRU over judgments; the best epoch on dev_docs (early stopping) is kept."""
+    sel, mname = cfg["select_metric"], METRIC_NAMES[cfg["select_metric"]]
     torch.manual_seed(cfg["seed"])
     feat_dim = next(f for f in feats if f is not None).size(-1)
     model = ContextClassifier(feat_dim, len(labels), cfg["b_hidden"], cfg["b_dropout"], cfg["b_layers"]).to(device)
@@ -297,9 +312,9 @@ def train_stage_b(feats, ys, dev_feats, dev_docs, labels, cfg, device, weight, l
             tot += loss.item() * len(y)
             n += len(y)
         rep = D.evaluate(dev_docs, to_preds(dev_docs, predict_stage_b(model, dev_feats, device), labels), labels)
-        f = rep["all"]["macro_f1"]
-        history.append(dict(epoch=ep, loss=tot / max(1, n), dev_macro_f1=f,
-                            **{f"dev_{k}": v["macro_f1"] for k, v in rep.items() if k != "all"}))
+        f = rep["all"][sel]
+        history.append(dict(epoch=ep, loss=tot / max(1, n), dev=f,
+                            **{f"dev_{k}": v[sel] for k, v in rep.items() if k != "all"}))
         mark = ""
         if f > best:
             best, best_epoch, bad, mark = f, ep, 0, "  <- best so far"
@@ -307,44 +322,45 @@ def train_stage_b(feats, ys, dev_feats, dev_docs, labels, cfg, device, weight, l
         else:
             bad += 1
         if mark or ep == 1 or ep % 5 == 0:
-            doms = ", ".join(f"{k} {v['macro_f1']:.4f}" for k, v in rep.items() if k != "all")
-            log(f"[stage B] epoch {ep}/{cfg['b_epochs']}  loss {tot / max(1, n):.4f}  dev macro-F1 {f:.4f} ({doms}){mark}")
+            doms = ", ".join(f"{k} {v[sel]:.4f}" for k, v in rep.items() if k != "all")
+            log(f"[stage B] epoch {ep}/{cfg['b_epochs']}  loss {tot / max(1, n):.4f}  dev {mname} {f:.4f} ({doms}){mark}")
         if bad >= cfg["b_patience"]:
             log(f"[stage B] no improvement for {bad} epochs, stopping")
             break
     model.load_state_dict(best_state)
-    log(f"[stage B] using epoch {best_epoch} (dev macro-F1 {best:.4f})")
-    return model, dict(history=history, best_epoch=best_epoch, best_dev_macro_f1=best,
+    log(f"[stage B] using epoch {best_epoch} (dev {mname} {best:.4f})")
+    return model, dict(history=history, best_epoch=best_epoch, best_dev_score=best, select_metric=sel,
                        train_seconds=time.time() - t_start)
 
 
-# ------------------------------------------------------------------------------- run
-def _save_stage(out, name, dev_docs, dev_preds, test_docs, test_preds, rep, labels):
-    d = os.path.join(out, name)
-    os.makedirs(d, exist_ok=True)
-    D.write_submission(test_docs, test_preds, labels, d)
-    with open(os.path.join(d, "dev_predictions.json"), "w", encoding="utf-8") as f:
-        json.dump(dev_preds, f)
-    D.confusion_csv(rep["all"]["confusion"], labels, os.path.join(d, "dev_confusion.csv"))
-
-
-def run(bb, **overrides) -> dict:
-    unknown = set(overrides) - set(DEFAULTS)
+# ------------------------------------------------------------------- shared run steps
+def resolve_cfg(bb, overrides, defaults=None) -> dict:
+    defaults = DEFAULTS if defaults is None else defaults
+    unknown = set(overrides) - set(defaults)
     if unknown:
-        raise ValueError(f"unknown settings: {sorted(unknown)}; known: {sorted(DEFAULTS)}")
-    cfg = {**DEFAULTS, **overrides}
+        raise ValueError(f"unknown settings: {sorted(unknown)}; known: {sorted(defaults)}")
+    cfg = {**defaults, **overrides}
     if cfg["exact_batches"] is None:
         cfg["exact_batches"] = bool(getattr(bb, "pad_effect", 0.0) > 1e-4)
+    if cfg["select_metric"] not in METRIC_NAMES:
+        raise ValueError(f"select_metric must be one of {sorted(METRIC_NAMES)}")
+    return cfg
+
+
+def start_run(cfg, kind="run"):
     set_seed(cfg["seed"])
     device = torch.device(cfg["device"] or ("cuda" if torch.cuda.is_available() else "cpu"))
     out = os.path.join(cfg["out_dir"], cfg["run_name"])
     os.makedirs(out, exist_ok=True)
     log = Logger(os.path.join(out, "log.txt"))
-    log(f"===== run '{cfg['run_name']}' on {device} -> {out}")
+    log(f"===== {kind} '{cfg['run_name']}' on {device} -> {out}")
     with open(os.path.join(out, "config.json"), "w") as f:
         json.dump(cfg, f, indent=1)
+    return device, out, log
 
-    # ---------------------------------------------------------------- data
+
+def prepare(bb, cfg, log=print):
+    """Labels and train/dev/test judgments, tokenised (d["ids"]) and checked against the model."""
     labels = D.load_labels(cfg["data_root"])
     docs = D.load_docs(cfg["data_root"])
     D.check_labels(docs, labels)
@@ -363,8 +379,11 @@ def run(bb, **overrides) -> dict:
     top = max((max(s) for d in train + dev + test for s in d["ids"]), default=0)
     if bb.vocab is not None and top >= bb.vocab:
         raise ValueError(f"token id {top} is >= the model's vocabulary size {bb.vocab}; wrong tokenizer?")
+    return labels, train, dev, test
 
-    # ---------------------------------------------------------------- model
+
+def build_stage_a(bb, labels, cfg, device, train_docs, log=print):
+    """A fresh copy of the Phase 1 model + head, with the chosen method; returns (clf, trainable, total)."""
     try:
         fresh = copy.deepcopy(bb.model)
     except Exception as e:  # noqa: BLE001
@@ -380,10 +399,34 @@ def run(bb, **overrides) -> dict:
         freeze_backbone(clf)
     elif cfg["method"] != "full":
         raise ValueError("method must be 'full' or 'frozen' (PEFT methods come next)")
-    freeze_unused(clf, train, cfg, device, bb.pad_id, log)
+    freeze_unused(clf, train_docs, cfg, device, bb.pad_id, log)
     n_trainable, n_total = count_params(clf), count_params(clf, trainable_only=False)
     log(f"[setup] method '{cfg['method']}': {n_trainable / 1e6:.2f}M trainable of {n_total / 1e6:.2f}M "
         f"parameters ({n_trainable / n_total:.1%})")
+    return clf, n_trainable, n_total
+
+
+def _save_stage(out, name, dev_docs, dev_preds, test_docs, test_preds, rep, labels):
+    d = os.path.join(out, name)
+    os.makedirs(d, exist_ok=True)
+    D.write_submission(test_docs, test_preds, labels, d)
+    with open(os.path.join(d, "dev_predictions.json"), "w", encoding="utf-8") as f:
+        json.dump(dev_preds, f)
+    D.confusion_csv(rep["all"]["confusion"], labels, os.path.join(d, "dev_confusion.csv"))
+
+
+def _fit_summary(rep):
+    return {k: dict(accuracy=v["accuracy"], macro_f1_all13=v["macro_f1_all13"], macro_f1=v["macro_f1"])
+            for k, v in rep.items()}
+
+
+# ------------------------------------------------------------------------------- run
+def run(bb, **overrides) -> dict:
+    cfg = resolve_cfg(bb, overrides)
+    sel = cfg["select_metric"]
+    device, out, log = start_run(cfg)
+    labels, train, dev, test = prepare(bb, cfg, log)
+    clf, n_trainable, n_total = build_stage_a(bb, labels, cfg, device, train, log)
 
     # ---------------------------------------------------------------- Stage A
     _reset_peak(device)
@@ -393,6 +436,10 @@ def run(bb, **overrides) -> dict:
     out_a = {s: run_sentences(clf, ds, cfg, device, bb.pad_id) for s, ds in (("dev", dev), ("test", test))}
     preds_a = {s: to_preds(ds, out_a[s], labels) for s, ds in (("dev", dev), ("test", test))}
     rep_a = D.evaluate(dev, preds_a["dev"], labels)
+    rep_fit = D.evaluate(train, to_preds(train, run_sentences(clf, train, cfg, device, bb.pad_id), labels), labels)
+    log(f"[stage A] on its own training sentences: accuracy {rep_fit['all']['accuracy']:.3f}, 13-role avg "
+        f"{rep_fit['all']['macro_f1_all13']:.3f} | on dev: accuracy {rep_a['all']['accuracy']:.3f}, 13-role avg "
+        f"{rep_a['all']['macro_f1_all13']:.3f}  (a big gap = memorising)")
     _save_stage(out, "stageA", dev, preds_a["dev"], test, preds_a["test"], rep_a, labels)
     if cfg["save_model"]:
         torch.save({"state_dict": clf.state_dict(), "labels": labels, "config": cfg},
@@ -429,14 +476,14 @@ def run(bb, **overrides) -> dict:
         f"{info_a['best_epoch']:>12d}")
     log(f"{'Stage B':10s}{n_b / 1e6:>17.2f}M{fmt_gb(peak_b):>17s}{info_b['train_seconds'] / 60:>10.1f}m"
         f"{info_b['best_epoch']:>12d}")
-    best = "stageB" if rep_b["all"]["macro_f1"] >= rep_a["all"]["macro_f1"] else "stageA"
-    log(f"\nbest on dev: {best} -> submit {os.path.join(out, best, 'submission.zip')}")
+    best = "stageB" if rep_b["all"][sel] >= rep_a["all"][sel] else "stageA"
+    log(f"\nbest on dev ({METRIC_NAMES[sel]}): {best} -> submit {os.path.join(out, best, 'submission.zip')}")
 
     metrics = dict(run_name=cfg["run_name"], route=bb.route, kind=bb.kind, pooling=clf.pool.kind,
                    data={s: dict(docs=len(ds), sentences=sum(len(d["sents"]) for d in ds))
                          for s, ds in (("train", train), ("dev", dev), ("test", test))},
-                   stage_a=dict(dev=rep_a, trainable_params=n_trainable, total_params=n_total,
-                                peak_gpu_gb=peak_a, **info_a),
+                   stage_a=dict(dev=rep_a, train_fit=_fit_summary(rep_fit), trainable_params=n_trainable,
+                                total_params=n_total, peak_gpu_gb=peak_a, **info_a),
                    stage_b=dict(dev=rep_b, trainable_params=n_b, peak_gpu_gb=peak_b, **info_b),
                    best=best, config=cfg)
     with open(os.path.join(out, "metrics.json"), "w") as f:

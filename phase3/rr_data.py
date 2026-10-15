@@ -253,24 +253,35 @@ def top_confusions(cm: list[list[int]], labels: list[str], k: int = 10):
     return sorted(pairs, reverse=True)[:k]
 
 
-def format_report(results: dict[str, dict], labels: list[str]) -> str:
-    """results: {"Stage A": evaluate(...), "Stage B": evaluate(...)} -> text tables."""
+def format_report(results: dict[str, dict], labels: list[str], k_mistakes: int = 8) -> str:
+    """results: {"Stage A": evaluate(...), "Stage B": evaluate(...), ...} -> text tables:
+    13-role average and macro-F1 (overall, CL, IT), accuracy, per-role F1 for each domain,
+    and the most common mistakes of the last result in each domain."""
     names = list(results)
     doms = [k for k in next(iter(results.values())) if k != "all"]
-    lines = [f"{'':10s}" + "".join(f"{n:>14s}" for n in names)]
+    w = max(10, max(len(n) for n in names) + 2)
+    lines = [f"{'':20s}" + "".join(f"{n:>{w}s}" for n in names)]
     for key in ["all"] + doms:
-        lines.append(f"{('macro-F1 ' + key):10s}" + "".join(f"{results[n][key]['macro_f1']:14.4f}" for n in names))
-    lines.append(f"{'accuracy':10s}" + "".join(f"{results[n]['all']['accuracy']:14.4f}" for n in names))
+        lines.append(f"{('13-role avg ' + key):20s}" +
+                     "".join(f"{results[n][key]['macro_f1_all13']:{w}.4f}" for n in names))
+    for key in ["all"] + doms:
+        lines.append(f"{('macro-F1 ' + key):20s}" + "".join(f"{results[n][key]['macro_f1']:{w}.4f}" for n in names))
+    lines.append(f"{'accuracy':20s}" + "".join(f"{results[n]['all']['accuracy']:{w}.4f}" for n in names))
+    lines.append("   (13-role avg = every role counts, as on Codabench; macro-F1 = only roles present)")
     lines.append("")
-    lines.append(f"{'role':24s}{'support':>8s}" + "".join(f"{('F1 ' + n):>14s}" for n in names))
-    first = results[names[0]]["all"]["per_label"]
-    for l in sorted(labels, key=lambda l: -first[l]["support"]):
-        lines.append(f"{l:24s}{first[l]['support']:8d}" +
-                     "".join(f"{results[n]['all']['per_label'][l]['f1']:14.3f}" for n in names))
+    cw = max(9, max(len(n) for n in names) + 5)
+    lines.append(f"{'F1 per role':24s}" + "".join(f"{('n ' + dm):>7s}" for dm in doms) +
+                 "".join(f"{(n + ' ' + dm):>{cw}s}" for n in names for dm in doms))
+    first = results[names[0]]
+    order = sorted(labels, key=lambda l: -first["all"]["per_label"][l]["support"])
+    for l in order:
+        lines.append(f"{l:24s}" + "".join(f"{first[dm]['per_label'][l]['support']:7d}" for dm in doms) +
+                     "".join(f"{results[n][dm]['per_label'][l]['f1']:{cw}.3f}" for n in names for dm in doms))
     last = names[-1]
-    lines.append(f"\nmost common mistakes ({last}): gold -> predicted")
-    for c, g, p in top_confusions(results[last]["all"]["confusion"], labels):
-        lines.append(f"  {c:5d}  {g} -> {p}")
+    for dm in doms:
+        lines.append(f"\nmost common mistakes ({last}, {dm}): gold -> predicted")
+        for c, g, p in top_confusions(results[last][dm]["confusion"], labels, k_mistakes):
+            lines.append(f"  {c:5d}  {g} -> {p}")
     return "\n".join(lines)
 
 
@@ -316,3 +327,81 @@ def write_submission(test_docs: list[dict], preds: dict[str, list[str]], labels:
     print(f"[submission] {zpath}: {len(sub)} judgments, {n} sentences, all counts match")
     print("             predicted roles:", ", ".join(f"{l} {c}" for l, c in dist.most_common()))
     return zpath
+
+
+# ------------------------------------------------------------------ cross-validation
+def make_folds(docs: list[dict], k: int = 5, seed: int = 0) -> list[list[int]]:
+    """k groups of document indices with the same share of each domain (CL, IT) in every group."""
+    rng = random.Random(seed)
+    folds: list[list[int]] = [[] for _ in range(k)]
+    j = 0
+    for dom in sorted({d["domain"] for d in docs}):
+        idx = [i for i, d in enumerate(docs) if d["domain"] == dom]
+        rng.shuffle(idx)
+        for i in idx:
+            folds[j % k].append(i)
+            j += 1
+    return [sorted(f) for f in folds]
+
+
+def macro_f1_np(gold, pred, n_labels: int, present_only: bool = False) -> float:
+    """Fast macro-F1 with numpy. Default: average over all n_labels roles (Codabench style)."""
+    import numpy as np
+    gold, pred = np.asarray(gold), np.asarray(pred)
+    cm = np.bincount(gold * n_labels + pred, minlength=n_labels * n_labels).reshape(n_labels, n_labels)
+    tp = np.diag(cm).astype(float)
+    support, predicted = cm.sum(1), cm.sum(0)
+    p = np.divide(tp, predicted, out=np.zeros_like(tp), where=predicted > 0)
+    r = np.divide(tp, support, out=np.zeros_like(tp), where=support > 0)
+    f = np.divide(2 * p * r, p + r, out=np.zeros_like(tp), where=(p + r) > 0)
+    if present_only:
+        m = (support + predicted) > 0
+        return float(f[m].mean()) if m.any() else 0.0
+    return float(f.mean())
+
+
+def tune_biases(logp, gold, n_labels: int, groups=None, n_groups: int = 1, grid=None, passes: int = 3):
+    """Per-role numbers added to the log-probabilities before choosing the role, set to
+    maximise the 13-role macro-F1 (a role with a positive bias is chosen more readily).
+    groups: optional group id per sentence (e.g. 0 = CL, 1 = IT) -> one bias vector per group.
+    Coordinate ascent: for each (group, role) try every grid value, keep the best; repeat.
+    Returns (biases [n_groups, n_labels], score before, score after)."""
+    import numpy as np
+    logp = np.asarray(logp, dtype=np.float64)
+    gold = np.asarray(gold)
+    groups = np.zeros(len(gold), dtype=int) if groups is None else np.asarray(groups)
+    grid = np.round(np.arange(-3.0, 3.0001, 0.25), 4) if grid is None else np.asarray(grid)
+    b = np.zeros((n_groups, n_labels))
+
+    def score():
+        return macro_f1_np(gold, (logp + b[groups]).argmax(1), n_labels)
+
+    start = best = score()
+    for _ in range(passes):
+        improved = False
+        for g in range(n_groups):
+            if not (groups == g).any():
+                continue
+            for c in range(n_labels):
+                keep = b[g, c]
+                for v in grid:
+                    b[g, c] = v
+                    s = score()
+                    if s > best + 1e-9:
+                        best, keep, improved = s, v, True
+                b[g, c] = keep
+        if not improved:
+            break
+    return b, start, best
+
+
+def biased_preds(docs: list[dict], logps, labels: list[str], bias, group_of) -> dict[str, list[str]]:
+    """{doc_id: [role per sentence]} after adding bias[group_of(doc)] to each sentence's log-probs."""
+    import numpy as np
+    out = {}
+    for d, lp in zip(docs, logps):
+        if lp is None or len(lp) == 0:
+            out[d["id"]] = []
+            continue
+        out[d["id"]] = [labels[i] for i in (np.asarray(lp, dtype=np.float64) + bias[group_of(d)]).argmax(1)]
+    return out

@@ -176,6 +176,49 @@ def test_evaluate_report_and_submission():
                 pass
 
 
+def test_make_folds_balanced():
+    docs = [{"domain": "CL"}] * 40 + [{"domain": "IT"}] * 40
+    folds = D.make_folds(docs, 5, seed=1)
+    assert sorted(i for f in folds for i in f) == list(range(80))
+    for f in folds:
+        assert len(f) == 16 and sum(1 for i in f if i < 40) == 8   # 8 CL + 8 IT each
+    assert D.make_folds(docs, 5, seed=1) == folds                  # reproducible
+    small = D.make_folds([{"domain": "CL"}] * 3 + [{"domain": "IT"}] * 3, 3)
+    assert sorted(i for f in small for i in f) == list(range(6))
+
+
+def test_macro_f1_np_matches_scores():
+    rng = random.Random(0)
+    gold = [rng.randrange(13) for _ in range(500)]
+    pred = [g if rng.random() < 0.6 else rng.randrange(13) for g in gold]
+    s = D.scores(gold, pred, LABELS)
+    assert abs(D.macro_f1_np(gold, pred, 13) - s["macro_f1_all13"]) < 1e-12
+    assert abs(D.macro_f1_np(gold, pred, 13, present_only=True) - s["macro_f1"]) < 1e-12
+
+
+def test_tune_biases_helps_rare_role_and_groups():
+    import numpy as np
+    rng = np.random.default_rng(0)
+    n = 3000
+    gold = rng.choice(3, size=n, p=[0.80, 0.15, 0.05])
+    logp = np.log(np.full((n, 3), 1e-3))
+    for i, g in enumerate(gold):                       # the model is shy about the rare roles
+        logp[i] = np.log([0.60, 0.25, 0.15]) if g == 0 else (
+            np.log([0.45, 0.40, 0.15]) if g == 1 else np.log([0.45, 0.20, 0.35]))
+    logp += rng.normal(0, 0.3, size=logp.shape)
+    b, before, after = D.tune_biases(logp, gold, 3)
+    assert b.shape == (1, 3) and after > before + 0.1, (before, after)
+    assert abs(D.macro_f1_np(gold, (logp + b[0]).argmax(1), 3) - after) < 1e-12
+    groups = (np.arange(n) % 2)
+    bg, before_g, after_g = D.tune_biases(logp, gold, 3, groups=groups, n_groups=2)
+    assert bg.shape == (2, 3) and after_g >= after - 1e-9      # more freedom never scores lower on fit data
+    docs = [{"id": "a", "domain": "CL"}, {"id": "b", "domain": "IT"}, {"id": "c", "domain": "CL"}]
+    lps = [logp[:4], logp[4:6], None]
+    out = D.biased_preds(docs, lps, ["x", "y", "z"], bg, lambda d: 0 if d["domain"] == "CL" else 1)
+    assert len(out["a"]) == 4 and len(out["b"]) == 2 and out["c"] == []
+    print(f"      bias tuning: 3-role macro-F1 {before:.3f} -> {after:.3f} (global), {after_g:.3f} (per group)")
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):
