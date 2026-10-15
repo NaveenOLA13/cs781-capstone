@@ -219,6 +219,37 @@ def test_tune_biases_helps_rare_role_and_groups():
     print(f"      bias tuning: 3-role macro-F1 {before:.3f} -> {after:.3f} (global), {after_g:.3f} (per group)")
 
 
+def _fake_metrics(docs, preds, name, trainable, saved_mb):
+    rep = D.evaluate(docs, preds, LABELS)
+    return dict(run_name=name, best="stageB",
+                stage_a=dict(dev=rep, trainable_params=trainable, total_params=1000, peak_gpu_gb=1.5,
+                             saved_mb=saved_mb, train_seconds=90.0, best_epoch=2,
+                             history=[dict(seconds=30.0)] * 3, train_fit={"all": {"accuracy": 0.9}}),
+                stage_b=dict(dev=rep))
+
+
+def test_pair_confusions_and_comparison():
+    docs = [{"id": "a", "domain": "CL", "labels": ["ArgumentPetitioner"] * 3 + ["ArgumentRespondent"] * 2},
+            {"id": "b", "domain": "IT", "labels": ["Fact"] * 4}]
+    preds = {"a": ["ArgumentRespondent", "ArgumentPetitioner", "ArgumentPetitioner",
+                   "ArgumentPetitioner", "ArgumentRespondent"], "b": ["Fact", "Fact", "RatioOfTheDecision", "Fact"]}
+    pc = D.pair_confusions(D.evaluate(docs, preds, LABELS), LABELS)
+    assert pc["Pet/Resp"]["CL"] == dict(rate=2 / 5, a_to_b=1, b_to_a=1, n=5), pc["Pet/Resp"]["CL"]
+    assert pc["Pet/Resp"]["IT"]["rate"] is None and pc["Pet/Resp"]["IT"]["n"] == 0
+    assert abs(pc["Fact/Ratio"]["all"]["rate"] - 1 / 4) < 1e-12 and pc["Fact/Ratio"]["IT"]["a_to_b"] == 1
+    assert "Lower/Present" in pc and len(pc) == len(D.CLOSE_PAIRS)
+    perfect = {d["id"]: list(d["labels"]) for d in docs}
+    runs = {"full": _fake_metrics(docs, preds, "x_full", 1000, 330.0),
+            "lora": _fake_metrics(docs, perfect, "x_lora", 12, 0.1), "ia3": None}
+    text = D.format_comparison(runs)
+    for s in ("COST", "DEV 13-ROLE AVERAGE", "MEMORISING", "CLOSELY RELATED", "Stage B, CL", "Stage A, IT",
+              "failed runs: ia3", "Pet/Resp", "330.0 MB", "1.20%"):
+        assert s in text, (s, text)
+    row = [line for line in text.splitlines() if line.startswith("lora")]
+    assert row and "0.0" in row[-1], row        # perfect predictions mix up nothing
+    assert D.format_comparison({"a": None}).startswith("no finished runs")
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):

@@ -292,6 +292,106 @@ def confusion_csv(cm: list[list[int]], labels: list[str], path: str) -> None:
             f.write(l + "," + ",".join(map(str, row)) + "\n")
 
 
+# ------------------------------------------------------------------- comparing runs
+# Roles that are easy to mix up: similar wording, or the same part of the judgment.
+# The first four include the most common mistakes of encdec_full (PrecRelied->Ratio, ArgResp->ArgPet).
+CLOSE_PAIRS = [
+    ("Pet/Resp", "ArgumentPetitioner", "ArgumentRespondent"),
+    ("Relied/Ratio", "PrecedentReliedUpon", "RatioOfTheDecision"),
+    ("Relied/NotRel", "PrecedentReliedUpon", "PrecedentNotReliedUpon"),
+    ("Fact/Ratio", "Fact", "RatioOfTheDecision"),
+    ("Lower/Fact", "RulingByLowerCourt", "Fact"),
+    ("Lower/Present", "RulingByLowerCourt", "RulingByPresentCourt"),
+    ("Ratio/Present", "RatioOfTheDecision", "RulingByPresentCourt"),
+]
+
+
+def pair_confusions(rep: dict, labels: list[str], pairs=CLOSE_PAIRS) -> dict:
+    """For each pair (a, b) and domain: of the sentences whose gold role is a or b, the share that
+    got the other role of the pair (rate; lower = the two roles are kept apart better).
+    rep: evaluate(...) output. Returns {short name: {domain: {rate, a_to_b, b_to_a, n}}}."""
+    idx = {l: i for i, l in enumerate(labels)}
+    out = {}
+    for short, a, b in pairs:
+        if a not in idx or b not in idx:
+            continue
+        ia, ib = idx[a], idx[b]
+        out[short] = {}
+        for dom, s in rep.items():
+            cm = s["confusion"]
+            n = sum(cm[ia]) + sum(cm[ib])
+            ab, ba = cm[ia][ib], cm[ib][ia]
+            out[short][dom] = dict(rate=(ab + ba) / n if n else None, a_to_b=ab, b_to_a=ba, n=n)
+    return out
+
+
+def _fmt(x, spec: str, width: int) -> str:
+    return f"{'-':>{width}s}" if x is None else f"{x:>{width}{spec}}"
+
+
+def format_comparison(runs: dict[str, dict | None], pairs=CLOSE_PAIRS) -> str:
+    """runs: {method name: metrics dict saved by rr_train.run (None = the run failed)} -> tables:
+    cost, dev 13-role average (all / CL / IT) of Stage A and Stage B, memorising (train vs dev
+    accuracy of Stage A), and how often closely related roles are mixed up, per domain."""
+    ok = {k: v for k, v in runs.items() if v}
+    failed = [k for k, v in runs.items() if not v]
+    if not ok:
+        return "no finished runs" + (f" (failed: {', '.join(failed)})" if failed else "")
+    first = next(iter(ok.values()))
+    labels = list(first["stage_a"]["dev"]["all"]["per_label"])
+    doms = [k for k in first["stage_a"]["dev"] if k != "all"]
+    w = max(10, max(len(k) for k in ok) + 2)
+    L = []
+
+    L.append("COST (Stage A)")
+    L.append(f"{'method':{w}s}{'trainable':>12s}{'% of all':>11s}{'saved file':>13s}{'peak GPU':>11s}"
+             f"{'time':>9s}{'s/epoch':>9s}{'best epoch':>12s}")
+    for k, m in ok.items():
+        a = m["stage_a"]
+        hist = a.get("history") or []
+        per_ep = sum(h["seconds"] for h in hist) / len(hist) if hist else None
+        pct = 100 * a["trainable_params"] / a["total_params"] if a.get("total_params") else None
+        L.append(f"{k:{w}s}{a['trainable_params'] / 1e6:>11.3f}M{_fmt(pct, '.2f', 10)}%"
+                 f"{_fmt(a.get('saved_mb'), '.1f', 10)} MB{_fmt(a.get('peak_gpu_gb'), '.2f', 8)} GB"
+                 f"{a['train_seconds'] / 60:>8.1f}m{_fmt(per_ep, '.0f', 8)}s{a['best_epoch']:>9d}/{len(hist):<2d}")
+
+    L.append("\nDEV 13-ROLE AVERAGE (the Codabench metric)")
+    cols = [(st, dm) for st in ("A", "B") for dm in ["all"] + doms]
+    L.append(f"{'method':{w}s}" + "".join(f"{(st + ' ' + dm):>9s}" for st, dm in cols) + f"{'B acc':>9s}")
+    for k, m in ok.items():
+        st_key = {"A": "stage_a", "B": "stage_b"}
+        L.append(f"{k:{w}s}" + "".join(f"{m[st_key[st]]['dev'][dm]['macro_f1_all13']:>9.4f}" for st, dm in cols)
+                 + f"{m['stage_b']['dev']['all']['accuracy']:>9.4f}")
+
+    L.append("\nMEMORISING (Stage A accuracy on its own training sentences vs dev; big gap = memorising)")
+    L.append(f"{'method':{w}s}{'train acc':>11s}{'dev acc':>9s}{'gap':>8s}")
+    for k, m in ok.items():
+        fit = (m["stage_a"].get("train_fit") or {}).get("all", {}).get("accuracy")
+        dev = m["stage_a"]["dev"]["all"]["accuracy"]
+        L.append(f"{k:{w}s}{_fmt(fit, '.3f', 11)}{dev:>9.3f}{_fmt(None if fit is None else fit - dev, '.3f', 8)}")
+
+    names = [p[0] for p in pairs if p[1] in labels and p[2] in labels]
+    if names:
+        pw = max(9, max(len(n) for n in names) + 2)
+        L.append("\nCLOSELY RELATED ROLES: % of the two roles' dev sentences given the other role of the pair "
+                 "(lower = kept apart better)")
+        L += [f"  {s:14s} {a} / {b}" for s, a, b in pairs if s in names]
+        for st, st_key in (("Stage A", "stage_a"), ("Stage B", "stage_b")):
+            pc = {k: pair_confusions(m[st_key]["dev"], labels, pairs) for k, m in ok.items()}
+            for dm in ["all"] + doms:
+                L.append(f"\n{st}, {dm}")
+                L.append(f"{'method':{w}s}" + "".join(f"{n:>{pw}s}" for n in names))
+                for k in ok:
+                    L.append(f"{k:{w}s}" + "".join(
+                        _fmt(None if pc[k][n][dm]["rate"] is None else 100 * pc[k][n][dm]["rate"], ".1f", pw)
+                        for n in names))
+                ref = next(iter(pc.values()))
+                L.append(f"{'(sentences)':{w}s}" + "".join(f"{ref[n][dm]['n']:>{pw}d}" for n in names))
+    if failed:
+        L.append(f"\nfailed runs: {', '.join(failed)}")
+    return "\n".join(L)
+
+
 # ----------------------------------------------------------------------- submission
 def write_submission(test_docs: list[dict], preds: dict[str, list[str]], labels: list[str],
                      out_dir: str) -> str:

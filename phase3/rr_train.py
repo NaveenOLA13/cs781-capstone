@@ -3,6 +3,8 @@
 Stage A  each sentence alone: Phase 1 model -> pooling -> + position -> head  (fine-tuned)
 Stage B  whole judgment: frozen Stage A features x_1..x_S -> BiGRU -> head
 Both are scored on dev (overall, CL, IT, per role) and both get a Codabench zip.
+Stage A methods: "full" fine-tuning, "frozen" backbone (head only), or a PEFT method from rr_peft.py
+("lora", "rslora", "adalora", "ia3": the Phase 1 weights stay fixed, small adapters are trained).
 
     from rr_backbone import make_backbone
     from rr_train import run
@@ -11,8 +13,8 @@ Both are scored on dev (overall, CL, IT, per role) and both get a Codabench zip.
 
 Every run trains a fresh copy of the Phase 1 weights, so runs never affect each other.
 Outputs in out_dir/run_name/: log.txt, metrics.json, stageA/ and stageB/ (submission.zip,
-prediction.json, dev_predictions.json, dev_confusion.csv), stageA_model.pt, stageB_model.pt,
-features.pt.
+prediction.json, dev_predictions.json, dev_confusion.csv), stageA_model.pt (PEFT methods:
+stageA_adapter.pt with only the trained tensors), stageB_model.pt, features.pt.
 """
 from __future__ import annotations
 
@@ -30,6 +32,7 @@ import torch
 import torch.nn.functional as F
 
 import rr_data as D
+import rr_peft as P
 from rr_head import ContextClassifier, count_params, freeze_backbone
 
 # the fp16 loss scaler skips its first step(s) on purpose; the scheduler warning about it is harmless
@@ -41,11 +44,19 @@ DEFAULTS = dict(
     # inputs
     max_len=128, pos_buckets=10, pos_dim=32,
     # Stage A
-    method="full",               # "full" fine-tuning or "frozen" backbone (head only)
+    method="full",               # "full", "frozen" (head only) or PEFT: "lora", "rslora", "adalora", "ia3"
     head="linear", dropout=0.1, epochs=3, batch_size=64, eval_batch_size=128,
     lr_backbone=5e-5, lr_head=1e-3, weight_decay=0.01, warmup=0.06, grad_clip=1.0, amp=True,
     weight_cap=10.0, weight_power=0.5, log_every=100,
     exact_batches=None,          # None: automatic (True if padding changes the model's outputs)
+    # PEFT (rr_peft.py), used only with a PEFT method
+    lr_peft=None,                # adapter learning rate; None: 5e-4 for the LoRA family, 3e-3 for IA3
+    peft_r=8, peft_alpha=16, peft_dropout=0.05,   # LoRA rank / alpha / dropout (AdaLoRA: final average rank)
+    peft_targets=None,           # layer names; None: LoRA family every Linear but the LM head, IA3 key/value/FF-down
+    ia3_ff=None,                 # IA3 feed-forward layers (input scaled); None: automatic
+    adalora_init_r=12,           # AdaLoRA starting rank per layer
+    adalora_tinit=0.1, adalora_tfinal=0.2,       # share of steps before rank changes start / after they stop
+    adalora_deltaT=10, adalora_orth=0.5,         # steps between budget updates; orthogonality penalty weight
     # Stage B
     b_epochs=40, b_patience=10, b_lr=1e-3, b_weight_decay=0.01, b_hidden=256, b_dropout=0.3, b_layers=1,
     save_model=True,
@@ -157,12 +168,14 @@ def run_sentences(clf, docs, cfg, device, pad_id, what="logits"):
 
 
 def make_optimizer(named_params, head_ids, cfg):
+    body_lr = cfg["lr_peft"] if cfg["method"] in P.PEFT_METHODS else cfg["lr_backbone"]
     groups = {}
-    for _, p in named_params:
+    for n, p in named_params:
         if not p.requires_grad:
             continue
-        lr = cfg["lr_head"] if id(p) in head_ids else cfg["lr_backbone"]
-        wd = cfg["weight_decay"] if p.dim() >= 2 else 0.0
+        lr = cfg["lr_head"] if id(p) in head_ids else body_lr
+        # no decay for biases, norms and IA3 scaling vectors (decay would pull a scale towards 0, not 1)
+        wd = cfg["weight_decay"] if p.dim() >= 2 and "ia3_" not in n else 0.0
         groups.setdefault((lr, wd), []).append(p)
     return torch.optim.AdamW([dict(params=v, lr=k[0], weight_decay=k[1]) for k, v in groups.items()])
 
@@ -173,6 +186,13 @@ def warmup_linear(opt, warmup_steps, total_steps):
             return (step + 1) / max(1, warmup_steps)
         return max(0.0, (total_steps - step) / max(1, total_steps - warmup_steps))
     return torch.optim.lr_scheduler.LambdaLR(opt, f)
+
+
+def stage_a_steps(docs, cfg) -> int:
+    """Optimizer steps per epoch of Stage A (the same for every epoch and seed)."""
+    items = flat(docs, cfg["pos_buckets"])
+    lengths = [len(docs[di]["ids"][si]) for di, si, _ in items]
+    return len(D.length_batches(lengths, cfg["batch_size"], shuffle=True, exact=cfg["exact_batches"]))
 
 
 def freeze_unused(clf, docs, cfg, device, pad_id, log=print, n_batches=3):
@@ -215,7 +235,8 @@ def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=pr
 
     head_ids = {id(p) for p in clf.head_parameters()}
     opt = make_optimizer(clf.named_parameters(), head_ids, cfg)
-    steps = len(D.length_batches(lengths, cfg["batch_size"], shuffle=True, exact=cfg["exact_batches"]))
+    steps = stage_a_steps(train_docs, cfg)
+    hooks = getattr(clf, "peft_hooks", None)       # AdaLoRA: extra loss term and rank updates
     total = steps * cfg["epochs"]
     sched = warmup_linear(opt, int(cfg["warmup"] * total), total)
     scaler = _scaler(device, cfg["amp"])
@@ -234,7 +255,9 @@ def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=pr
             y = torch.tensor([y_all[k] for k in b], dtype=torch.long, device=device)
             with _autocast(device, cfg["amp"]):
                 logits = clf(ids, mask, pos=pos)
-            loss = F.cross_entropy(logits.float(), y, weight=weight)
+            ce = F.cross_entropy(logits.float(), y, weight=weight)
+            extra = hooks.extra_loss() if hooks is not None else None
+            loss = ce if extra is None else ce + extra
             opt.zero_grad(set_to_none=True)
             if not torch.isfinite(loss):
                 skipped += 1
@@ -243,10 +266,13 @@ def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=pr
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(trainable, cfg["grad_clip"])
+            scale = scaler.get_scale() if hooks is not None else 0.0
             scaler.step(opt)
             scaler.update()
             sched.step()
-            tot += loss.item() * len(b)
+            if hooks is not None:      # a lower scale after update() means this step was skipped (inf grads)
+                hooks.after_step(stepped=scaler.get_scale() >= scale)
+            tot += ce.item() * len(b)
             seen += len(b)
             if cfg["log_every"] and step % cfg["log_every"] == 0:
                 log(f"  epoch {ep} step {step}/{steps}  loss {tot / max(1, seen):.4f}")
@@ -273,9 +299,15 @@ def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=pr
         log(f"[stage A] using epoch {best_epoch} (dev {mname} {best:.4f})")
     else:
         log(f"[stage A] using the last epoch ({best_epoch}); dev was not looked at")
-    return dict(history=history, best_epoch=best_epoch, best_dev_score=best if best_state is not None else None,
+    info = dict(history=history, best_epoch=best_epoch, best_dev_score=best if best_state is not None else None,
                 select_metric=sel, class_weights=w, train_counts=dict(zip(labels, counts)),
                 train_seconds=time.time() - t_start, weight_tensor=weight)
+    if hooks is not None:
+        info["peft"] = hooks.summary()
+        if "final_rank_mean_by_layer_type" in info["peft"]:
+            log("[peft] AdaLoRA final average rank by layer type: " + ", ".join(
+                f"{k} {v}" for k, v in info["peft"]["final_rank_mean_by_layer_type"].items()))
+    return info
 
 
 # --------------------------------------------------------------------------- Stage B
@@ -344,6 +376,10 @@ def resolve_cfg(bb, overrides, defaults=None) -> dict:
         cfg["exact_batches"] = bool(getattr(bb, "pad_effect", 0.0) > 1e-4)
     if cfg["select_metric"] not in METRIC_NAMES:
         raise ValueError(f"select_metric must be one of {sorted(METRIC_NAMES)}")
+    if cfg["method"] not in P.ALL_METHODS:
+        raise ValueError(f"method must be one of {P.ALL_METHODS}")
+    if cfg["method"] in P.PEFT_METHODS and cfg["lr_peft"] is None:
+        cfg["lr_peft"] = P.DEFAULT_LR[cfg["method"]]
     return cfg
 
 
@@ -388,17 +424,21 @@ def build_stage_a(bb, labels, cfg, device, train_docs, log=print):
         fresh = copy.deepcopy(bb.model)
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"could not copy the model ({e}); build it again before each run") from e
+    hooks = None
+    if cfg["method"] in P.PEFT_METHODS:            # adapters go into the copy before the head is built
+        total = stage_a_steps(train_docs, cfg) * cfg["epochs"]
+        hooks = P.apply_peft(fresh, cfg, bb.d_model, bb.vocab, total, log)
     clf = bb.classifier(len(labels), model=fresh, pos_buckets=cfg["pos_buckets"],
                         pos_dim=cfg["pos_dim"], head=cfg["head"], dropout=cfg["dropout"])
     clf = clf.to(device).float()
+    if hooks is not None:
+        P.attach(clf, hooks)
     log(f"[setup] fresh copy of the Phase 1 weights; hidden states: {bb.route}; pooling '{clf.pool.kind}'; "
         f"position buckets {cfg['pos_buckets']}; head {cfg['head']}")
     log("[setup] batches: " + ("only sentences of exactly the same length (no padding)" if cfg["exact_batches"]
                                else "similar lengths, padded at the end"))
     if cfg["method"] == "frozen":
         freeze_backbone(clf)
-    elif cfg["method"] != "full":
-        raise ValueError("method must be 'full' or 'frozen' (PEFT methods come next)")
     freeze_unused(clf, train_docs, cfg, device, bb.pad_id, log)
     n_trainable, n_total = count_params(clf), count_params(clf, trainable_only=False)
     log(f"[setup] method '{cfg['method']}': {n_trainable / 1e6:.2f}M trainable of {n_total / 1e6:.2f}M "
@@ -441,9 +481,15 @@ def run(bb, **overrides) -> dict:
         f"{rep_fit['all']['macro_f1_all13']:.3f} | on dev: accuracy {rep_a['all']['accuracy']:.3f}, 13-role avg "
         f"{rep_a['all']['macro_f1_all13']:.3f}  (a big gap = memorising)")
     _save_stage(out, "stageA", dev, preds_a["dev"], test, preds_a["test"], rep_a, labels)
+    saved_mb = None
     if cfg["save_model"]:
-        torch.save({"state_dict": clf.state_dict(), "labels": labels, "config": cfg},
-                   os.path.join(out, "stageA_model.pt"))
+        if cfg["method"] in P.PEFT_METHODS:            # PEFT: only the small trained part is stored
+            path = os.path.join(out, "stageA_adapter.pt")
+            P.save_adapter(clf, path, labels, cfg)
+        else:
+            path = os.path.join(out, "stageA_model.pt")
+            torch.save({"state_dict": clf.state_dict(), "labels": labels, "config": cfg}, path)
+        saved_mb = os.path.getsize(path) / 2 ** 20
 
     # ---------------------------------------------------------------- Stage B
     feats = {s: run_sentences(clf, ds, cfg, device, bb.pad_id, what="features")
@@ -483,7 +529,8 @@ def run(bb, **overrides) -> dict:
                    data={s: dict(docs=len(ds), sentences=sum(len(d["sents"]) for d in ds))
                          for s, ds in (("train", train), ("dev", dev), ("test", test))},
                    stage_a=dict(dev=rep_a, train_fit=_fit_summary(rep_fit), trainable_params=n_trainable,
-                                total_params=n_total, peak_gpu_gb=peak_a, **info_a),
+                                total_params=n_total, peak_gpu_gb=peak_a, saved_mb=saved_mb, method=cfg["method"],
+                                **info_a),
                    stage_b=dict(dev=rep_b, trainable_params=n_b, peak_gpu_gb=peak_b, **info_b),
                    best=best, config=cfg)
     with open(os.path.join(out, "metrics.json"), "w") as f:
