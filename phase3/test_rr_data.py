@@ -112,6 +112,12 @@ def test_batches_cover_everything_once():
     assert all(lengths[x[i]] <= lengths[x[i + 1]] for x in b for i in range(len(x) - 1))
     pad = sum(max(lengths[i] for i in x) * len(x) - sum(lengths[i] for i in x) for x in D.length_batches(lengths, 32, True))
     assert pad < 0.1 * sum(lengths), pad                  # length bucketing keeps padding small
+    for shuffle in (False, True):                         # exact: one length per batch, no padding
+        b = D.length_batches(lengths, 32, shuffle, seed=3, exact=True)
+        assert sorted(i for x in b for i in x) == list(range(1001)) and max(map(len, b)) <= 32
+        assert all(len({lengths[i] for i in x}) == 1 for x in b)
+    assert len(D.length_batches(lengths, 32, True, seed=1, exact=True)) == \
+        len(D.length_batches(lengths, 32, True, seed=2, exact=True))   # step count does not depend on seed
 
 
 def test_class_weights():

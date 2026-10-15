@@ -158,11 +158,27 @@ def length_report(raw_lengths: list[int], max_len: int) -> str:
 
 # ------------------------------------------------------------------------- batching
 def length_batches(lengths: list[int], batch_size: int, shuffle: bool, seed: int = 0,
-                   pool: int = 50) -> list[list[int]]:
+                   pool: int = 50, exact: bool = False) -> list[list[int]]:
     """Batches of indices with similar lengths (little padding).
     shuffle=False: sorted by length (prediction). shuffle=True: random pools of
-    batch_size*pool items are sorted by length and cut into batches; batch order is shuffled."""
+    batch_size*pool items are sorted by length and cut into batches; batch order is shuffled.
+    exact=True: every batch holds sentences of exactly one length (no padding at all), for
+    models whose outputs change with padding (e.g. a bidirectional RNN encoder)."""
     idx = list(range(len(lengths)))
+    if exact:
+        rng = random.Random(seed)
+        groups: dict[int, list[int]] = {}
+        for i in idx:
+            groups.setdefault(lengths[i], []).append(i)
+        batches = []
+        for L in sorted(groups):
+            g = groups[L]
+            if shuffle:
+                rng.shuffle(g)
+            batches += [g[i:i + batch_size] for i in range(0, len(g), batch_size)]
+        if shuffle:
+            rng.shuffle(batches)
+        return batches
     if not shuffle:
         idx.sort(key=lambda i: lengths[i])
         return [idx[i:i + batch_size] for i in range(0, len(idx), batch_size)]

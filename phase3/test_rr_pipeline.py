@@ -273,6 +273,7 @@ def test_full_run_decoder():
         res = run(bb, data_root=data, out_dir=os.path.join(tmp, "runs"), run_name="gpt", epochs=4,
                   b_epochs=4, batch_size=16, max_len=32, lr_backbone=3e-3, lr_head=3e-3, log_every=0)
         m = _check_run(res, data, model, before)
+        assert m["config"]["exact_batches"] is False            # causal decoder: padding has no effect
         print(f"      dev macro-F1: stage A {m['stage_a']['best_dev_macro_f1']:.3f}, "
               f"stage B {m['stage_b']['best_dev_macro_f1']:.3f} (fake data)")
 
@@ -286,6 +287,7 @@ def test_full_and_frozen_run_encdec():
         res = run(bb, data_root=data, out_dir=os.path.join(tmp, "runs"), run_name="ed", epochs=2, b_epochs=2,
                   batch_size=16, max_len=32, lr_backbone=3e-3, log_every=0)
         m = _check_run(res, data, model, before)
+        assert m["config"]["exact_batches"] is True             # BiGRU: padding changes outputs
         used = count_params(model.emb) + count_params(model.encoder)
         head = (D_ + 32) * 13 + 13 + 10 * 32
         assert m["stage_a"]["trainable_params"] == used + head, (m["stage_a"]["trainable_params"], used + head)

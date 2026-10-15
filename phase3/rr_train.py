@@ -19,7 +19,6 @@ from __future__ import annotations
 import contextlib
 import copy
 import json
-import math
 import os
 import random
 import time
@@ -46,6 +45,7 @@ DEFAULTS = dict(
     head="linear", dropout=0.1, epochs=5, batch_size=64, eval_batch_size=128,
     lr_backbone=5e-5, lr_head=1e-3, weight_decay=0.01, warmup=0.06, grad_clip=1.0, amp=True,
     weight_cap=10.0, weight_power=0.5, log_every=100,
+    exact_batches=None,          # None: automatic (True if padding changes the model's outputs)
     # Stage B
     b_epochs=40, b_patience=10, b_lr=1e-3, b_weight_decay=0.01, b_hidden=256, b_dropout=0.3, b_layers=1,
     save_model=True,
@@ -137,7 +137,7 @@ def run_sentences(clf, docs, cfg, device, pad_id, what="logits"):
     items = flat(docs, cfg["pos_buckets"])
     lengths = [len(docs[di]["ids"][si]) for di, si, _ in items]
     out = [None] * len(items)
-    for b in D.length_batches(lengths, cfg["eval_batch_size"], shuffle=False):
+    for b in D.length_batches(lengths, cfg["eval_batch_size"], shuffle=False, exact=cfg["exact_batches"]):
         ids, mask, pos = _batch(docs, items, b, pad_id, device)
         with _autocast(device, cfg["amp"]):
             y = clf(ids, mask, pos=pos) if what == "logits" else clf.features(ids, mask, pos=pos)
@@ -179,7 +179,8 @@ def freeze_unused(clf, docs, cfg, device, pad_id, log=print, n_batches=3):
     clf.zero_grad(set_to_none=True)
     items = flat(docs, cfg["pos_buckets"])
     lengths = [len(docs[di]["ids"][si]) for di, si, _ in items]
-    for b in D.length_batches(lengths, cfg["batch_size"], shuffle=True, seed=123)[:n_batches]:
+    for b in D.length_batches(lengths, cfg["batch_size"], shuffle=True, seed=123,
+                              exact=cfg["exact_batches"])[:n_batches]:
         ids, mask, pos = _batch(docs, items, b, pad_id, device)
         with _autocast(device, cfg["amp"]):
             out = clf(ids, mask, pos=pos)
@@ -208,7 +209,7 @@ def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=pr
 
     head_ids = {id(p) for p in clf.head_parameters()}
     opt = make_optimizer(clf.named_parameters(), head_ids, cfg)
-    steps = math.ceil(len(items) / cfg["batch_size"])
+    steps = len(D.length_batches(lengths, cfg["batch_size"], shuffle=True, exact=cfg["exact_batches"]))
     total = steps * cfg["epochs"]
     sched = warmup_linear(opt, int(cfg["warmup"] * total), total)
     scaler = _scaler(device, cfg["amp"])
@@ -220,7 +221,8 @@ def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=pr
     for ep in range(1, cfg["epochs"] + 1):
         clf.train()
         t0, tot, seen, skipped = time.time(), 0.0, 0, 0
-        batches = D.length_batches(lengths, cfg["batch_size"], shuffle=True, seed=cfg["seed"] * 1000 + ep)
+        batches = D.length_batches(lengths, cfg["batch_size"], shuffle=True, seed=cfg["seed"] * 1000 + ep,
+                                   exact=cfg["exact_batches"])
         for step, b in enumerate(batches, 1):
             ids, mask, pos = _batch(train_docs, items, b, pad_id, device)
             y = torch.tensor([y_all[k] for k in b], dtype=torch.long, device=device)
@@ -331,6 +333,8 @@ def run(bb, **overrides) -> dict:
     if unknown:
         raise ValueError(f"unknown settings: {sorted(unknown)}; known: {sorted(DEFAULTS)}")
     cfg = {**DEFAULTS, **overrides}
+    if cfg["exact_batches"] is None:
+        cfg["exact_batches"] = bool(getattr(bb, "pad_effect", 0.0) > 1e-4)
     set_seed(cfg["seed"])
     device = torch.device(cfg["device"] or ("cuda" if torch.cuda.is_available() else "cpu"))
     out = os.path.join(cfg["out_dir"], cfg["run_name"])
@@ -370,6 +374,8 @@ def run(bb, **overrides) -> dict:
     clf = clf.to(device).float()
     log(f"[setup] fresh copy of the Phase 1 weights; hidden states: {bb.route}; pooling '{clf.pool.kind}'; "
         f"position buckets {cfg['pos_buckets']}; head {cfg['head']}")
+    log("[setup] batches: " + ("only sentences of exactly the same length (no padding)" if cfg["exact_batches"]
+                               else "similar lengths, padded at the end"))
     if cfg["method"] == "frozen":
         freeze_backbone(clf)
     elif cfg["method"] != "full":

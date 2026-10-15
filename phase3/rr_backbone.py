@@ -50,6 +50,7 @@ class Backbone:
     route: str = ""
     d_model: int = 0
     vocab: int | None = None
+    pad_effect: float = 0.0          # how much padding changes a sentence vector (0 = not at all)
 
     def classifier(self, n_labels: int, model: nn.Module | None = None, pooling: str | None = None,
                    **kw) -> SentenceClassifier:
@@ -353,7 +354,8 @@ def make_backbone(model: nn.Module, tokenizer=None, encode=None, pad_id: int | N
     bb = Backbone(model=model, encode=encode, pad_id=pad_id, bos_id=bos_id if add_bos else None,
                   eos_id=eos_id if add_eos else None, kind=kind, pooling=pooling,
                   module_name=kw.get("module_name"), mode=kw.get("mode", "pre_head"), call=kw.get("call"),
-                  route=desc, d_model=d_model, vocab=vocab)
+                  route=desc, d_model=d_model, vocab=vocab,
+                  pad_effect=pad_diff / scale)
     say(f"[backbone] hidden states : {desc}")
     say(f"[backbone] model type    : {kind} ({'reads left-to-right' if causal else 'reads both ways'})"
         f" -> pooling '{pooling}', hidden size d = {d_model}")
@@ -362,6 +364,7 @@ def make_backbone(model: nn.Module, tokenizer=None, encode=None, pad_id: int | N
         f"sample sentence -> {len(encode(SAMPLE))} tokens; vocabulary {vocab}")
     say(f"[backbone] parameters    : {count_params(model, False) / 1e6:.1f}M; {max_len} tokens fit through the model")
     note = ("none" if pad_diff <= 1e-4 * scale else
-            f"{pad_diff / scale:.1%} of the vector size (batches group similar lengths to keep this small)")
+            f"{pad_diff / scale:.1%} of the vector size -> training will batch only sentences of "
+            "exactly the same length, so no sentence is ever padded")
     say(f"[backbone] padding effect: {note}")
     return bb
