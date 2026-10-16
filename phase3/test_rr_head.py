@@ -9,8 +9,8 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rr_head import (HiddenStates, Pooler, SentenceClassifier, count_params, find_lm_head,
-                     freeze_backbone, load_phase1, padding_check)
+from rr_head import (ContextClassifier, HiddenStates, Pooler, SentenceAttention, SentenceClassifier,  # noqa: E402
+                     count_params, distance_buckets, find_lm_head, freeze_backbone, load_phase1, padding_check)
 
 torch.manual_seed(0)
 V, D, NL = 50, 16, 13
@@ -167,6 +167,49 @@ def test_load_phase1_roundtrip():
             assert False, "mismatched architecture should raise"
         except RuntimeError:
             pass
+
+
+def test_distance_buckets():
+    def ref(i, j):
+        d = j - i
+        a = abs(d)
+        b = a if a <= 2 else 3 if a <= 4 else 4 if a <= 8 else 5 if a <= 16 else 6 if a <= 32 else 7
+        return 0 if d == 0 else (b if d > 0 else b + 7)
+    S = 70
+    got = distance_buckets(S)
+    assert got.shape == (S, S) and int(got.max()) == 14 and int(got.min()) == 0
+    for i in range(S):
+        for j in range(S):
+            assert int(got[i, j]) == ref(i, j), (i, j, int(got[i, j]), ref(i, j))
+
+
+def test_attention_starts_switched_off_and_knows_order():
+    F_ = 24
+    x = torch.randn(9, F_)
+    torch.manual_seed(1)
+    gru = ContextClassifier(F_, NL, d_ctx=16, arch="gru").eval()
+    torch.manual_seed(1)
+    gru_attn = ContextClassifier(F_, NL, d_ctx=16, arch="gru_attn").eval()
+    assert torch.allclose(gru(x), gru_attn(x), atol=1e-6)          # same start: attention output is 0
+    attn = ContextClassifier(F_, NL, d_ctx=16, arch="attn").eval()
+    assert attn(x).shape == (9, NL) and attn(x.unsqueeze(0)).shape == (1, 9, NL)
+    att = SentenceAttention(16, heads=4).eval()
+    assert att(torch.randn(1, 5, 16)).abs().max() == 0                # switched off at the start
+    nn.init.normal_(att.o.weight)
+    nn.init.normal_(att.dist.weight)
+    h = torch.randn(1, 6, 16)
+    perm = torch.tensor([5, 3, 0, 1, 4, 2])
+    out, out_p = att(h), att(h[:, perm])
+    assert not torch.allclose(out[:, perm], out_p, atol=1e-5)       # order matters through the distances
+    assert att.last_weights.shape == (1, 4, 6, 6)
+    m = ContextClassifier(F_, NL, d_ctx=16, arch="gru_attn")
+    m(x).sum().backward()
+    assert m.attn.o.weight.grad is not None and m.attn.o.weight.grad.abs().sum() > 0    # it can learn to turn on
+    try:
+        ContextClassifier(F_, NL, arch="lstm")
+        raise AssertionError("unknown version should fail")
+    except ValueError:
+        pass
 
 
 if __name__ == "__main__":

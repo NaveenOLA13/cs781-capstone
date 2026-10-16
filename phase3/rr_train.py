@@ -5,6 +5,10 @@ Stage B  whole judgment: frozen Stage A features x_1..x_S -> BiGRU -> head
 Both are scored on dev (overall, CL, IT, per role) and both get a Codabench zip.
 Stage A methods: "full" fine-tuning, "frozen" backbone (head only), or a PEFT method from rr_peft.py
 ("lora", "rslora", "adalora", "ia3": the Phase 1 weights stay fixed, small adapters are trained).
+Neighbour context (context=True): Stage A reads [previous sentence] <sep> [next sentence] <sep> [sentence]
+and takes the sentence vector from the sentence's own tokens only (pool mask), so a left-to-right model has
+read both neighbours before it reaches the sentence's last token.
+Stage B versions (b_arch): "gru" (BiGRU), "gru_attn" (BiGRU + sentence attention), "attn" (attention only).
 Knowledge distillation (rr_kd.py): with kd_teacher=<teacher.pt>, Stage A and Stage B also learn from
 the teacher's probabilities for every training sentence:
     loss = kd_alpha * CE(gold) + (1 - kd_alpha) * T^2 * KL(teacher_T || student_T)
@@ -46,6 +50,9 @@ DEFAULTS = dict(
     limit_train_docs=0,          # >0: only the first k training judgments per domain (quick check)
     # inputs
     max_len=128, pos_buckets=10, pos_dim=32,
+    context=False,               # True: Stage A also reads the previous and the next sentence
+    context_tokens=64,           # at most this many tokens of each neighbour (end of previous, start of next)
+    context_sep_id=None,         # separator token between the pieces; None: the tokenizer's end-of-text id
     # Stage A
     method="full",               # "full", "frozen" (head only) or PEFT: "lora", "rslora", "adalora", "ia3"
     head="linear", dropout=0.1, epochs=3, batch_size=64, eval_batch_size=128,
@@ -67,6 +74,9 @@ DEFAULTS = dict(
     kd_stage_b=True,             # also use the teacher term when training Stage B
     # Stage B
     b_epochs=40, b_patience=10, b_lr=1e-3, b_weight_decay=0.01, b_hidden=256, b_dropout=0.3, b_layers=1,
+    b_arch="gru",                # Stage B: "gru", "gru_attn" (BiGRU + attention) or "attn" (attention only)
+    b_heads=4, b_attn_layers=2,  # attention heads; attention blocks of the "attn" version
+    b_variants=None,             # rr_kd.teacher_oof / rr_final: several Stage B versions on the same features
     save_model=True,
     select_metric="macro_f1_all13",  # what picks the best epoch: 13-role average (Codabench) or "macro_f1"
 )
@@ -127,10 +137,40 @@ def flat(docs, buckets):
     return out
 
 
-def _batch(docs, items, b, pad_id, device):
-    ids, mask = collate([docs[items[k][0]]["ids"][items[k][1]] for k in b], pad_id, device)
+def item_seq(docs, item, cfg):
+    """Token ids for one sentence and how many of them are context: the sentence alone (context=False) or
+    [end of previous sentence] <sep> [start of next sentence] <sep> [sentence] (context=True)."""
+    sents = docs[item[0]]["ids"]
+    si = item[1]
+    tgt = list(sents[si])
+    if not cfg.get("context"):
+        return tgt, 0
+    k, sep = cfg["context_tokens"], cfg["context_sep_id"]
+    prev = list(sents[si - 1][-k:]) if si > 0 and k > 0 else []
+    nxt = list(sents[si + 1][:k]) if si + 1 < len(sents) and k > 0 else []
+    ctx = prev + [sep] + nxt + [sep]
+    return ctx + tgt, len(ctx)
+
+
+def item_lengths(docs, items, cfg):
+    if not cfg.get("context"):
+        return [len(docs[di]["ids"][si]) for di, si, _ in items]
+    return [len(item_seq(docs, it, cfg)[0]) for it in items]
+
+
+def _batch(docs, items, b, pad_id, device, cfg=None):
+    """ids, mask, pool mask (None = pool over all tokens; with context only the sentence's own tokens), pos."""
+    if cfg is not None and cfg.get("context"):
+        seqs = [item_seq(docs, items[k], cfg) for k in b]
+        ids, mask = collate([q for q, _ in seqs], pad_id, device)
+        pool = mask.clone()
+        for j, (_, n_ctx) in enumerate(seqs):
+            pool[j, :n_ctx] = 0
+    else:
+        ids, mask = collate([docs[items[k][0]]["ids"][items[k][1]] for k in b], pad_id, device)
+        pool = None
     pos = torch.tensor([items[k][2] for k in b], dtype=torch.long, device=device)
-    return ids, mask, pos
+    return ids, mask, pool, pos
 
 
 def to_preds(docs, outputs, labels):
@@ -157,12 +197,13 @@ def run_sentences(clf, docs, cfg, device, pad_id, what="logits"):
     was = clf.training
     clf.eval()
     items = flat(docs, cfg["pos_buckets"])
-    lengths = [len(docs[di]["ids"][si]) for di, si, _ in items]
+    lengths = item_lengths(docs, items, cfg)
     out = [None] * len(items)
     for b in D.length_batches(lengths, cfg["eval_batch_size"], shuffle=False, exact=cfg["exact_batches"]):
-        ids, mask, pos = _batch(docs, items, b, pad_id, device)
+        ids, mask, pool, pos = _batch(docs, items, b, pad_id, device, cfg)
         with _autocast(device, cfg["amp"]):
-            y = clf(ids, mask, pos=pos) if what == "logits" else clf.features(ids, mask, pos=pos)
+            y = (clf(ids, mask, pool_mask=pool, pos=pos) if what == "logits"
+                 else clf.features(ids, mask, pool_mask=pool, pos=pos))
         y = y.float().cpu()
         for j, k in enumerate(b):
             out[k] = y[j]
@@ -225,7 +266,7 @@ def warmup_linear(opt, warmup_steps, total_steps):
 def stage_a_steps(docs, cfg) -> int:
     """Optimizer steps per epoch of Stage A (the same for every epoch and seed)."""
     items = flat(docs, cfg["pos_buckets"])
-    lengths = [len(docs[di]["ids"][si]) for di, si, _ in items]
+    lengths = item_lengths(docs, items, cfg)
     return len(D.length_batches(lengths, cfg["batch_size"], shuffle=True, exact=cfg["exact_batches"]))
 
 
@@ -235,12 +276,12 @@ def freeze_unused(clf, docs, cfg, device, pad_id, log=print, n_batches=3):
     clf.train()
     clf.zero_grad(set_to_none=True)
     items = flat(docs, cfg["pos_buckets"])
-    lengths = [len(docs[di]["ids"][si]) for di, si, _ in items]
+    lengths = item_lengths(docs, items, cfg)
     for b in D.length_batches(lengths, cfg["batch_size"], shuffle=True, seed=123,
                               exact=cfg["exact_batches"])[:n_batches]:
-        ids, mask, pos = _batch(docs, items, b, pad_id, device)
+        ids, mask, pool, pos = _batch(docs, items, b, pad_id, device, cfg)
         with _autocast(device, cfg["amp"]):
-            out = clf(ids, mask, pos=pos)
+            out = clf(ids, mask, pool_mask=pool, pos=pos)
         out.float().logsumexp(-1).mean().backward()
     unused = [(n, p) for n, p in clf.named_parameters() if p.requires_grad and p.grad is None]
     for _, p in unused:
@@ -263,7 +304,7 @@ def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=pr
     li = {l: i for i, l in enumerate(labels)}
     items = flat(train_docs, cfg["pos_buckets"])
     y_all = [li[train_docs[di]["labels"][si]] for di, si, _ in items]
-    lengths = [len(train_docs[di]["ids"][si]) for di, si, _ in items]
+    lengths = item_lengths(train_docs, items, cfg)
     w, counts = D.class_weights(y_all, len(labels), cfg["weight_cap"], cfg["weight_power"])
     weight = torch.tensor(w, dtype=torch.float32, device=device)
     log("[stage A] class weights: " + ", ".join(f"{l} {x:.2f} (n={c})" for l, x, c in zip(labels, w, counts)))
@@ -290,10 +331,10 @@ def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=pr
         batches = D.length_batches(lengths, cfg["batch_size"], shuffle=True, seed=cfg["seed"] * 1000 + ep,
                                    exact=cfg["exact_batches"])
         for step, b in enumerate(batches, 1):
-            ids, mask, pos = _batch(train_docs, items, b, pad_id, device)
+            ids, mask, pool, pos = _batch(train_docs, items, b, pad_id, device, cfg)
             y = torch.tensor([y_all[k] for k in b], dtype=torch.long, device=device)
             with _autocast(device, cfg["amp"]):
-                logits = clf(ids, mask, pos=pos)
+                logits = clf(ids, mask, pool_mask=pool, pos=pos)
             ce = F.cross_entropy(logits.float(), y, weight=weight)
             loss = ce
             if soft is not None:
@@ -372,11 +413,14 @@ def train_stage_b(feats, ys, dev_feats, dev_docs, labels, cfg, device, weight, l
     sel, mname = cfg["select_metric"], METRIC_NAMES[cfg["select_metric"]]
     torch.manual_seed(cfg["seed"])
     feat_dim = next(f for f in feats if f is not None).size(-1)
-    model = ContextClassifier(feat_dim, len(labels), cfg["b_hidden"], cfg["b_dropout"], cfg["b_layers"]).to(device)
+    model = ContextClassifier(feat_dim, len(labels), cfg["b_hidden"], cfg["b_dropout"], cfg["b_layers"],
+                              arch=cfg["b_arch"], heads=cfg["b_heads"], attn_layers=cfg["b_attn_layers"]).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["b_lr"], weight_decay=cfg["b_weight_decay"])
     rng = random.Random(cfg["seed"])
     order = [i for i, f in enumerate(feats) if f is not None]
-    log(f"[stage B] {len(order)} judgments, input {feat_dim} -> BiGRU {cfg['b_hidden']} -> {len(labels)} roles, "
+    arch = {"gru": f"BiGRU {cfg['b_hidden']}", "gru_attn": f"BiGRU {cfg['b_hidden']} + attention",
+            "attn": f"{cfg['b_attn_layers']} attention blocks {cfg['b_hidden']}"}[cfg["b_arch"]]
+    log(f"[stage B] {len(order)} judgments, input {feat_dim} -> {arch} -> {len(labels)} roles, "
         f"{count_params(model) / 1e6:.2f}M parameters")
     best, best_state, best_epoch, bad, history = -1.0, None, 0, 0, []
     t_start = time.time()
@@ -437,7 +481,33 @@ def resolve_cfg(bb, overrides, defaults=None) -> dict:
         raise ValueError("kd_alpha must be in [0, 1] and kd_T > 0")
     if cfg["kd_teacher"] is not None and not os.path.exists(cfg["kd_teacher"]):
         raise ValueError(f"kd_teacher file not found: {cfg['kd_teacher']}")
+    from rr_head import ContextClassifier as _CC
+    for a in [cfg["b_arch"]] + list(cfg["b_variants"] or []):
+        if a not in _CC.ARCHS:
+            raise ValueError(f"Stage B version {a!r} unknown; choose from {_CC.ARCHS}")
+    if cfg["context"]:
+        if cfg["context_sep_id"] is None:
+            cfg["context_sep_id"] = getattr(bb, "sep_id", None)
+        if cfg["context_sep_id"] is None:
+            raise ValueError("context=True needs a separator token: pass context_sep_id=...")
+        cfg["context_sep_id"] = int(cfg["context_sep_id"])
     return cfg
+
+
+def check_input_length(bb, n: int) -> None:
+    """Runs the model once on n tokens, on a CPU copy (a too-long input on the GPU would break the session)."""
+    m = copy.deepcopy(bb.model).cpu().float().eval()
+    clf = bb.classifier(2, model=m)
+    tok = 5 if (bb.vocab or 0) > 5 else 0
+    ids = torch.full((1, n), tok, dtype=torch.long)
+    try:
+        with torch.no_grad():
+            clf.encoder(ids, torch.ones_like(ids))
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"the model cannot take {n} tokens ({type(e).__name__}: {e}); "
+                           "lower context_tokens or max_len") from e
+    finally:
+        del m, clf
 
 
 def start_run(cfg, kind="run"):
@@ -472,6 +542,14 @@ def prepare(bb, cfg, log=print):
     top = max((max(s) for d in train + dev + test for s in d["ids"]), default=0)
     if bb.vocab is not None and top >= bb.vocab:
         raise ValueError(f"token id {top} is >= the model's vocabulary size {bb.vocab}; wrong tokenizer?")
+    if cfg["context"]:
+        docs_all = train + dev + test
+        lens = item_lengths(docs_all, flat(docs_all, cfg["pos_buckets"]), cfg)
+        n_max = max(lens, default=0)
+        check_input_length(bb, n_max)
+        lens.sort()
+        log(f"[data] with neighbour context (up to {cfg['context_tokens']} tokens of each neighbour, separator id "
+            f"{cfg['context_sep_id']}): tokens per input median {lens[len(lens) // 2]}, longest {n_max} (fits)")
     return labels, train, dev, test
 
 

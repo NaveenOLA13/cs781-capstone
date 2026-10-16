@@ -51,6 +51,7 @@ class Backbone:
     d_model: int = 0
     vocab: int | None = None
     pad_effect: float = 0.0          # how much padding changes a sentence vector (0 = not at all)
+    sep_id: int | None = None        # separator between sentences when neighbours are given as context
 
     def classifier(self, n_labels: int, model: nn.Module | None = None, pooling: str | None = None,
                    **kw) -> SentenceClassifier:
@@ -351,11 +352,12 @@ def make_backbone(model: nn.Module, tokenizer=None, encode=None, pad_id: int | N
             model.to(dtype)
         model.train(was_training)
 
+    sep_id = eos_id if eos_id is not None else (bos_id if bos_id is not None else pad_id)
     bb = Backbone(model=model, encode=encode, pad_id=pad_id, bos_id=bos_id if add_bos else None,
                   eos_id=eos_id if add_eos else None, kind=kind, pooling=pooling,
                   module_name=kw.get("module_name"), mode=kw.get("mode", "pre_head"), call=kw.get("call"),
                   route=desc, d_model=d_model, vocab=vocab,
-                  pad_effect=pad_diff / scale)
+                  pad_effect=pad_diff / scale, sep_id=sep_id)
     say(f"[backbone] hidden states : {desc}")
     say(f"[backbone] model type    : {kind} ({'reads left-to-right' if causal else 'reads both ways'})"
         f" -> pooling '{pooling}', hidden size d = {d_model}")

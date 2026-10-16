@@ -353,6 +353,54 @@ def test_out_of_fold_run():
                   + ", ".join(f"{v} {m['dev'][v]['all']['macro_f1_all13']:.3f}" for v in VARIANTS))
 
 
+def test_context_inputs():
+    from rr_train import _batch, item_seq
+    docs = [{"ids": [[11, 12], [13, 14, 15], [16]]}]
+    cfg = {"context": True, "context_tokens": 2, "context_sep_id": 9}
+    assert item_seq(docs, (0, 0, 0), cfg) == ([9, 13, 14, 9, 11, 12], 4)          # no previous sentence
+    assert item_seq(docs, (0, 1, 0), cfg) == ([11, 12, 9, 16, 9, 13, 14, 15], 5)
+    assert item_seq(docs, (0, 2, 0), cfg) == ([14, 15, 9, 9, 16], 4)              # end of previous, no next
+    assert item_seq(docs, (0, 1, 0), {"context": False}) == ([13, 14, 15], 0)
+    ids, mask, pool, pos = _batch(docs, [(0, 0, 0), (0, 1, 5), (0, 2, 9)], [0, 1, 2], 0, "cpu", cfg)
+    assert ids.shape == (3, 8) and pos.tolist() == [0, 5, 9]
+    assert pool[0].tolist() == [0, 0, 0, 0, 1, 1, 0, 0] and pool[1].tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
+    assert mask[2].tolist() == [1, 1, 1, 1, 1, 0, 0, 0] and pool[2].tolist() == [0, 0, 0, 0, 1, 0, 0, 0]
+
+
+def test_context_run_and_neighbours_matter():
+    from rr_train import run_sentences
+    with tempfile.TemporaryDirectory() as tmp:
+        data = make_fake_data(os.path.join(tmp, "data"), n_train=4)
+        model = ToyGPT()
+        before = {k: v.clone() for k, v in model.state_dict().items()}
+        bb = _bb(model)
+        res = run(bb, data_root=data, out_dir=os.path.join(tmp, "runs"), run_name="ctx", context=True,
+                  context_tokens=8, b_arch="gru_attn", epochs=3, b_epochs=2, batch_size=16, max_len=32,
+                  lr_backbone=3e-3, lr_head=3e-3, log_every=0)
+        m = _check_run(res, data, model, before)
+        assert m["config"]["context"] is True and m["config"]["context_sep_id"] == 2      # WordTok's </s>
+        assert m["config"]["b_arch"] == "gru_attn"
+        clf, cfg, cpu = res["stage_a"], dict(m["config"]), torch.device("cpu")
+        d1 = {"ids": [[5, 6, 7], [8, 9, 10]]}
+        d2 = {"ids": [[5, 6, 7], [20, 21, 22]]}                 # same first sentence, different next sentence
+        on = run_sentences(clf, [d1, d2], cfg, cpu, bb.pad_id, what="features")
+        off = run_sentences(clf, [d1, d2], {**cfg, "context": False}, cpu, bb.pad_id, what="features")
+        assert not torch.allclose(on[0][0], on[1][0])            # with context the next sentence is read
+        assert torch.allclose(off[0][0], off[1][0])              # without context it is not
+
+
+def test_context_too_long_fails_early():
+    with tempfile.TemporaryDirectory() as tmp:
+        data = make_fake_data(os.path.join(tmp, "data"), n_train=2)
+        bb = make_backbone(ToyGPT(max_pos=20), WordTok(), max_len=16, verbose=False)
+        try:
+            run(bb, data_root=data, out_dir=os.path.join(tmp, "runs"), run_name="long", context=True,
+                context_tokens=16, max_len=16, epochs=1, b_epochs=1, log_every=0)
+            raise AssertionError("inputs longer than the model allows should fail before training")
+        except RuntimeError as e:
+            assert "cannot take" in str(e), e
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):

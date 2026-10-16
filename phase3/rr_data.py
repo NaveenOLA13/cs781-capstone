@@ -570,3 +570,21 @@ def tune_smoothing(docs: list[dict], logps, labels: list[str], trans_for, weight
     table = {w: evaluate(docs, smoothed_preds(docs, logps, labels, trans_for, w), labels) for w in weights}
     best = max(sorted(table), key=lambda w: (round(table[w]["all"]["macro_f1_all13"], 6), -w))
     return best, table
+
+
+def tune_smoothing_per_domain(docs: list[dict], logps, labels: list[str], trans_for,
+                              weights=(0, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0)):
+    """One smoothing weight per domain (e.g. CL and IT), chosen together on labelled judgments.
+    Returns ({domain: w}, evaluate(...) of that choice). Ties go to the smaller total weight."""
+    import itertools
+    domains = sorted({d["domain"] for d in docs})
+    per_w = {w: smoothed_preds(docs, logps, labels, trans_for, w) for w in weights}
+    best, best_key, best_rep = None, None, None
+    for combo in itertools.product(weights, repeat=len(domains)):
+        wd = dict(zip(domains, combo))
+        preds = {d["id"]: per_w[wd[d["domain"]]][d["id"]] for d in docs}
+        rep = evaluate(docs, preds, labels)
+        key = (round(rep["all"]["macro_f1_all13"], 6), -sum(combo))
+        if best_key is None or key > best_key:
+            best, best_key, best_rep = wd, key, rep
+    return best, best_rep

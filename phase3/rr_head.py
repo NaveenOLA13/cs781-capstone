@@ -18,6 +18,7 @@ Usage
 """
 from __future__ import annotations
 
+import math
 import re
 
 import torch
@@ -336,25 +337,106 @@ class DocClassifier(nn.Module):
         return self.doc_head(self.drop(torch.cat([x, c.squeeze(0)], -1)))
 
 
+N_DISTANCE_BUCKETS = 15
+
+
+def distance_buckets(S: int, device=None) -> torch.Tensor:
+    """[S, S] bucket of (j - i): how far sentence j is from sentence i and in which direction.
+    0 = same sentence; 1..7 = j after i by 1, 2, 3-4, 5-8, 9-16, 17-32, >32; 8..14 = j before i, same steps."""
+    i = torch.arange(S, device=device)
+    d = i[None, :] - i[:, None]
+    a = d.abs()
+    far = torch.log2((a - 1).clamp(min=1).float()).floor().long() + 2
+    b = torch.where(a <= 2, a, far.clamp(max=7))
+    return torch.where(d > 0, b, torch.where(d < 0, b + 7, torch.zeros_like(b)))
+
+
+class SentenceAttention(nn.Module):
+    """Self-attention over the sentences of one judgment, written out by hand (queries, keys, values,
+    softmax). Every attention score also gets a learned number for the distance and direction between
+    the two sentences (distance_buckets), so the attention knows the order of the sentences. The output
+    projection starts at zero: the layer starts switched off and training turns it on where it helps."""
+
+    def __init__(self, d: int, heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        if d % heads:
+            raise ValueError(f"width {d} is not divisible by {heads} heads")
+        self.h, self.dk = heads, d // heads
+        self.q, self.k, self.v, self.o = (nn.Linear(d, d) for _ in range(4))
+        nn.init.zeros_(self.o.weight)
+        nn.init.zeros_(self.o.bias)
+        self.dist = nn.Embedding(N_DISTANCE_BUCKETS, heads)
+        nn.init.zeros_(self.dist.weight)
+        self.drop = nn.Dropout(dropout)
+        self.last_weights = None                     # [B, heads, S, S] of the last call (for inspection)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:          # [B, S, d]
+        B, S, d = x.shape
+        q, k, v = (f(x).view(B, S, self.h, self.dk).transpose(1, 2) for f in (self.q, self.k, self.v))
+        att = q @ k.transpose(-1, -2) / math.sqrt(self.dk)       # [B, heads, S, S]
+        att = att + self.dist(distance_buckets(S, x.device)).permute(2, 0, 1).unsqueeze(0)
+        w = att.softmax(-1)
+        self.last_weights = w.detach()
+        return self.o((self.drop(w) @ v).transpose(1, 2).reshape(B, S, d))
+
+
+class AttentionBlock(nn.Module):
+    """x + attention(norm(x)), then x + feed-forward(norm(x))."""
+
+    def __init__(self, d: int, heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.n1, self.n2 = nn.LayerNorm(d), nn.LayerNorm(d)
+        self.attn = SentenceAttention(d, heads, dropout)
+        self.ff = nn.Sequential(nn.Linear(d, 2 * d), nn.GELU(), nn.Dropout(dropout), nn.Linear(2 * d, d))
+
+    def forward(self, x):
+        x = x + self.attn(self.n1(x))
+        return x + self.ff(self.n2(x))
+
+
 class ContextClassifier(nn.Module):
-    """Stage B: the sentence features of one judgment [S, F] (from a frozen Stage A) ->
-    LayerNorm -> BiGRU over the sentence sequence -> [feature ; context] -> role scores [S, n_labels]."""
+    """Stage B: the sentence features of one judgment [S, F] (from a frozen Stage A) -> role scores [S, L].
+    arch="gru":      LayerNorm -> BiGRU over the sentence sequence -> [feature ; context] -> Linear
+    arch="gru_attn": the same, plus sentence attention on top of the BiGRU output (context + attention);
+                     it starts exactly as "gru" because the attention output starts at zero
+    arch="attn":     no BiGRU: Linear -> `attn_layers` attention blocks (order only from the distance
+                     numbers and the position feature) -> [feature ; context] -> Linear"""
+
+    ARCHS = ("gru", "gru_attn", "attn")
 
     def __init__(self, feat_dim: int, n_labels: int, d_ctx: int = 256, dropout: float = 0.3,
-                 layers: int = 1):
+                 layers: int = 1, arch: str = "gru", heads: int = 4, attn_layers: int = 2):
         super().__init__()
+        if arch not in self.ARCHS:
+            raise ValueError(f"arch must be one of {self.ARCHS}")
+        self.arch = arch
         self.norm = nn.LayerNorm(feat_dim)
         self.drop = nn.Dropout(dropout)
-        self.gru = nn.GRU(feat_dim, d_ctx // 2, num_layers=layers, batch_first=True, bidirectional=True,
-                          dropout=dropout if layers > 1 else 0.0)
-        self.head = nn.Linear(feat_dim + 2 * (d_ctx // 2), n_labels)
+        if arch == "attn":
+            width = d_ctx
+            self.inp = nn.Linear(feat_dim, width)
+            self.blocks = nn.ModuleList([AttentionBlock(width, heads) for _ in range(attn_layers)])
+        else:
+            width = 2 * (d_ctx // 2)
+            self.gru = nn.GRU(feat_dim, d_ctx // 2, num_layers=layers, batch_first=True, bidirectional=True,
+                              dropout=dropout if layers > 1 else 0.0)
+        self.head = nn.Linear(feat_dim + width, n_labels)
+        if arch == "gru_attn":                 # created last, so the other weights start as in "gru"
+            self.attn = SentenceAttention(width, heads)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:          # [S, F] or [1, S, F]
         single = x.dim() == 2
         if single:
             x = x.unsqueeze(0)
         x = self.drop(self.norm(x.float()))
-        c, _ = self.gru(x)
+        if self.arch == "attn":
+            c = self.inp(x)
+            for blk in self.blocks:
+                c = blk(c)
+        else:
+            c, _ = self.gru(x)
+            if self.arch == "gru_attn":
+                c = c + self.attn(c)
         y = self.head(self.drop(torch.cat([x, c], -1)))
         return y.squeeze(0) if single else y
 

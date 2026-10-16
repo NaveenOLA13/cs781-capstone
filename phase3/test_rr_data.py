@@ -282,6 +282,31 @@ def test_viterbi_smoothing():
     assert w > 0 and table[w]["all"]["accuracy"] == 1.0 and table[0]["all"]["accuracy"] < 1.0, (w, table)
 
 
+def test_smoothing_per_domain():
+    import numpy as np
+    labs = ["A", "B", "C"]
+    docs, logps = [], []
+    for k in range(4):                     # CL: blocks of A then B, one wrong sentence -> smoothing helps
+        docs.append({"id": f"cl{k}", "domain": "CL", "labels": ["A"] * 6 + ["B"] * 6})
+        p = np.full((12, 3), 0.05)
+        p[:6, 0], p[6:, 1] = 0.9, 0.9
+        p[2 + k % 3] = [0.4, 0.55, 0.05]
+        logps.append(np.log(p / p.sum(1, keepdims=True)))
+    for k in range(4):                     # IT: roles change every sentence and the model is right -> smoothing hurts
+        lab = ["A", "B"] * 5
+        docs.append({"id": f"it{k}", "domain": "IT", "labels": lab})
+        p = np.full((10, 3), 0.05)
+        for i, l in enumerate(lab):
+            p[i, labs.index(l)], p[i, 1 - labs.index(l)] = 0.55, 0.40
+        logps.append(np.log(p / p.sum(1, keepdims=True)))
+    tr, st = D.transition_logprobs([d["labels"] for d in docs[:4]], labs)      # "stay in the same role"
+    w_dom, rep = D.tune_smoothing_per_domain(docs, logps, labs, lambda d: (tr, st), weights=(0, 0.5, 1.0, 2.0))
+    _, table = D.tune_smoothing(docs, logps, labs, lambda d: (tr, st), weights=(0, 0.5, 1.0, 2.0))
+    assert w_dom["CL"] > 0 and w_dom["IT"] == 0, w_dom
+    best_shared = max(r["all"]["macro_f1_all13"] for r in table.values())
+    assert rep["all"]["macro_f1_all13"] >= best_shared and rep["all"]["accuracy"] == 1.0, (rep["all"], best_shared)
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):

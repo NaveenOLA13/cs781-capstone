@@ -153,8 +153,16 @@ def teacher_oof(bb, **overrides) -> dict:
         "+".join(f"{sum(pool[i]['domain'] == dm for i in f)} {dm}" for dm in domains) for f in folds)
         + ("; each copy picks its epochs on its held-out group" if on_dev else "; each copy picks its epochs on dev"))
 
-    oof, oof_a = [None] * len(pool), [None] * len(pool)
-    dev_a, dev_b, test_b, fold_info = [], [], [], []
+    variants = list(cfg["b_variants"] or [cfg["b_arch"]])        # Stage B versions; the first is the main one
+    v0 = variants[0]
+    if len(variants) > 1:
+        log(f"[{tag}] Stage B versions trained on the same Stage A features in every copy: {', '.join(variants)} "
+            f"(main: {v0})")
+    oof_v = {v: [None] * len(pool) for v in variants}
+    oof_a = [None] * len(pool)
+    dev_a, fold_info = [], []
+    dev_bv = {v: [] for v in variants}
+    test_bv = {v: [] for v in variants}
     peak, infer, saved, first = 0.0, 0.0, 0, None
     n_trainable = n_total = 0
     t_start = time.time()
@@ -186,38 +194,53 @@ def teacher_oof(bb, **overrides) -> dict:
         _free(device)
         ys = [torch.tensor([li[l] for l in d["labels"]], dtype=torch.long) for d in fit]
         sel_key = "held" if on_dev else "dev"
-        model_b, info_b = T.train_stage_b(feats["fit"], ys, feats[sel_key], select, labels, cfg, device, weight,
-                                          _quiet)
-        held_p = _probs(T.predict_stage_b(model_b, feats["held"], device))
-        for i, p in zip(held, held_p):
-            oof[i] = p
-        if not on_dev:
-            dev_b.append(_probs(T.predict_stage_b(model_b, feats["dev"], device)))
-        test_b.append(_probs(T.predict_stage_b(model_b, feats["test"], device)))
-        rep_h = D.evaluate(held_docs, T.to_preds(held_docs, held_p, labels), labels)
-        rep_d = None if on_dev else D.evaluate(dev, T.to_preds(dev, dev_b[-1], labels), labels)
+        rep_hv, best_ep, states_b = {}, {}, {}
+        for v in variants:                                   # every Stage B version on the same features
+            model_b, info_b = T.train_stage_b(feats["fit"], ys, feats[sel_key], select, labels,
+                                              {**cfg, "b_arch": v}, device, weight, _quiet)
+            held_p = _probs(T.predict_stage_b(model_b, feats["held"], device))
+            for i, p in zip(held, held_p):
+                oof_v[v][i] = p
+            if not on_dev:
+                dev_bv[v].append(_probs(T.predict_stage_b(model_b, feats["dev"], device)))
+            test_bv[v].append(_probs(T.predict_stage_b(model_b, feats["test"], device)))
+            rep_hv[v] = D.evaluate(held_docs, T.to_preds(held_docs, held_p, labels), labels)
+            best_ep[v] = info_b["best_epoch"]
+            states_b[v] = {n: t.detach().cpu() for n, t in model_b.state_dict().items()}
+            del model_b
+        rep_h = rep_hv[v0]
+        rep_d = None if on_dev else D.evaluate(dev, T.to_preds(dev, dev_bv[v0][-1], labels), labels)
         if cfg["save_model"]:
             path = os.path.join(out, f"{tag}_fold{k + 1}.pt")
-            torch.save({"stageA_trained": state_a, "stageB": model_b.state_dict(), "fold": k + 1,
-                        "held_out": [d["id"] for d in held_docs], "labels": labels, "config": cfg,
+            torch.save({"stageA_trained": state_a, "stageB": states_b[v0], "stageB_versions": states_b,
+                        "fold": k + 1, "held_out": [d["id"] for d in held_docs], "labels": labels, "config": cfg,
                         "note": "Stage A: only the trained tensors (adapters + head); every other weight equals "
-                                "the Phase 1 checkpoint. Stage B: the whole BiGRU."}, path)
+                                "the Phase 1 checkpoint. Stage B: whole models, one per version."}, path)
             saved += os.path.getsize(path)
         minutes = (time.time() - t0) / 60
         first = first or info_a
         fold_info.append(dict(fold=k + 1, fit_judgments=len(fit), held_out=[d["id"] for d in held_docs],
                               minutes=minutes, stage_a_best_epoch=info_a["best_epoch"],
-                              stage_b_best_epoch=info_b["best_epoch"],
+                              stage_b_best_epoch=best_ep[v0], stage_b_best_epochs=best_ep,
                               held_out_13avg={d: v["macro_f1_all13"] for d, v in rep_h.items()},
+                              held_out_13avg_versions={v: {d: r["macro_f1_all13"] for d, r in rep_hv[v].items()}
+                                                       for v in variants},
                               dev_13avg=None if rep_d is None else {d: v["macro_f1_all13"] for d, v in rep_d.items()}))
+        vs = "" if len(variants) == 1 else " | " + ", ".join(
+            f"{v} {rep_hv[v]['all']['macro_f1_all13']:.3f}" for v in variants)
         log(f"[{tag} {k + 1}/{K}] done in {minutes:.1f} min. Its {len(held_docs)} unseen judgments: {_short(rep_h)}"
-            + ("" if rep_d is None else f" | dev: {_short(rep_d)}"))
-        del model_b, feats
+            + vs + ("" if rep_d is None else f" | dev: {_short(rep_d)}"))
+        del feats
         _free(device)
 
     # ------------------------------------------------ the K copies together
+    oof, test_b, dev_b = oof_v[v0], test_bv[v0], dev_bv[v0]
     test_pb = _avg(test_b)
     rep_oof = D.evaluate(pool, T.to_preds(pool, oof, labels), labels)
+    rep_oof_v = {v: D.evaluate(pool, T.to_preds(pool, oof_v[v], labels), labels) for v in variants}
+    if len(variants) > 1:
+        log(f"[{tag}] out-of-fold 13-role avg of each Stage B version: " + " | ".join(
+            f"{v}: {_short(rep_oof_v[v])}" for v in variants))
     rep_oof_a = D.evaluate(pool, T.to_preds(pool, oof_a, labels), labels)
     gold_p, top_p, n = 0.0, 0.0, 0
     for d, p in zip(pool, oof):
@@ -250,7 +273,12 @@ def teacher_oof(bb, **overrides) -> dict:
                          for d, p in zip(pool, oof)},
                "dev": {} if on_dev else {d["id"]: lp for d, lp in zip(dev, _log(_avg(dev_b))) if lp is not None},
                "test": {d["id"]: lp for d, lp in zip(test, _log(test_pb)) if lp is not None},
-               "folds": [[pool[i]["id"] for i in f] for f in folds], "train_on_dev": on_dev, "config": cfg}
+               "folds": [[pool[i]["id"] for i in f] for f in folds], "train_on_dev": on_dev, "config": cfg,
+               "main_version": v0,
+               "versions": {v: {"train": {d["id"]: (torch.zeros(0, L) if p is None else torch.log(p.clamp_min(1e-12)))
+                                          for d, p in zip(pool, oof_v[v])},
+                                "test": {d["id"]: lp for d, lp in zip(test, _log(_avg(test_bv[v]))) if lp is not None}}
+                            for v in variants}}
     tpath = os.path.join(out, "teacher.pt")
     torch.save(teacher, tpath)
     total_min = (time.time() - t_start) / 60
@@ -265,6 +293,7 @@ def teacher_oof(bb, **overrides) -> dict:
                                 best_epoch=first["best_epoch"], train_seconds=time.time() - t_start),
                    stage_b=dict(dev=rep_b),
                    oof_train=dict(stage_b=rep_oof, stage_a=rep_oof_a, gold_prob=gold_p, top_prob=top_p),
+                   stage_b_versions={v: rep_oof_v[v] for v in variants}, main_version=v0,
                    folds=fold_info, config=cfg)
     with open(os.path.join(out, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=1)
