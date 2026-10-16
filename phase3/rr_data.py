@@ -344,16 +344,20 @@ def format_comparison(runs: dict[str, dict | None], pairs=CLOSE_PAIRS) -> str:
     L = []
 
     L.append("COST (Stage A)")
-    L.append(f"{'method':{w}s}{'trainable':>12s}{'% of all':>11s}{'saved file':>13s}{'peak GPU':>11s}"
-             f"{'time':>9s}{'s/epoch':>9s}{'best epoch':>12s}")
+    L.append(f"{'method':{w}s}{'model size':>12s}{'trainable':>12s}{'% of all':>11s}{'saved file':>13s}"
+             f"{'peak GPU':>11s}{'time':>9s}{'s/epoch':>9s}{'best epoch':>12s}{'dev pass':>10s}")
     for k, m in ok.items():
         a = m["stage_a"]
         hist = a.get("history") or []
         per_ep = sum(h["seconds"] for h in hist) / len(hist) if hist else None
-        pct = 100 * a["trainable_params"] / a["total_params"] if a.get("total_params") else None
-        L.append(f"{k:{w}s}{a['trainable_params'] / 1e6:>11.3f}M{_fmt(pct, '.2f', 10)}%"
+        tot = a.get("total_params")
+        pct = 100 * a["trainable_params"] / tot if tot else None
+        L.append(f"{k:{w}s}{_fmt(None if tot is None else tot / 1e6, '.2f', 11)}M"
+                 f"{a['trainable_params'] / 1e6:>11.3f}M{_fmt(pct, '.2f', 10)}%"
                  f"{_fmt(a.get('saved_mb'), '.1f', 10)} MB{_fmt(a.get('peak_gpu_gb'), '.2f', 8)} GB"
-                 f"{a['train_seconds'] / 60:>8.1f}m{_fmt(per_ep, '.0f', 8)}s{a['best_epoch']:>9d}/{len(hist):<2d}")
+                 f"{a['train_seconds'] / 60:>8.1f}m{_fmt(per_ep, '.0f', 8)}s{a['best_epoch']:>9d}/{len(hist):<2d}"
+                 f"{_fmt(a.get('dev_infer_seconds'), '.1f', 9)}s")
+    L.append("   (model size = all weights of one model; dev pass = Stage A time to read every dev sentence once)")
 
     L.append("\nDEV 13-ROLE AVERAGE (the Codabench metric)")
     cols = [(st, dm) for st in ("A", "B") for dm in ["all"] + doms]

@@ -280,7 +280,13 @@ def run_methods(bb, methods=ALL_METHODS, prefix: str = "run", skip_done: bool = 
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-    text = D.format_comparison(results)
+    save_comparison(results, cfg0["out_dir"], prefix)
+    return results
+
+
+def save_comparison(results: dict, out_dir: str, prefix: str, extra_text: str = "") -> str:
+    """Print the comparison of finished runs and save it as <prefix>_comparison.txt / .json in out_dir."""
+    text = D.format_comparison(results) + (("\n\n" + extra_text) if extra_text else "")
     print("\n" + "=" * 78 + f"\nCOMPARISON '{prefix}' (dev)\n" + text)
     rows = {}
     for m, met in results.items():
@@ -289,22 +295,23 @@ def run_methods(bb, methods=ALL_METHODS, prefix: str = "run", skip_done: bool = 
             continue
         a, b = met["stage_a"], met["stage_b"]
         labels = list(a["dev"]["all"]["per_label"])
-        rows[m] = dict(run=met["run_name"], trainable=a["trainable_params"], total=a["total_params"],
+        rows[m] = dict(run=met["run_name"], trainable=a["trainable_params"], total=a.get("total_params"),
                        saved_mb=a.get("saved_mb"), peak_gpu_gb=a.get("peak_gpu_gb"),
                        stage_a_minutes=a["train_seconds"] / 60, best_epoch=a["best_epoch"],
+                       dev_infer_seconds=a.get("dev_infer_seconds"),
                        dev_13avg={st: {k: v["macro_f1_all13"] for k, v in s["dev"].items()}
                                   for st, s in (("A", a), ("B", b))},
                        train_fit_acc=(a.get("train_fit") or {}).get("all", {}).get("accuracy"),
                        close_pairs={st: D.pair_confusions(s["dev"], labels) for st, s in (("A", a), ("B", b))},
-                       peft=a.get("peft"),
-                       submission=os.path.join(cfg0["out_dir"], met["run_name"], met["best"], "submission.zip"))
-    os.makedirs(cfg0["out_dir"], exist_ok=True)
-    with open(os.path.join(cfg0["out_dir"], f"{prefix}_comparison.txt"), "w", encoding="utf-8") as f:
+                       peft=a.get("peft"), kd=met.get("kd"),
+                       submission=os.path.join(out_dir, met["run_name"], met["best"], "submission.zip"))
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, f"{prefix}_comparison.txt"), "w", encoding="utf-8") as f:
         f.write(text + "\n")
-    with open(os.path.join(cfg0["out_dir"], f"{prefix}_comparison.json"), "w") as f:
+    with open(os.path.join(out_dir, f"{prefix}_comparison.json"), "w") as f:
         json.dump(rows, f, indent=1)
     print("\nsubmission files (best stage on dev):")
     for m, r in rows.items():
-        print(f"  {m:8s} " + ("FAILED" if r is None else r["submission"]))
-    print(f"saved {prefix}_comparison.txt and {prefix}_comparison.json in {cfg0['out_dir']}")
-    return results
+        print(f"  {m:12s} " + ("FAILED" if r is None else r["submission"]))
+    print(f"saved {prefix}_comparison.txt and {prefix}_comparison.json in {out_dir}")
+    return text

@@ -5,6 +5,9 @@ Stage B  whole judgment: frozen Stage A features x_1..x_S -> BiGRU -> head
 Both are scored on dev (overall, CL, IT, per role) and both get a Codabench zip.
 Stage A methods: "full" fine-tuning, "frozen" backbone (head only), or a PEFT method from rr_peft.py
 ("lora", "rslora", "adalora", "ia3": the Phase 1 weights stay fixed, small adapters are trained).
+Knowledge distillation (rr_kd.py): with kd_teacher=<teacher.pt>, Stage A and Stage B also learn from
+the teacher's probabilities for every training sentence:
+    loss = kd_alpha * CE(gold) + (1 - kd_alpha) * T^2 * KL(teacher_T || student_T)
 
     from rr_backbone import make_backbone
     from rr_train import run
@@ -57,6 +60,11 @@ DEFAULTS = dict(
     adalora_init_r=12,           # AdaLoRA starting rank per layer
     adalora_tinit=0.1, adalora_tfinal=0.2,       # share of steps before rank changes start / after they stop
     adalora_deltaT=10, adalora_orth=0.5,         # steps between budget updates; orthogonality penalty weight
+    # knowledge distillation (rr_kd.py)
+    kd_teacher=None,             # teacher.pt from rr_kd.teacher_oof (teacher log-probs per training sentence)
+    kd_alpha=0.5,                # weight of the gold-label loss; the teacher term gets 1 - kd_alpha
+    kd_T=2.0,                    # temperature: both distributions are softened before they are compared
+    kd_stage_b=True,             # also use the teacher term when training Stage B
     # Stage B
     b_epochs=40, b_patience=10, b_lr=1e-3, b_weight_decay=0.01, b_hidden=256, b_dropout=0.3, b_layers=1,
     save_model=True,
@@ -167,6 +175,32 @@ def run_sentences(clf, docs, cfg, device, pad_id, what="logits"):
     return res
 
 
+def kd_loss(logits, teacher_logp, T):
+    """T^2 * KL(teacher_T || student_T), averaged over sentences. teacher_logp: [N, L] log-probabilities;
+    dividing them by T and renormalising softens the teacher exactly like dividing logits by T."""
+    p = F.softmax(teacher_logp.float() / T, dim=-1)
+    return F.kl_div(F.log_softmax(logits.float() / T, dim=-1), p, reduction="batchmean") * (T * T)
+
+
+def teacher_targets(path, docs, labels):
+    """The teacher's log-probabilities [S, L] for each judgment in `docs` (same order), from teacher.pt."""
+    t = torch.load(path, map_location="cpu", weights_only=False)
+    if list(t["labels"]) != list(labels):
+        raise ValueError("the teacher was trained with a different label list")
+    out, missing = [], []
+    for d in docs:
+        lp = t["train"].get(d["id"])
+        if lp is None:
+            missing.append(d["id"])
+            continue
+        if lp.shape != (len(d["labels"]), len(labels)):
+            raise ValueError(f"{d['id']}: teacher has {tuple(lp.shape)} for {len(d['labels'])} sentences")
+        out.append(lp.float())
+    if missing:
+        raise ValueError(f"the teacher has no probabilities for {len(missing)} training judgments, e.g. {missing[:3]}")
+    return out
+
+
 def make_optimizer(named_params, head_ids, cfg):
     body_lr = cfg["lr_peft"] if cfg["method"] in P.PEFT_METHODS else cfg["lr_backbone"]
     groups = {}
@@ -221,9 +255,10 @@ def freeze_unused(clf, docs, cfg, device, pad_id, log=print, n_batches=3):
             ", ".join(f"{k} {v / 1e6:.2f}M" for k, v in parts.most_common()))
 
 
-def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=print):
+def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=print, soft=None):
     """Fine-tune Stage A. With dev_docs, every epoch is scored on dev and the best epoch is kept;
-    with dev_docs=None (cross-validation) it trains a fixed number of epochs and keeps the last."""
+    with dev_docs=None (cross-validation) it trains a fixed number of epochs and keeps the last.
+    soft: teacher log-probabilities per training judgment (knowledge distillation) or None."""
     sel, mname = cfg["select_metric"], METRIC_NAMES[cfg["select_metric"]]
     li = {l: i for i, l in enumerate(labels)}
     items = flat(train_docs, cfg["pos_buckets"])
@@ -237,6 +272,10 @@ def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=pr
     opt = make_optimizer(clf.named_parameters(), head_ids, cfg)
     steps = stage_a_steps(train_docs, cfg)
     hooks = getattr(clf, "peft_hooks", None)       # AdaLoRA: extra loss term and rank updates
+    a_kd, T_kd = cfg["kd_alpha"], cfg["kd_T"]
+    if soft is not None:
+        log(f"[stage A] knowledge distillation: {a_kd} x gold-label loss + {1 - a_kd:.2f} x teacher term "
+            f"(temperature {T_kd})")
     total = steps * cfg["epochs"]
     sched = warmup_linear(opt, int(cfg["warmup"] * total), total)
     scaler = _scaler(device, cfg["amp"])
@@ -247,7 +286,7 @@ def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=pr
     t_start = time.time()
     for ep in range(1, cfg["epochs"] + 1):
         clf.train()
-        t0, tot, seen, skipped = time.time(), 0.0, 0, 0
+        t0, tot, tot_kd, seen, skipped = time.time(), 0.0, 0.0, 0, 0
         batches = D.length_batches(lengths, cfg["batch_size"], shuffle=True, seed=cfg["seed"] * 1000 + ep,
                                    exact=cfg["exact_batches"])
         for step, b in enumerate(batches, 1):
@@ -256,8 +295,13 @@ def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=pr
             with _autocast(device, cfg["amp"]):
                 logits = clf(ids, mask, pos=pos)
             ce = F.cross_entropy(logits.float(), y, weight=weight)
+            loss = ce
+            if soft is not None:
+                t_lp = torch.stack([soft[items[k][0]][items[k][1]] for k in b]).to(device)
+                kd = kd_loss(logits, t_lp, T_kd)
+                loss = a_kd * ce + (1 - a_kd) * kd
             extra = hooks.extra_loss() if hooks is not None else None
-            loss = ce if extra is None else ce + extra
+            loss = loss if extra is None else loss + extra
             opt.zero_grad(set_to_none=True)
             if not torch.isfinite(loss):
                 skipped += 1
@@ -273,11 +317,16 @@ def train_stage_a(clf, train_docs, dev_docs, labels, cfg, device, pad_id, log=pr
             if hooks is not None:      # a lower scale after update() means this step was skipped (inf grads)
                 hooks.after_step(stepped=scaler.get_scale() >= scale)
             tot += ce.item() * len(b)
+            if soft is not None:
+                tot_kd += kd.item() * len(b)
             seen += len(b)
             if cfg["log_every"] and step % cfg["log_every"] == 0:
                 log(f"  epoch {ep} step {step}/{steps}  loss {tot / max(1, seen):.4f}")
         rec = dict(epoch=ep, loss=tot / max(1, seen), seconds=time.time() - t0, skipped_steps=skipped)
         extra = f"  ({skipped} steps skipped: non-finite loss)" if skipped else ""
+        if soft is not None:
+            rec["kd_loss"] = tot_kd / max(1, seen)
+            extra = f"  teacher term {rec['kd_loss']:.4f}" + extra
         if dev_docs:
             dev_out = run_sentences(clf, dev_docs, cfg, device, pad_id)
             rep = D.evaluate(dev_docs, to_preds(dev_docs, dev_out, labels), labels)
@@ -317,8 +366,9 @@ def predict_stage_b(model, feats, device):
     return [None if f is None else model(f.to(device)).float().cpu() for f in feats]
 
 
-def train_stage_b(feats, ys, dev_feats, dev_docs, labels, cfg, device, weight, log=print):
-    """Train the BiGRU over judgments; the best epoch on dev_docs (early stopping) is kept."""
+def train_stage_b(feats, ys, dev_feats, dev_docs, labels, cfg, device, weight, log=print, soft=None):
+    """Train the BiGRU over judgments; the best epoch on dev_docs (early stopping) is kept.
+    soft: teacher log-probabilities per training judgment (knowledge distillation) or None."""
     sel, mname = cfg["select_metric"], METRIC_NAMES[cfg["select_metric"]]
     torch.manual_seed(cfg["seed"])
     feat_dim = next(f for f in feats if f is not None).size(-1)
@@ -336,7 +386,10 @@ def train_stage_b(feats, ys, dev_feats, dev_docs, labels, cfg, device, weight, l
         tot, n = 0.0, 0
         for i in order:
             x, y = feats[i].to(device), ys[i].to(device)
-            loss = F.cross_entropy(model(x), y, weight=weight)
+            out = model(x)
+            loss = F.cross_entropy(out, y, weight=weight)
+            if soft is not None:
+                loss = cfg["kd_alpha"] * loss + (1 - cfg["kd_alpha"]) * kd_loss(out, soft[i].to(device), cfg["kd_T"])
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -380,6 +433,10 @@ def resolve_cfg(bb, overrides, defaults=None) -> dict:
         raise ValueError(f"method must be one of {P.ALL_METHODS}")
     if cfg["method"] in P.PEFT_METHODS and cfg["lr_peft"] is None:
         cfg["lr_peft"] = P.DEFAULT_LR[cfg["method"]]
+    if not 0.0 <= cfg["kd_alpha"] <= 1.0 or cfg["kd_T"] <= 0:
+        raise ValueError("kd_alpha must be in [0, 1] and kd_T > 0")
+    if cfg["kd_teacher"] is not None and not os.path.exists(cfg["kd_teacher"]):
+        raise ValueError(f"kd_teacher file not found: {cfg['kd_teacher']}")
     return cfg
 
 
@@ -466,14 +523,20 @@ def run(bb, **overrides) -> dict:
     sel = cfg["select_metric"]
     device, out, log = start_run(cfg)
     labels, train, dev, test = prepare(bb, cfg, log)
+    soft = teacher_targets(cfg["kd_teacher"], train, labels) if cfg["kd_teacher"] else None
+    if soft is not None:
+        log(f"[kd] teacher probabilities for all {len(train)} training judgments from {cfg['kd_teacher']}")
     clf, n_trainable, n_total = build_stage_a(bb, labels, cfg, device, train, log)
 
     # ---------------------------------------------------------------- Stage A
     _reset_peak(device)
-    info_a = train_stage_a(clf, train, dev, labels, cfg, device, bb.pad_id, log)
+    info_a = train_stage_a(clf, train, dev, labels, cfg, device, bb.pad_id, log, soft=soft)
     peak_a = _gb(device)
     weight = info_a.pop("weight_tensor")
-    out_a = {s: run_sentences(clf, ds, cfg, device, bb.pad_id) for s, ds in (("dev", dev), ("test", test))}
+    t_inf = time.time()
+    out_a = {"dev": run_sentences(clf, dev, cfg, device, bb.pad_id)}
+    infer_s = time.time() - t_inf                  # Stage A over all dev sentences (model speed)
+    out_a["test"] = run_sentences(clf, test, cfg, device, bb.pad_id)
     preds_a = {s: to_preds(ds, out_a[s], labels) for s, ds in (("dev", dev), ("test", test))}
     rep_a = D.evaluate(dev, preds_a["dev"], labels)
     rep_fit = D.evaluate(train, to_preds(train, run_sentences(clf, train, cfg, device, bb.pad_id), labels), labels)
@@ -501,7 +564,8 @@ def run(bb, **overrides) -> dict:
     _reset_peak(device)
     li = {l: i for i, l in enumerate(labels)}
     ys = [torch.tensor([li[l] for l in d["labels"]], dtype=torch.long) for d in train]
-    model_b, info_b = train_stage_b(feats["train"], ys, feats["dev"], dev, labels, cfg, device, weight, log)
+    model_b, info_b = train_stage_b(feats["train"], ys, feats["dev"], dev, labels, cfg, device, weight, log,
+                                    soft=soft if cfg["kd_stage_b"] else None)
     peak_b = _gb(device)
     out_b = {"dev": predict_stage_b(model_b, feats["dev"], device),
              "test": predict_stage_b(model_b, feats["test"], device)}
@@ -530,7 +594,7 @@ def run(bb, **overrides) -> dict:
                          for s, ds in (("train", train), ("dev", dev), ("test", test))},
                    stage_a=dict(dev=rep_a, train_fit=_fit_summary(rep_fit), trainable_params=n_trainable,
                                 total_params=n_total, peak_gpu_gb=peak_a, saved_mb=saved_mb, method=cfg["method"],
-                                **info_a),
+                                dev_infer_seconds=infer_s, **info_a),
                    stage_b=dict(dev=rep_b, trainable_params=n_b, peak_gpu_gb=peak_b, **info_b),
                    best=best, config=cfg)
     with open(os.path.join(out, "metrics.json"), "w") as f:
