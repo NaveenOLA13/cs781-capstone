@@ -509,3 +509,64 @@ def biased_preds(docs: list[dict], logps, labels: list[str], bias, group_of) -> 
             continue
         out[d["id"]] = [labels[i] for i in (np.asarray(lp, dtype=np.float64) + bias[group_of(d)]).argmax(1)]
     return out
+
+
+# ------------------------------------------------------------- role-sequence smoothing
+def transition_logprobs(label_seqs, labels: list[str], alpha: float = 1.0):
+    """From gold role sequences: log P(role of the next sentence | role of this sentence) [L, L] and
+    log P(role of the first sentence) [L], with add-alpha counts so unseen changes stay possible."""
+    import numpy as np
+    idx = {l: i for i, l in enumerate(labels)}
+    L = len(labels)
+    trans, start = np.full((L, L), float(alpha)), np.full(L, float(alpha))
+    for seq in label_seqs:
+        if not seq:
+            continue
+        start[idx[seq[0]]] += 1
+        for a, b in zip(seq, seq[1:]):
+            trans[idx[a], idx[b]] += 1
+    return np.log(trans / trans.sum(1, keepdims=True)), np.log(start / start.sum())
+
+
+def viterbi(logp, trans, start, w: float) -> list[int]:
+    """The role sequence of one judgment that maximises
+        sum_i logp[i, y_i] + w * (start[y_0] + sum_i trans[y_(i-1), y_i]).
+    logp: [S, L] model log-probabilities; w = 0 gives the model's own choice per sentence."""
+    import numpy as np
+    logp = np.asarray(logp, dtype=np.float64)
+    if len(logp) == 0:
+        return []
+    if w == 0:
+        return logp.argmax(1).tolist()
+    S, L = logp.shape
+    score = logp[0] + w * start
+    back = np.zeros((S, L), dtype=np.int64)
+    for i in range(1, S):
+        cand = score[:, None] + w * trans                  # [previous role, this role]
+        back[i] = cand.argmax(0)
+        score = cand.max(0) + logp[i]
+    path = [int(score.argmax())]
+    for i in range(S - 1, 0, -1):
+        path.append(int(back[i, path[-1]]))
+    return path[::-1]
+
+
+def smoothed_preds(docs: list[dict], logps, labels: list[str], trans_for, w: float) -> dict[str, list[str]]:
+    """{doc_id: roles} after Viterbi smoothing; trans_for(doc) -> (trans, start) for that judgment."""
+    out = {}
+    for d, lp in zip(docs, logps):
+        if lp is None or len(lp) == 0:
+            out[d["id"]] = []
+            continue
+        tr, st = trans_for(d)
+        out[d["id"]] = [labels[i] for i in viterbi(lp, tr, st, w)]
+    return out
+
+
+def tune_smoothing(docs: list[dict], logps, labels: list[str], trans_for, weights=(0, 0.1, 0.2, 0.3, 0.5, 0.75,
+                                                                                  1.0, 1.5, 2.0)):
+    """Tries each weight on labelled judgments (out-of-fold predictions); returns (best w, {w: evaluate(...)}).
+    Ties go to the smaller weight (less change)."""
+    table = {w: evaluate(docs, smoothed_preds(docs, logps, labels, trans_for, w), labels) for w in weights}
+    best = max(sorted(table), key=lambda w: (round(table[w]["all"]["macro_f1_all13"], 6), -w))
+    return best, table

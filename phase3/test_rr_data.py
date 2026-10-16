@@ -250,6 +250,38 @@ def test_pair_confusions_and_comparison():
     assert D.format_comparison({"a": None}).startswith("no finished runs")
 
 
+def test_viterbi_smoothing():
+    import itertools
+
+    import numpy as np
+    labs = ["A", "B", "C"]
+    tr, st = D.transition_logprobs([["A", "A", "A", "B", "B"], ["B", "B", "C", "C"], ["A", "A"]], labs)
+    assert np.allclose(np.exp(tr).sum(1), 1) and abs(np.exp(st).sum() - 1) < 1e-9
+    assert tr[0, 0] > tr[0, 2] and st[0] > st[2]                     # A->A seen, A->C never; most start with A
+    rng = np.random.default_rng(0)
+    for _ in range(20):                                               # exact: compare with trying every sequence
+        lp = np.log(rng.dirichlet(np.ones(3), size=4))
+        w = float(rng.uniform(0, 2))
+        best = max(itertools.product(range(3), repeat=4),
+                   key=lambda y: sum(lp[i, y[i]] for i in range(4)) + w * (st[y[0]] + sum(tr[y[i - 1], y[i]]
+                                                                                       for i in range(1, 4))))
+        assert D.viterbi(lp, tr, st, w) == list(best)
+    lp = np.log(np.array([[.9, .05, .05], [.9, .05, .05], [.45, .5, .05], [.9, .05, .05], [.9, .05, .05]]))
+    assert D.viterbi(lp, tr, st, 0) == [0, 0, 1, 0, 0]               # w = 0: the model's own choice
+    assert D.viterbi(lp, tr, st, 1.0) == [0, 0, 0, 0, 0]             # the lone "B" is smoothed away
+    assert D.viterbi(np.zeros((0, 3)), tr, st, 1.0) == []
+    docs = [{"id": f"d{k}", "domain": "CL", "labels": ["A"] * 6 + ["B"] * 6} for k in range(4)]
+    noisy = []
+    for k in range(4):                                                # one wrong sentence inside each block
+        p = np.full((12, 3), 0.05)
+        p[:6, 0], p[6:, 1] = 0.9, 0.9
+        p[2 + k % 3] = [0.4, 0.55, 0.05]
+        noisy.append(np.log(p / p.sum(1, keepdims=True)))
+    tr2, st2 = D.transition_logprobs([d["labels"] for d in docs], labs)
+    w, table = D.tune_smoothing(docs, noisy, labs, lambda d: (tr2, st2), weights=(0, 0.5, 1.0))
+    assert w > 0 and table[w]["all"]["accuracy"] == 1.0 and table[0]["all"]["accuracy"] < 1.0, (w, table)
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):
