@@ -117,8 +117,12 @@ def _expected_trainable(model, method, cfg_r=8, init_r=12):
     n = 0
     for t in targets:
         i, o = mods[t].in_features, mods[t].out_features
-        n += {"lora": cfg_r * (i + o), "rslora": cfg_r * (i + o), "adalora": init_r * (i + o + 1),
-              "ia3": i if t in ff else o}[method]
+        if method == "ia3":                 # one scale per input (feed-forward) or per output
+            n += i if t in ff else o
+        elif method == "adalora":           # P (r x in), Q (out x r), E (r)
+            n += init_r * (i + o + 1)
+        else:                               # LoRA / rsLoRA: A (r x in), B (out x r)
+            n += cfg_r * (i + o)
     return n + HEAD, targets
 
 
