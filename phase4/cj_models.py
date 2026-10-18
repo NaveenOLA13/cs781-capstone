@@ -81,7 +81,8 @@ def _load_ckpt(path: str) -> dict:
         if not pkl:
             raise ValueError(f"{path} is a folder without data.pkl: not an unpacked checkpoint")
         base = os.path.dirname(pkl[0])
-        tmp = os.path.join(tempfile.gettempdir(), "ckpt_" + re.sub(r"\W", "_", path)[-60:] + ".pt")
+        # one file per process: two grid workers may rebuild the same checkpoint at the same time
+        tmp = os.path.join(tempfile.gettempdir(), f"ckpt_{os.getpid()}_" + re.sub(r"\W", "_", path)[-60:] + ".pt")
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
             for root, _, files in os.walk(base):
                 for f in files:
