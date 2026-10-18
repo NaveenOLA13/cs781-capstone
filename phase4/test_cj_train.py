@@ -212,7 +212,8 @@ def test_trainable_sets():
                 elif tech == "adapter":
                     assert names == set() and len(h.body_params) > 0
                     assert all(p.requires_grad for p in h.body_params)
-                assert all(p.requires_grad for p in h.body_params)
+                if tech != "unfreeze":                     # unfreezing starts with everything frozen on purpose
+                    assert all(p.requires_grad for p in h.body_params), (kind, tech)
 
 
 def test_updates_change_the_model():
