@@ -246,8 +246,12 @@ def encode_docs(docs: list[dict], encode, n_tokens: int, window: str = "tail", w
         os.makedirs(cache_dir, exist_ok=True)
         path = os.path.join(cache_dir, f"tok_{fingerprint(encode)}_{window}_{n_tokens}.pkl")
         if os.path.exists(path):
-            with open(path, "rb") as f:
-                cache = pickle.load(f)
+            try:
+                with open(path, "rb") as f:
+                    cache = pickle.load(f)
+            except Exception as e:  # noqa: BLE001  (a damaged cache file is rebuilt)
+                log(f"[data] cache {path} unreadable ({type(e).__name__}); tokenising again")
+                cache = {}
     todo = []
     for i, d in enumerate(docs):
         key = hashlib.md5(d["text"].encode("utf-8")).hexdigest()
@@ -268,7 +272,7 @@ def encode_docs(docs: list[dict], encode, n_tokens: int, window: str = "tail", w
             out[i] = ids
             cache[key] = ids
         if path:
-            tmp = path + ".tmp"
+            tmp = f"{path}.{os.getpid()}.tmp"   # one file per process: parallel workers may write the same cache
             with open(tmp, "wb") as f:
                 pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
             os.replace(tmp, path)

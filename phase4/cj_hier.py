@@ -22,7 +22,6 @@ submission_050/) and the comparison <run>/hier_k<k>/hier.txt. Chunk vectors are 
 """
 from __future__ import annotations
 
-import copy
 import json
 import math
 import os
@@ -53,7 +52,8 @@ def rebuild(run_dir: str, bb=None, ckpt: str | None = None, device=None, log=pri
         from cj_models import load_backbone
         bb, _ = load_backbone(name, max_len=cfg["max_len"], path=ckpt or cfg.get("ckpt_path"), log=log)
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    clf = bb.classifier(2, model=copy.deepcopy(bb.model), head=cfg["head"], dropout=cfg["dropout"],
+    model, _ = R.make_model(bb, cfg, log=lambda *a: None)    # a KD student keeps only its first blocks
+    clf = bb.classifier(2, model=model, head=cfg["head"], dropout=cfg["dropout"],
                         pooling=cfg["pooling"]).to(device).float()
     g = torch.Generator().manual_seed(0)
     top = max(8, min(bb.vocab or 1000, 1000))
@@ -361,7 +361,7 @@ def run_hier_many(run_dirs, gpus: int | None = None, poll: int = 60, **overrides
             if n_gpu:
                 env["CUDA_VISIBLE_DEVICES"] = str(gpu)
             fh = open(log_path, "w")
-            p = subprocess.Popen([sys.executable, os.path.join(here, "cj_hier.py"), "--run", run,
+            p = subprocess.Popen([sys.executable, "-u", os.path.join(here, "cj_hier.py"), "--run", run,
                                   "--settings", json.dumps(overrides)], stdout=fh, stderr=subprocess.STDOUT,
                                  env=env, cwd=here)
             procs.append((p, gpu, fh, run))
