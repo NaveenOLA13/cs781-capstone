@@ -43,6 +43,9 @@ DEFAULTS = dict(
     grad_clip=1.0, amp=True, class_weight_power=0.5, dropout=0.1, head="linear", pooling=None,
     exact_batches=None,          # None: automatic (only cases of exactly one length per batch if padding matters)
     limit_train=0, limit_dev=0,  # >0: quick check on the first k cases of each label
+    train_chunks=1,              # >1: every training case gives its last k chunks of max_len tokens as examples
+    chunk_stride=448,            # tokens between the starts of neighbouring chunks (overlap = max_len - stride)
+    ckpt_path=None,              # the Phase 1 / mid-trained checkpoint used (recorded for later steps)
     tok_workers=4, cache_dir="/kaggle/working/cj_cache", log_every=200, fit_sample=1000,
     save_weights=True, fetch_data=True,
     **T.TECH_DEFAULTS,
@@ -123,20 +126,38 @@ def resolve_cfg(overrides: dict) -> dict:
 
 # --------------------------------------------------------------------------------- data
 def prepare_tokens(encode, cfg, log=print, bos_id=None, eos_id=None):
-    """(data, {split: token id lists}) with the window of every case; tokenised once and cached."""
+    """(data, {split: token id lists}, case_of) with the window of every case; tokenised once and cached.
+    With train_chunks = k > 1 every training case gives its last k chunks (each one example with the case's label);
+    case_of[j] is the case of training example j. Dev and test always use one window per case."""
     data = D.load_data(cfg["data_root"], fetch=cfg["fetch_data"], log=log)
     data["train"] = limit(data["train"], cfg["limit_train"], cfg["seed"])
     data["dev"] = limit(data["dev"], cfg["limit_dev"], cfg["seed"])
     log(D.summary(data))
     n = cfg["max_len"] - (bos_id is not None) - (eos_id is not None)
-    seqs = {}
+    k = int(cfg.get("train_chunks", 1) or 1)
+    if k > 1 and cfg["window"] != "tail":
+        raise ValueError("train_chunks > 1 needs window='tail'")
+
+    def wrap(x):
+        return ([bos_id] if bos_id is not None else []) + (x or [0]) + ([eos_id] if eos_id is not None else [])
+
+    seqs, case_of = {}, list(range(len(data["train"])))
     for s, ds in data.items():
-        ids = D.encode_docs(ds, encode, n, cfg["window"], workers=cfg["tok_workers"], cache_dir=cfg["cache_dir"],
+        span = D.chunk_span(n, cfg["chunk_stride"], k) if (s == "train" and k > 1) else n
+        ids = D.encode_docs(ds, encode, span, cfg["window"], workers=cfg["tok_workers"], cache_dir=cfg["cache_dir"],
                             log=log)
-        seqs[s] = [([bos_id] if bos_id is not None else []) + (x or [0]) + ([eos_id] if eos_id is not None else [])
-                   for x in ids]
-        log(f"[data] {s}: " + D.length_report([len(x) for x in ids], n))
-    return data, seqs
+        if s == "train" and k > 1:
+            seqs[s], case_of = [], []
+            for i, x in enumerate(ids):
+                for c in D.chunk_ids(x, n, cfg["chunk_stride"], k):
+                    seqs[s].append(wrap(c))
+                    case_of.append(i)
+            log(f"[data] train: {len(seqs[s])} chunk examples from {len(ids)} cases (last {k} chunks of {n} tokens, "
+                f"stride {cfg['chunk_stride']})")
+        else:
+            seqs[s] = [wrap(x) for x in ids]
+            log(f"[data] {s}: " + D.length_report([len(x) for x in ids], n))
+    return data, seqs, case_of
 
 
 @torch.no_grad()
@@ -204,11 +225,11 @@ def run(bb, name: str = "model", **overrides) -> dict:
     with open(os.path.join(out, "config.json"), "w") as f:
         json.dump(cfg, f, indent=1)
 
-    data, seqs = prepare_tokens(bb.encode, cfg, log, bb.bos_id, bb.eos_id)
+    data, seqs, case_of = prepare_tokens(bb.encode, cfg, log, bb.bos_id, bb.eos_id)
     top = max(max(s) for ss in seqs.values() for s in ss)
     if bb.vocab is not None and top >= bb.vocab:
         raise ValueError(f"token id {top} >= the model's vocabulary {bb.vocab}: wrong tokenizer?")
-    y_tr = [d["label"] for d in data["train"]]
+    y_tr = [data["train"][c]["label"] for c in case_of]
     y_dev = [d["label"] for d in data["dev"]]
 
     # ------------------------------------------------------------------ model + technique
@@ -246,7 +267,8 @@ def run(bb, name: str = "model", **overrides) -> dict:
     all_params = head + body
     w = D.class_weights(y_tr, cfg["class_weight_power"])
     weight = torch.tensor(w, dtype=torch.float32, device=device)
-    log(f"[train] {len(y_tr)} cases ({sum(y_tr)} label 1), class weights {w[0]:.2f} / {w[1]:.2f}; "
+    log(f"[train] {len(y_tr)} examples from {len(data['train'])} cases ({sum(y_tr)} label 1), class weights "
+        f"{w[0]:.2f} / {w[1]:.2f}; "
         f"{steps_per_epoch} steps per epoch x {cfg['epochs']} epochs")
 
     keep_ids = {id(p) for p in all_params}

@@ -275,6 +275,32 @@ def encode_docs(docs: list[dict], encode, n_tokens: int, window: str = "tail", w
     return out  # type: ignore[return-value]
 
 
+def chunk_span(max_len: int, stride: int, k: int) -> int:
+    """Tokens needed at the end of a case for its last k chunks of max_len tokens, consecutive chunks `stride` apart."""
+    return stride * (k - 1) + max_len
+
+
+def chunk_ids(ids: list[int], max_len: int, stride: int, k: int) -> list[list[int]]:
+    """The last (up to) k chunks of max_len tokens, in reading order. Each chunk ends `stride` tokens before the
+    next one (neighbours overlap by max_len - stride tokens). At the start of the case the first chunk is taken
+    as the first max_len tokens, unless that would add fewer than stride // 2 new tokens. A case of at most
+    max_len tokens is one chunk."""
+    n = len(ids)
+    if n <= max_len:
+        return [list(ids)]
+    out, end, prev_start = [], n, None
+    while len(out) < k:
+        start = end - max_len
+        if start <= 0:
+            if prev_start is None or prev_start >= stride // 2:
+                out.append(list(ids[:max_len]))
+            break
+        out.append(list(ids[start:end]))
+        prev_start = start
+        end -= stride
+    return out[::-1]
+
+
 def length_report(lengths: list[int], n_tokens: int) -> str:
     s = sorted(lengths)
     if not s:

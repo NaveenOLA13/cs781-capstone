@@ -153,6 +153,21 @@ def test_encode_docs_cache_and_workers():
     assert "fill the whole 32-token window" in D.length_report(lengths, 32)
 
 
+def test_chunks():
+    ids = list(range(1000))
+    ch = D.chunk_ids(ids, 512, 448, 3)
+    assert [(c[0], c[-1], len(c)) for c in ch] == [(40, 551, 512), (488, 999, 512)]   # only 2 fit: 1000 < 3 chunks
+    ch = D.chunk_ids(list(range(2000)), 512, 448, 3)
+    assert [(c[0], c[-1]) for c in ch] == [(592, 1103), (1040, 1551), (1488, 1999)]
+    assert D.chunk_ids(list(range(300)), 512, 448, 8) == [list(range(300))]
+    assert D.chunk_ids([], 512, 448, 3) == [[]]
+    assert D.chunk_span(512, 448, 8) == 3648
+    # the window encode_docs keeps (tail chunk_span tokens) holds exactly the last k chunks
+    long = list(range(5000))
+    tail = long[-D.chunk_span(512, 448, 4):]
+    assert D.chunk_ids(tail, 512, 448, 4) == D.chunk_ids(long, 512, 448, 4)
+
+
 def test_batches_cover_everything_once():
     lengths = [5, 5, 9, 9, 9, 3, 12, 5, 9, 1, 12]
     for exact in (False, True):

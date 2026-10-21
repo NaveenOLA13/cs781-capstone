@@ -141,7 +141,7 @@ def _setup(kind, tmp):
     bb = _bb(kind)
     cfg = R.resolve_cfg(dict(FAST, data_root=root, cache_dir=os.path.join(tmp, "cache"), out_dir=tmp))
     cfg["exact_batches"] = bool(bb.pad_effect > 1e-4)
-    data, seqs = R.prepare_tokens(bb.encode, cfg, log=lambda *a: None)
+    data, seqs, _ = R.prepare_tokens(bb.encode, cfg, log=lambda *a: None)
     clf = bb.classifier(2, model=__import__("copy").deepcopy(bb.model)).to(DEV).float()
     used = R.find_used(clf, seqs["train"], cfg, DEV, bb.pad_id)
     return bb, clf, used, seqs, cfg, data

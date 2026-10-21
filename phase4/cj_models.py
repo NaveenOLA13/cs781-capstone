@@ -142,8 +142,8 @@ def model_max_len(cfg_model: dict) -> int | None:
     return min(vals) if vals else None
 
 
-def load_backbone(name: str, max_len: int = 512, path: str | None = None, log=print):
-    """(Backbone, info) for a Phase 1 model; the model is in float32 on the CPU."""
+def load_model(name: str, path: str | None = None, log=print):
+    """(model in float32 on the CPU, checkpoint dict, path, info) for a Phase 1 model (or a mid-trained one)."""
     from models import build_model
     path = path or find_checkpoint(name, log)
     ck = _load_ckpt(path)
@@ -156,15 +156,24 @@ def load_backbone(name: str, max_len: int = 512, path: str | None = None, log=pr
     model = build_model(arch, cfg_model, vocab)
     frac = _load_weights(model, ck)
     model.eval()
-    limit = model_max_len(cfg_model)
+    info = dict(name=name, path=path, arch=arch, vocab=vocab, params=count_params(model, False), loaded=frac,
+                model_limit=model_max_len(cfg_model),
+                config={k: v for k, v in cfg_model.items() if isinstance(v, (int, float, str, bool))},
+                mid_training=ck.get("mid_training"))
+    return model, ck, path, info
+
+
+def load_backbone(name: str, max_len: int = 512, path: str | None = None, log=print):
+    """(Backbone, info) for a Phase 1 model; the model is in float32 on the CPU."""
+    model, _, path, info = load_model(name, path, log)
+    limit = info["model_limit"]
     if limit is not None and max_len > limit:
         log(f"[model] {name}: max_len {max_len} -> {limit} (the model's limit)")
         max_len = limit
     tok = load_tokenizer(log)
     bb = make_backbone(model, tok, max_len=max_len, verbose=True)
-    info = dict(name=name, path=path, arch=arch, vocab=vocab, params=count_params(model, False),
-                loaded=frac, max_len=max_len, model_limit=limit, route=bb.route, kind=bb.kind, pooling=bb.pooling,
-                config={k: v for k, v in cfg_model.items() if isinstance(v, (int, float, str, bool))})
-    log(f"[model] {name}: {arch}, {info['params'] / 1e6:.1f}M weights ({frac:.0%} loaded), input up to "
-        f"{max_len} tokens, {bb.kind} -> pooling '{bb.pooling}'")
+    info.update(max_len=max_len, route=bb.route, kind=bb.kind, pooling=bb.pooling)
+    mid = " (mid-trained on CJPE text)" if info.get("mid_training") else ""
+    log(f"[model] {name}{mid}: {info['arch']}, {info['params'] / 1e6:.1f}M weights ({info['loaded']:.0%} loaded), "
+        f"input up to {max_len} tokens, {bb.kind} -> pooling '{bb.pooling}'")
     return bb, info

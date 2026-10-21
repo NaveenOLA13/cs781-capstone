@@ -151,7 +151,7 @@ def _worker(spec_path: str) -> int:
         spec = json.load(f)
     import cj_train
     from cj_models import load_backbone
-    settings = spec["settings"]
+    settings = {**spec["settings"], "ckpt_path": spec["ckpt"]}
     bb, info = load_backbone(spec["model"], max_len=settings.get("max_len", cj_train.DEFAULTS["max_len"]),
                              path=spec["ckpt"])
     if info["max_len"] != settings.get("max_len", cj_train.DEFAULTS["max_len"]):
