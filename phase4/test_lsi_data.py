@@ -11,11 +11,13 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lsi_data as L  # noqa: E402
 
-KEYWORDS = {3: "murder", 7: "theft", 11: "fraud", 20: "forgery", 31: "bail"}
+KEYWORDS = {3: "murder", 7: "theft", 11: "fraud", 20: "dowry", 31: "bail"}   # token ids distinct from the filler
 
 
-def make_fake_lsi(tmp, n_train=60, n_dev=24, n_test=12, n_words=(30, 120), seed=0, extra_test_in_dev=2):
-    """Phase_5_LSI-like folders; a document's statutes are the ids whose keyword appears in its text."""
+def make_fake_lsi(tmp, n_train=60, n_dev=24, n_test=12, n_words=(30, 120), seed=0, extra_test_in_dev=2,
+                  at_end=False):
+    """Phase_5_LSI-like folders; a document's statutes are the ids whose keyword appears in its text (at random
+    places, or at the end of the document with at_end=True: easier for the tiny test models)."""
     rng = random.Random(seed)
     filler = [f"w{i}" for i in range(50)]
 
@@ -25,7 +27,7 @@ def make_fake_lsi(tmp, n_train=60, n_dev=24, n_test=12, n_words=(30, 120), seed=
             labs = [x for x in labs if x != 20] or [3]
         words = [rng.choice(filler) for _ in range(rng.randint(*n_words))]
         for x in labs:
-            words.insert(rng.randrange(len(words) + 1), KEYWORDS[x])
+            words.insert(len(words) if at_end else rng.randrange(len(words) + 1), KEYWORDS[x])
         return {"id": f"{split}_{i:03d}", "text": " ".join(words), "labels": sorted(labs)}
 
     root = os.path.join(tmp, "Phase_5_LSI")

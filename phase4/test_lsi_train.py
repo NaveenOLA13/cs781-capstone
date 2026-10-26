@@ -35,7 +35,7 @@ def test_helpers():
 
 def test_runs_kd_ensemble():
     with tempfile.TemporaryDirectory() as tmp:
-        root = make_fake_lsi(tmp, n_train=240, n_dev=60, n_test=20, n_words=(20, 70))
+        root = make_fake_lsi(tmp, n_train=240, n_dev=60, n_test=20, n_words=(20, 70), at_end=True)
         out = os.path.join(tmp, "runs")
         common = dict(FAST, data_root=root, out_dir=out, cache_dir=os.path.join(tmp, "cache"))
         res = S.run(_bb("llama"), name="llama", technique="full", lr_body=1e-3, save_train_probs=True, **common)
