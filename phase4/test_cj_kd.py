@@ -71,9 +71,10 @@ def test_teacher_to_students():
         hier_dir = os.path.join(teacher_run, "hier_k3")
         p = K.plan(hier_dir, out_dir=os.path.join(tmp, "kd"), ckpt="toy", tok_workers=1, log_every=0,
                    eval_batch_size=16, fit_sample=20, lr_head=3e-3, batch_size=8)
-        best = max(("last", "vote", "mean"),
-                   key=lambda v: json.load(open(os.path.join(hier_dir, v, "metrics.json")))["dev_tuned"]["macro_f1"])
-        assert p["teacher_file"] == os.path.join(hier_dir, best, "train_probs.json"), (p["teacher_file"], best)
+        f1 = {v: json.load(open(os.path.join(hier_dir, v, "metrics.json")))["dev_tuned"]["macro_f1"]
+              for v in ("last", "vote", "mean")}
+        chosen = os.path.basename(os.path.dirname(p["teacher_file"]))
+        assert f1[chosen] == max(f1.values()), (chosen, f1)       # the best on dev (ties: any of them)
         assert p["sft_dir"] == teacher_run and p["model"] == "llama"
         assert [j["run_name"] for j in p["jobs"]] == ["llama_student_kd", "llama_student"]
         s_kd = p["jobs"][0]["settings"]
