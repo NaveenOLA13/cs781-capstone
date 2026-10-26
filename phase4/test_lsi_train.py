@@ -24,7 +24,8 @@ FAST = dict(max_len=16, doc_tokens=96, train_chunks=3, eval_chunks=6, epochs=4, 
 
 
 def test_helpers():
-    assert S.doc_chunks(list(range(70)), 32) == [list(range(32)), list(range(32, 64))]   # 6-token tail dropped
+    assert S.doc_chunks(list(range(70)), 32) == [list(range(32)), list(range(32, 64)), list(range(38, 70))]
+    assert S.doc_chunks(list(range(84)), 32) == [list(range(32)), list(range(32, 64)), list(range(64, 84))]
     assert S.doc_chunks(list(range(10)), 32) == [list(range(10))] and S.doc_chunks([], 32) == [[]]
     assert S.spread(3, 8) == [0, 1, 2] and S.spread(10, 4) == [0, 3, 6, 9]
     assert S.doc_batches([3, 3, 3, 1], 6) == [[0, 1], [2, 3]] and S.doc_batches([9, 1], 4) == [[0], [1]]

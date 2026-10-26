@@ -72,10 +72,11 @@ def resolve_cfg(overrides: dict) -> dict:
 
 # --------------------------------------------------------------------------------- data
 def doc_chunks(ids: list[int], n: int) -> list[list[int]]:
-    """Non-overlapping chunks of n tokens; a short last piece (< 32 tokens) is dropped when there are others."""
+    """Chunks of n tokens; a short last piece (< n / 2 tokens) is replaced by the document's last n tokens
+    (overlapping the previous chunk), so no text is lost and chunks stay long."""
     ch = [ids[i:i + n] for i in range(0, len(ids), n)] or [[]]
-    if len(ch) > 1 and len(ch[-1]) < 32:
-        ch = ch[:-1]
+    if len(ch) > 1 and len(ch[-1]) < n // 2:
+        ch[-1] = ids[-n:]
     return ch
 
 
