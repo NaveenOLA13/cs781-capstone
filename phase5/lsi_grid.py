@@ -1,11 +1,12 @@
 """Phase 5 runs on Kaggle: several fine-tuning techniques of one Phase 1 model (one process per GPU), the knowledge
 distillation pair (student with / without the teacher) and an ensemble of finished runs.
 
-    from lsi_grid import run_grid, run_kd, ensemble, compare_all
-    run_grid("llama", techniques=("full", "lorma"), save_train_probs=True)   # 2 GPUs: one run each
-    run_kd("/kaggle/working/lsi_runs/llama_full")                            # teacher = that run
-    ensemble(["/kaggle/working/lsi_runs"])                                   # best mix of finished runs on dev
-    compare_all()                                                            # table of every run
+    from lsi_grid import run_grid, run_kd, ensemble, compare_all, report
+    run_grid("llama", techniques=("full", "lorma"), save_chunks=True)        # 2 GPUs: one run each
+    run_kd("/kaggle/working/lsi_runs/llama_full/stageB/gru_attn")            # teacher = a run or a Stage B version
+    ensemble(["/kaggle/working/lsi_runs"])                                   # best mix of finished results on dev
+    compare_all()                                                            # table of every fine-tuned run
+    report(["/kaggle/working/lsi_runs"])                                     # every result incl. Stage B, students
 
 Each GPU gets its own process (python -u lsi_grid.py --worker job.json) that loads the model once and runs its jobs
 one after another; progress lines are printed here every minute, full logs are in <out_dir>/<run>/log.txt.
@@ -23,6 +24,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+import p5_paths  # noqa: E402,F401  (Phase 4 building blocks)
 
 COST = {"frozen": 1.0, "full": 3.0, "partial": 2.0, "unfreeze": 2.4, "bitfit": 2.0, "lorma": 2.3,
         "adalora": 2.4, "adapter": 2.0}
@@ -133,50 +135,131 @@ def run_grid(model: str, techniques=("full", "lorma"), ckpt: str | None = None, 
 
 
 KD_COPY = ("data_root", "cache_dir", "max_len", "doc_tokens", "train_chunks", "eval_chunks", "chunk_pool", "epochs",
-           "batch_size", "eval_batch_size", "pos_weight_power", "pos_weight_max", "seed", "fetch_data", "dropout",
-           "head", "pooling", "min_pos")
+           "batch_size", "eval_batch_size", "loss", "pos_weight_power", "pos_weight_max", "asl_gamma_neg",
+           "asl_gamma_pos", "asl_clip", "seed", "fetch_data", "dropout", "head", "pooling", "min_pos", "limit_train")
 
 
-def run_kd(teacher_dir: str, student_layers=0.5, kd_alpha: float = 0.5, kd_T: float = 2.0, technique: str = "full",
-           plain: bool = True, out_dir: str = OUT_DIR, gpus: int | None = None, skip_done: bool = True,
-           poll: int = 60, **settings) -> str:
-    """Knowledge distillation: teacher = a finished run with train_probs.json (run it with save_train_probs=True);
-    student = the same Phase 1 model with only its first student_layers blocks (a share or a number), trained with
-    the teacher (<model>_student_kd) and, for comparison, without it (<model>_student). Settings are copied from
-    the teacher run unless given."""
+def _short_name(root: str, base: str, base_dirs) -> str:
+    """A result's name: relative to its base folder, or (several bases) to their common parent folder."""
+    if len(base_dirs) == 1:
+        return os.path.relpath(root, base)
+    common = os.path.commonpath([os.path.abspath(b) for b in base_dirs])
+    return os.path.relpath(os.path.abspath(root), common)
+
+
+def _sft_run_of(path: str) -> str:
+    """The fine-tuned run folder at or above path (the first one with config.json + metrics.json)."""
+    d = os.path.abspath(path)
+    for _ in range(4):
+        if os.path.exists(os.path.join(d, "config.json")) and os.path.exists(os.path.join(d, "metrics.json")):
+            return d
+        d = os.path.dirname(d)
+    raise FileNotFoundError(f"no fine-tuned run (config.json + metrics.json) at or above {path}")
+
+
+def plan_kd(teacher_dir: str, student_layers=0.5, kd_alpha: float = 0.5, kd_T: float = 2.0, technique: str = "full",
+            plain: bool = True, out_dir: str = OUT_DIR, sft_run: str | None = None, **settings) -> dict:
+    """Teacher, student checkpoint and the worker jobs (no training). teacher_dir = a fine-tuned run, a Stage B
+    version or an ensemble folder (each holds train_probs.json + labels.json); the student starts from the same
+    checkpoint as the fine-tuned run at or above teacher_dir (or sft_run, needed for an ensemble teacher), with its
+    settings unless given."""
     t_file = os.path.join(teacher_dir, "train_probs.json")
     if not os.path.exists(t_file):
-        raise FileNotFoundError(f"{t_file} missing: run the teacher with save_train_probs=True")
-    with open(os.path.join(teacher_dir, "config.json")) as f:
+        raise FileNotFoundError(f"{t_file} missing: use a run trained with save_train_probs / save_chunks, "
+                                "or a Stage B version")
+    sft = _sft_run_of(sft_run or teacher_dir)
+    with open(os.path.join(sft, "config.json")) as f:
         tcfg = json.load(f)
-    with open(os.path.join(teacher_dir, "metrics.json")) as f:
-        tm = json.load(f)
-    model = tm["model"]
+    with open(os.path.join(sft, "metrics.json")) as f:
+        sm = json.load(f)
+    tm = sm
+    if os.path.abspath(teacher_dir) != sft and os.path.exists(os.path.join(teacher_dir, "metrics.json")):
+        with open(os.path.join(teacher_dir, "metrics.json")) as f:
+            tm = json.load(f)
+    model = sm["model"]
     ckpt = tcfg.get("ckpt_path")
     if not ckpt:
         from cj_models import find_checkpoint
         ckpt = find_checkpoint(model)
     base = {k: tcfg[k] for k in KD_COPY if k in tcfg}
     base.update(settings)
-    base.update(out_dir=out_dir, student_layers=student_layers)
-    print(f"[kd] teacher {teacher_dir}: {tm['run_name']}, dev macro-F1 {tm['dev_chosen']['macro_f1']:.4f} "
-          f"(cross-fitted {max(tm['cv_global'], tm['cv_per_label']):.4f}), {tm['total_params'] / 1e6:.1f}M weights")
-    print(f"[kd] student: {model} from {ckpt}, first {student_layers} of its blocks, {technique}; loss = "
-          f"{1 - kd_alpha:.2f} x gold + {kd_alpha:.2f} x teacher (temperature {kd_T})"
-          + ("; also the same student without the teacher" if plain else ""))
+    base.update(out_dir=out_dir, student_layers=student_layers, save_chunks=False, save_train_probs=False)
     jobs = [dict(run_name=f"{model}_student_kd", technique=technique,
                  settings=dict(base, kd_teacher=t_file, kd_alpha=kd_alpha, kd_T=kd_T))]
     if plain:
         jobs.append(dict(run_name=f"{model}_student", technique=technique, settings=dict(base)))
-    names = [j["run_name"] for j in jobs]
-    todo = [j for j in jobs if not (skip_done and _done(out_dir, j["run_name"]))]
+    return dict(teacher_dir=teacher_dir, teacher_file=t_file, teacher=tm, sft_dir=sft, sft=sm, model=model,
+                ckpt=ckpt, base=base, jobs=jobs, technique=technique, out_dir=out_dir)
+
+
+def run_kd(teacher_dir: str, student_layers=0.5, kd_alpha: float = 0.5, kd_T: float = 2.0, technique: str = "full",
+           plain: bool = True, out_dir: str = OUT_DIR, sft_run: str | None = None, gpus: int | None = None,
+           skip_done: bool = True, poll: int = 60, **settings) -> str:
+    """Knowledge distillation: teacher = a finished run or Stage B version with train_probs.json; student = the same
+    Phase 1 model (same starting checkpoint) with only its first student_layers blocks (a share or a number),
+    trained with the teacher (<model>_student_kd) and, for comparison, without it (<model>_student)."""
+    p = plan_kd(teacher_dir, student_layers, kd_alpha, kd_T, technique, plain, out_dir, sft_run, **settings)
+    tm, sm = p["teacher"], p["sft"]
+    print(f"[kd] teacher {teacher_dir}: dev macro-F1 {tm['dev_chosen']['macro_f1']:.4f} (cross-fitted "
+          f"{max(tm['cv_global'], tm['cv_per_label']):.4f}); fine-tuned run {sm['run_name']}, "
+          f"{sm['total_params'] / 1e6:.1f}M weights" + (f" + Stage B {tm['params'] / 1e6:.2f}M" if "params" in tm
+                                                       else ""))
+    print(f"[kd] student: {p['model']} from {p['ckpt']}, first {student_layers} of its blocks, {technique}; loss = "
+          f"{1 - kd_alpha:.2f} x gold + {kd_alpha:.2f} x teacher (temperature {kd_T})"
+          + ("; also the same student without the teacher" if plain else ""))
+    names = [j["run_name"] for j in p["jobs"]]
+    todo = [j for j in p["jobs"] if not (skip_done and _done(out_dir, j["run_name"]))]
     if todo:
-        _pretokenise(base)
-        run_jobs(model, todo, ckpt, out_dir, gpus, poll)
-    text = _table(out_dir, [tm["run_name"]] + names if os.path.dirname(teacher_dir.rstrip("/")) == out_dir.rstrip("/")
-                  else names, f"knowledge distillation (teacher {tm['run_name']})")
-    with open(os.path.join(out_dir, f"{model}_kd.txt"), "w") as f:
+        _pretokenise(p["base"])
+        run_jobs(p["model"], todo, p["ckpt"], out_dir, gpus, poll)
+    text = _table(out_dir, names, f"knowledge distillation (teacher {teacher_dir})")
+    text += (f"\nteacher: dev macro-F1 {tm['dev_chosen']['macro_f1']:.4f}, cross-fitted "
+             f"{max(tm['cv_global'], tm['cv_per_label']):.4f}")
+    print(text.splitlines()[-1])
+    with open(os.path.join(out_dir, f"{p['model']}_kd.txt"), "w") as f:
         f.write(text + "\n")
+    return text
+
+
+def report(base_dirs, out_path: str | None = None) -> str:
+    """One table of every result under base_dirs (fine-tuned runs, Stage B versions, KD students, ensembles), best
+    cross-fitted dev macro-F1 first; saved as out_path (default <first base>/all_results.txt)."""
+    if isinstance(base_dirs, str):
+        base_dirs = [base_dirs]
+    rows = []
+    for base in base_dirs:
+        for root, _, files in os.walk(base):
+            if "metrics.json" not in files:
+                continue
+            with open(os.path.join(root, "metrics.json")) as f:
+                m = json.load(f)
+            if "dev_chosen" not in m:
+                continue
+            name = _short_name(root, base, base_dirs)
+            kind = ("ensemble" if "members" in m else "Stage B" if "version" in m
+                    else "KD student" if m.get("student") else "fine-tuned")
+            size = (f"{m['trainable_params'] / 1e6:.2f}M/{m['total_params'] / 1e6:.0f}M" if "trainable_params" in m
+                    else f"+{m['params'] / 1e6:.2f}M" if "params" in m else f"{len(m.get('members', []))} runs")
+            rows.append((max(m["cv_global"], m["cv_per_label"]), name, kind, size, m))
+    rows.sort(key=lambda r: -r[0])
+    hdr = (f"{'result':44s} {'kind':11s} {'trained/size':>14s} {'macro@t':>8s} {'macro':>7s} {'cv':>7s} "
+           f"{'micro':>7s} {'subset':>7s}")
+    lines = [hdr, "-" * len(hdr)]
+    for cv, name, kind, size, m in rows:
+        lines.append(f"{name[-44:]:44s} {kind:11s} {size:>14s} {m['dev_global']['macro_f1']:8.4f} "
+                     f"{m['dev_chosen']['macro_f1']:7.4f} {cv:7.4f} {m['dev_chosen']['micro_f1']:7.4f} "
+                     f"{m['dev_chosen']['subset_acc']:7.4f}")
+    lines.append("macro@t: dev macro-F1 at one global threshold; macro: with the chosen thresholds; cv: cross-fitted "
+                 "(thresholds tuned on the other half of dev; the honest estimate, used for ranking).")
+    if rows:
+        best = rows[0][4]
+        sub = best.get("submission") or best.get("submissions", {}).get("chosen")
+        lines.append(f"best: {rows[0][1]} (cv {rows[0][0]:.4f}) -> submit {sub}")
+    text = "\n".join(lines)
+    out_path = out_path or os.path.join(base_dirs[0], "all_results.txt")
+    with open(out_path, "w") as f:
+        f.write(text + "\n")
+    print(text)
     return text
 
 
@@ -203,8 +286,10 @@ def ensemble(base_dirs, out_dir: str = "/kaggle/working/lsi_ensemble", data_root
     runs = {}
     for base in base_dirs:
         for root, _, files in os.walk(base):
+            if os.path.abspath(root).startswith(os.path.abspath(out_dir)):
+                continue                              # an earlier ensemble written inside base_dirs
             if {"dev_probs.json", "test_probs.json", "labels.json"} <= set(files):
-                runs[os.path.relpath(root, base) if len(base_dirs) == 1 else root] = root
+                runs[_short_name(root, base, base_dirs)] = root
     if not runs:
         raise ValueError(f"no finished runs under {base_dirs}")
     data = L.load_data(data_root or L.DEFAULT_ROOT, fetch=fetch)
@@ -250,10 +335,20 @@ def ensemble(base_dirs, out_dir: str = "/kaggle/working/lsi_ensemble", data_root
     L.save_probs(os.path.join(out_dir, "dev_probs.json"), ids_dev, P_dev)
     L.save_probs(os.path.join(out_dir, "test_probs.json"), ids_test, P_test)
     sub = L.write_submission(data["test"], labels, P_test, th["thresholds"], os.path.join(out_dir, "submission"))
+    tr_paths = [os.path.join(runs[m], "train_probs.json") for m in members]
+    teacher = False
+    if all(os.path.exists(p) for p in tr_paths):      # the ensemble can also be a KD teacher
+        try:
+            ids_tr = [d["id"] for d in data["train"]]
+            L.save_probs(os.path.join(out_dir, "train_probs.json"), ids_tr,
+                         np.mean([L.load_probs(p, ids_tr) for p in tr_paths], 0))
+            teacher = True
+        except ValueError as e:
+            log(f"[ensemble] no train_probs.json: {e}")
     res = dict(members=members, steps=steps, threshold_kind=th["kind"], t_global=th["t_global"],
                cv_global=th["cv_global"], cv_per_label=th["cv_per_label"], dev_global=L.short(th["dev_global"]),
                dev_chosen=L.short(th["dev_chosen"]), single_best=ranked[0], single_best_dev_f1=score[ranked[0]],
-               submission=sub)
+               submission=sub, train_probs=teacher)
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         json.dump(res, f, indent=1)
     log("[ensemble] members: " + " + ".join(f"{s['added']} ({s['dev_f1']:.4f})" for s in steps))

@@ -1,9 +1,10 @@
 """Self-test of Phase 5 training (lsi_train.py) on tiny stand-in models and fake documents whose statutes are given
 by keywords. Needs torch. About 2-4 minutes.     python test_lsi_train.py  -> every line PASS
 
-Checks: chunking helpers; full fine-tuning learns the fake task with max-pooling over chunks; LoRMA and a model whose
+Checks: chunking helpers; the asymmetric loss; full fine-tuning learns the fake task with max-pooling over chunks
+and saves every chunk's vector and scores (chunks.pt) for Stage B; LoRMA with the asymmetric loss and a model whose
 output changes with padding (same-length chunk groups) run end to end; submissions are valid; the teacher's
-train_probs.json drives a half-size KD student; the ensemble combines the runs.
+train_probs.json drives a half-size KD student; the ensemble combines the runs (and averages their train_probs).
 """
 import json
 import os
@@ -24,7 +25,8 @@ FAST = dict(max_len=16, doc_tokens=96, train_chunks=3, eval_chunks=6, epochs=4, 
 
 
 def test_helpers():
-    assert S.doc_chunks(list(range(70)), 32) == [list(range(32)), list(range(32, 64))]   # 6-token tail dropped
+    assert S.doc_chunks(list(range(70)), 32) == [list(range(32)), list(range(32, 64)), list(range(38, 70))]
+    assert S.doc_chunks(list(range(84)), 32) == [list(range(32)), list(range(32, 64)), list(range(64, 84))]
     assert S.doc_chunks(list(range(10)), 32) == [list(range(10))] and S.doc_chunks([], 32) == [[]]
     assert S.spread(3, 8) == [0, 1, 2] and S.spread(10, 4) == [0, 3, 6, 9]
     assert S.doc_batches([3, 3, 3, 1], 6) == [[0, 1], [2, 3]] and S.doc_batches([9, 1], 4) == [[0], [1]]
@@ -33,12 +35,25 @@ def test_helpers():
     assert S.aggregate(z, [2, 1], "mean").tolist() == [[1., 0.], [5., 5.]]
 
 
+def test_asl_loss():
+    y = torch.tensor([[1., 0., 0.]])
+    z = torch.tensor([[4., -4., 0.]], requires_grad=True)          # confident right, confident right, unsure
+    loss = S.asl_loss(z, y, gamma_neg=4.0, gamma_pos=0.0, clip=0.05)
+    loss.backward()
+    g = z.grad[0]
+    assert g[0] < 0 and abs(g[1]) < 1e-9 and g[2] > 0, g           # easy negative (p < clip): no gradient at all
+    assert S.asl_loss(torch.tensor([[9., -9.]]), torch.tensor([[1., 0.]])) < 1e-3
+    zb = torch.tensor([[0.5, 0.5]])
+    assert S.asl_loss(zb, torch.tensor([[1., 0.]]), 0.0, 0.0, 0.0) > S.asl_loss(zb, torch.tensor([[1., 0.]]))
+
+
 def test_runs_kd_ensemble():
     with tempfile.TemporaryDirectory() as tmp:
-        root = make_fake_lsi(tmp, n_train=240, n_dev=60, n_test=20, n_words=(20, 70))
+        root = make_fake_lsi(tmp, n_train=240, n_dev=60, n_test=20, n_words=(20, 70), at_end=True)
         out = os.path.join(tmp, "runs")
         common = dict(FAST, data_root=root, out_dir=out, cache_dir=os.path.join(tmp, "cache"))
-        res = S.run(_bb("llama"), name="llama", technique="full", lr_body=1e-3, save_train_probs=True, **common)
+        res = S.run(_bb("llama"), name="llama", technique="full", lr_body=1e-3, save_chunks=True, ckpt_path="toy",
+                    **common)
         m = res["metrics"]
         log = open(os.path.join(res["out_dir"], "log.txt")).read()
         print(f"    llama full: dev macro-F1 {m['dev_global']['macro_f1']:.3f} (global), cross-fitted "
@@ -51,12 +66,26 @@ def test_runs_kd_ensemble():
             assert len(rows) == 20 and all(r["pred"] and set(r["pred"]) <= {3, 7, 11, 20, 31} for r in rows)
         tp = json.load(open(os.path.join(res["out_dir"], "train_probs.json")))
         assert len(tp) == 240 and all(len(v) == 5 for v in tp.values())
+        ch = torch.load(os.path.join(res["out_dir"], "chunks.pt"), weights_only=False)
+        assert ch["labels"] == [3, 7, 11, 20, 31] and set(ch["splits"]) == {"train", "dev", "test"}
+        for s_, n_ in (("train", 240), ("dev", 60), ("test", 20)):
+            sp = ch["splits"][s_]
+            assert len(sp["ids"]) == len(sp["feats"]) == len(sp["logits"]) == n_
+            assert all(1 <= len(f) <= 6 and len(f) == len(z) and z.shape[1] == 5 for f, z in zip(sp["feats"],
+                                                                                                 sp["logits"]))
+        # the saved dev probabilities = maximum over the saved chunk scores
+        dp = json.load(open(os.path.join(res["out_dir"], "dev_probs.json")))
+        sp = ch["splits"]["dev"]
+        diff = max(abs(torch.sigmoid(z.float().max(0).values) - torch.tensor(dp[i])).max().item()
+                   for i, z in zip(sp["ids"], sp["logits"]))
+        assert diff < 5e-3, diff
         pl = json.load(open(os.path.join(res["out_dir"], "per_label.json")))
         assert pl["labels"] == [3, 7, 11, 20, 31] and len(pl["thresholds"]) == 5
         # LoRMA (parametrised weights) and a padding-sensitive encoder-decoder (same-length chunk groups)
-        r2 = S.run(_bb("llama"), name="llama", technique="lorma", epochs=1, **{k: v for k, v in common.items()
-                                                                            if k != "epochs"})
-        assert r2["metrics"]["trainable_share"] < 0.5
+        r2 = S.run(_bb("llama"), name="llama", technique="lorma", epochs=1, loss="asl",
+                   **{k: v for k, v in common.items() if k != "epochs"})
+        assert r2["metrics"]["trainable_share"] < 0.5 and r2["metrics"]["loss"] == "asl"
+        assert "asymmetric" in open(os.path.join(r2["out_dir"], "log.txt")).read()
         r3 = S.run(_bb("encdec"), name="encdec", technique="bitfit", epochs=1, **{k: v for k, v in common.items()
                                                                                if k != "epochs"})
         assert "same-length chunk groups" in open(os.path.join(r3["out_dir"], "log.txt")).read()
@@ -71,6 +100,7 @@ def test_runs_kd_ensemble():
         assert "llama_student_kd" in table and "llama_full" in table
         ens = G.ensemble([out], out_dir=os.path.join(tmp, "ens"), data_root=root, fetch=False, log=lambda *a: None)
         assert ens["members"] and os.path.exists(ens["submission"])
+        assert ens["train_probs"] == (set(ens["members"]) <= {"llama_full"})   # only llama_full saved train probs
         assert G.compare_all(out).count("\n") >= 5
 
 

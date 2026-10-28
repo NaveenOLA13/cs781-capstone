@@ -12,7 +12,9 @@ Model: Phase 1 model -> chunk vector (same pooling as Phase 4) -> dropout -> lin
 the document's score for a statute = the maximum over its chunks (chunk_pool="max"; "mean" and "lse" also exist),
 so a statute only needs evidence in one part of the document.
 Loss: binary cross-entropy per statute with pos_weight = (negatives / positives) ** pos_weight_power (capped at
-pos_weight_max), so rare statutes are not ignored. The head's bias starts at each statute's training frequency.
+pos_weight_max), so rare statutes are not ignored (loss="bce"); or the asymmetric loss of Ridnik et al. 2021
+(loss="asl": focusing gamma_neg on the many easy negatives, probability margin asl_clip). The head's bias starts at
+each statute's training frequency.
 Every epoch is scored on dev (macro-F1 at the best global threshold); the best epoch is kept. Thresholds for the
 submission: global or per statute, chosen by cross-fitting on dev (lsi_data.choose_thresholds).
 Knowledge distillation: student_layers keeps only the first blocks (a smaller student); kd_teacher = a teacher run's
@@ -21,7 +23,8 @@ probabilities softened at temperature kd_T.
 
 Outputs in out_dir/run_name/: log.txt, config.json, labels.json, metrics.json, per_label.json (dev F1 and support
 of every statute), dev_probs.json, test_probs.json (+ train_probs.json with save_train_probs), submission/
-(chosen thresholds) and submission_global/ (one global threshold), trained.pt.
+(chosen thresholds) and submission_global/ (one global threshold), trained.pt; with save_chunks also chunks.pt
+(vector and scores of every chunk of every train / dev / test document) for the whole-document stage (lsi_hier.py).
 """
 from __future__ import annotations
 
@@ -35,23 +38,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import cj_data as C
-import cj_tech as T
-import cj_train as R
-import lsi_data as L
-from cj_models import count_params
+import p5_paths  # noqa: F401  (puts the Phase 4 building blocks on the path)
+import cj_data as C  # noqa: E402
+import cj_tech as T  # noqa: E402
+import cj_train as R  # noqa: E402
+import lsi_data as L  # noqa: E402
+from cj_models import count_params  # noqa: E402
 
 DEFAULTS = dict(
     data_root=L.DEFAULT_ROOT, out_dir="/kaggle/working/lsi_runs", run_name=None, device=None, seed=42,
-    technique="lorma", max_len=512, doc_tokens=8192, train_chunks=4, eval_chunks=8, chunk_pool="max",
-    epochs=3, batch_size=8, eval_batch_size=32, lr_body=None, lr_head=1e-3, weight_decay=0.01, warmup=0.06,
-    grad_clip=1.0, amp=True, pos_weight_power=0.5, pos_weight_max=30.0, dropout=0.1, head="linear", pooling=None,
+    technique="lorma", max_len=512, doc_tokens=8192, train_chunks=3, eval_chunks=16, chunk_pool="max",
+    epochs=2, batch_size=8, eval_batch_size=32, lr_body=None, lr_head=1e-3, weight_decay=0.01, warmup=0.06,
+    grad_clip=1.0, amp=True, loss="bce", pos_weight_power=0.5, pos_weight_max=30.0,
+    asl_gamma_neg=4.0, asl_gamma_pos=0.0, asl_clip=0.05, dropout=0.1, head="linear", pooling=None,
     min_pos=3, limit_train=0, fit_sample=500, ckpt_path=None, tok_workers=4, cache_dir="/kaggle/working/lsi_cache",
-    log_every=200, save_weights=True, save_train_probs=False, fetch_data=True,
+    log_every=200, save_weights=True, save_train_probs=False, save_chunks=False, fetch_data=True,
     student_layers=0, kd_teacher=None, kd_alpha=0.5, kd_T=2.0,
     **T.TECH_DEFAULTS,
 )
 POOLS = ("max", "mean", "lse")
+LOSSES = ("bce", "asl")
 
 
 def resolve_cfg(overrides: dict) -> dict:
@@ -63,6 +69,8 @@ def resolve_cfg(overrides: dict) -> dict:
         raise ValueError(f"technique must be one of {T.TECHNIQUES}")
     if cfg["chunk_pool"] not in POOLS:
         raise ValueError(f"chunk_pool must be one of {POOLS}")
+    if cfg["loss"] not in LOSSES:
+        raise ValueError(f"loss must be one of {LOSSES}")
     if cfg["lr_body"] is None:
         cfg["lr_body"] = T.BODY_LR[cfg["technique"]]
     if cfg["kd_teacher"] and not os.path.exists(cfg["kd_teacher"]):
@@ -111,24 +119,37 @@ def prepare(encode, cfg, log=print, bos_id=None, eos_id=None):
 
 
 # -------------------------------------------------------------------------------- model
-def chunk_logits(clf, seqs, pad_id, device, exact: bool, amp: bool) -> torch.Tensor:
-    """Scores of every chunk; with exact=True (models whose output changes with padding) only chunks of the same
-    length are run together."""
+def _forward(clf, ids, mask, keep: bool):
+    if not keep:
+        return clf(ids, mask).float(), None
+    f = clf.features(ids, mask)
+    return clf.head(f).float(), f.float()
+
+
+def chunk_logits(clf, seqs, pad_id, device, exact: bool, amp: bool, keep: bool = False):
+    """Scores of every chunk ([n, statutes]); with keep=True returns (scores, chunk vectors) (evaluation only:
+    no dropout between vector and head). With exact=True (models whose output changes with padding) only chunks of
+    the same length are run together."""
     if not exact:
         ids, mask = R.collate(seqs, pad_id, device)
         with R._autocast(device, amp):
-            return clf(ids, mask).float()
+            z, f = _forward(clf, ids, mask, keep)
+        return (z, f) if keep else z
     out: list = [None] * len(seqs)
+    feats: list = [None] * len(seqs)
     groups: dict[int, list[int]] = {}
     for i, s in enumerate(seqs):
         groups.setdefault(len(s), []).append(i)
     for idx in groups.values():
         ids, mask = R.collate([seqs[i] for i in idx], pad_id, device)
         with R._autocast(device, amp):
-            z = clf(ids, mask).float()
+            z, f = _forward(clf, ids, mask, keep)
         for r, i in enumerate(idx):
             out[i] = z[r]
-    return torch.stack(out)
+            if keep:
+                feats[i] = f[r]
+    z = torch.stack(out)
+    return (z, torch.stack(feats)) if keep else z
 
 
 def aggregate(z: torch.Tensor, counts: list[int], how: str) -> torch.Tensor:
@@ -161,18 +182,44 @@ def doc_batches(counts: list[int], max_chunks: int) -> list[list[int]]:
 
 
 @torch.no_grad()
-def predict(clf, docs, cfg, device, pad_id, exact) -> np.ndarray:
-    """P(statute) for every document: eval_chunks chunks spread over the document, max (or mean / lse) over them."""
+def predict(clf, docs, cfg, device, pad_id, exact, keep: bool = False):
+    """P(statute) for every document: eval_chunks chunks spread over the document, max (or mean / lse) over them.
+    keep=True also returns, per document, the vectors [n, d] and scores [n, statutes] of those chunks (float16, CPU)."""
     was = clf.training
     clf.eval()
     sel = [[d[j] for j in spread(len(d), cfg["eval_chunks"])] for d in docs]
     counts = [len(s) for s in sel]
-    out = []
+    out, feats, logits = [], [], []
     for b in doc_batches(counts, cfg["eval_batch_size"]):
-        z = chunk_logits(clf, [c for i in b for c in sel[i]], pad_id, device, exact, cfg["amp"])
-        out.append(torch.sigmoid(aggregate(z, [counts[i] for i in b], cfg["chunk_pool"])).cpu().numpy())
+        cs = [counts[i] for i in b]
+        if keep:
+            z, f = chunk_logits(clf, [c for i in b for c in sel[i]], pad_id, device, exact, cfg["amp"], keep=True)
+            k = 0
+            for c in cs:
+                feats.append(f[k:k + c].half().cpu())
+                logits.append(z[k:k + c].half().cpu())
+                k += c
+        else:
+            z = chunk_logits(clf, [c for i in b for c in sel[i]], pad_id, device, exact, cfg["amp"])
+        out.append(torch.sigmoid(aggregate(z, cs, cfg["chunk_pool"])).cpu().numpy())
     clf.train(was)
-    return np.concatenate(out) if out else np.zeros((0, 0), dtype=np.float32)
+    P = np.concatenate(out) if out else np.zeros((0, 0), dtype=np.float32)
+    return (P, feats, logits) if keep else P
+
+
+def asl_loss(z: torch.Tensor, y: torch.Tensor, gamma_neg: float = 4.0, gamma_pos: float = 0.0,
+             clip: float = 0.05) -> torch.Tensor:
+    """Asymmetric loss (Ridnik et al., ICCV 2021), averaged over documents and statutes: negatives are down-weighted
+    by p ** gamma_neg after shifting their probability down by clip (easy negatives give no loss at all)."""
+    p = torch.sigmoid(z)
+    p_neg = (p - clip).clamp(min=0) if clip > 0 else p
+    lp = y * torch.log(p.clamp(min=1e-8))
+    ln = (1 - y) * torch.log((1 - p_neg).clamp(min=1e-8))
+    if gamma_pos > 0:
+        lp = lp * (1 - p) ** gamma_pos
+    if gamma_neg > 0:
+        ln = ln * p_neg ** gamma_neg
+    return -(lp + ln).mean()
 
 
 def _head_linear(clf, n_out):
@@ -256,8 +303,10 @@ def run(bb, name: str = "model", **overrides) -> dict:
     n_total = count_params(clf, trainable_only=False)
     log(f"[setup] {tech}: {n_trainable / 1e6:.3f}M trained weights of {n_total / 1e6:.1f}M "
         f"({n_trainable / n_total:.2%}); {n_lab} statutes; chunk vector '{clf.pool.kind}' pooling, document score = "
-        f"{cfg['chunk_pool']} over chunks; body lr {cfg['lr_body']}, head lr {cfg['lr_head']}; pos_weight "
-        f"{pw.min():.1f}-{pw.max():.1f}" + ("; same-length chunk groups (padding changes this model)" if exact else ""))
+        f"{cfg['chunk_pool']} over chunks; body lr {cfg['lr_body']}, head lr {cfg['lr_head']}; loss "
+        + (f"BCE with pos_weight {pw.min():.1f}-{pw.max():.1f}" if cfg["loss"] == "bce" else
+           f"asymmetric (gamma_neg {cfg['asl_gamma_neg']}, gamma_pos {cfg['asl_gamma_pos']}, clip {cfg['asl_clip']})")
+        + ("; same-length chunk groups (padding changes this model)" if exact else ""))
 
     groups = {}
     for p, lr in [(p, cfg["lr_head"]) for p in head] + [(p, cfg["lr_body"]) for p in body]:
@@ -281,6 +330,7 @@ def run(bb, name: str = "model", **overrides) -> dict:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
     best, best_state, best_epoch, history, step = -1.0, None, 0, [], 0
+    best_P_dev, best_infer = None, None
     t_start = time.time()
     rng = random.Random(cfg["seed"])
     for ep in range(1, cfg["epochs"] + 1):
@@ -302,7 +352,10 @@ def run(bb, name: str = "model", **overrides) -> dict:
             z = chunk_logits(clf, [c for s in sel for c in s], bb.pad_id, device, exact, cfg["amp"])
             zd = aggregate(z, [len(s) for s in sel], cfg["chunk_pool"])
             y = torch.tensor(Y_tr[b], dtype=torch.float32, device=device)
-            gold = F.binary_cross_entropy_with_logits(zd, y, pos_weight=pos_weight)
+            if cfg["loss"] == "asl":
+                gold = asl_loss(zd, y, cfg["asl_gamma_neg"], cfg["asl_gamma_pos"], cfg["asl_clip"])
+            else:
+                gold = F.binary_cross_entropy_with_logits(zd, y, pos_weight=pos_weight)
             main = gold
             if teacher is not None:
                 q = torch.tensor(teacher[b], dtype=torch.float32, device=device).clamp(1e-4, 1 - 1e-4)
@@ -334,7 +387,9 @@ def run(bb, name: str = "model", **overrides) -> dict:
                 log(f"  epoch {ep} step {k + 1}/{n_steps}  loss {tot / max(1, seen):.4f}  "
                     + (f"teacher term {tot_kd / max(1, seen):.4f}  " if teacher is not None else "")
                     + f"{el / 60:.1f} min, about {el / (k + 1) * (n_steps - k - 1) / 60:.1f} min left in this epoch")
+        t_inf = time.time()
         P_dev = predict(clf, docs["dev"], cfg, device, bb.pad_id, exact)
+        infer_ep = time.time() - t_inf
         t_g, m_g = L.tune_global(Y_dev, P_dev)
         rec = dict(epoch=ep, loss=tot / max(1, seen), seconds=time.time() - t0, skipped_steps=skipped,
                    dev_macro_f1=m_g, threshold=t_g, teacher_term=tot_kd / max(1, seen) if teacher is not None else None)
@@ -342,6 +397,7 @@ def run(bb, name: str = "model", **overrides) -> dict:
         if m_g > best:
             best, best_epoch, mark = m_g, ep, "  <- best so far"
             best_state = snapshot()
+            best_P_dev, best_infer = P_dev, infer_ep
         log(f"[train] epoch {ep}/{cfg['epochs']}  loss {rec['loss']:.4f}  dev macro-F1 {m_g:.4f} at threshold "
             f"{t_g:.2f}  {rec['seconds'] / 60:.1f} min{mark}" + (f"  ({skipped} steps skipped)" if skipped else ""))
         history.append(rec)
@@ -351,10 +407,17 @@ def run(bb, name: str = "model", **overrides) -> dict:
     log(f"[train] using epoch {best_epoch}")
 
     # ------------------------------------------------------------------ results
-    t_inf = time.time()
-    P_dev = predict(clf, docs["dev"], cfg, device, bb.pad_id, exact)
-    infer_s = time.time() - t_inf
-    P_test = predict(clf, docs["test"], cfg, device, bb.pad_id, exact)
+    chunks = {}
+    if cfg["save_chunks"]:                     # one pass per split that also keeps every chunk's vector and scores
+        t_inf = time.time()
+        P_dev, f_, z_ = predict(clf, docs["dev"], cfg, device, bb.pad_id, exact, keep=True)
+        infer_s = time.time() - t_inf
+        chunks["dev"] = dict(feats=f_, logits=z_)
+        P_test, f_, z_ = predict(clf, docs["test"], cfg, device, bb.pad_id, exact, keep=True)
+        chunks["test"] = dict(feats=f_, logits=z_)
+    else:                                      # the best epoch's dev predictions are reused (same weights)
+        P_dev, infer_s = best_P_dev, best_infer
+        P_test = predict(clf, docs["test"], cfg, device, bb.pad_id, exact)
     th = L.choose_thresholds(Y_dev, P_dev, cfg["min_pos"], cfg["seed"])
     fit_idx = sorted(random.Random(cfg["seed"]).sample(range(len(Y_tr)), min(cfg["fit_sample"], len(Y_tr))))
     P_fit = predict(clf, [docs["train"][i] for i in fit_idx], cfg, device, bb.pad_id, exact)
@@ -369,10 +432,22 @@ def run(bb, name: str = "model", **overrides) -> dict:
     ids = {s: [d["id"] for d in data[s]] for s in data}
     L.save_probs(os.path.join(out, "dev_probs.json"), ids["dev"], P_dev)
     L.save_probs(os.path.join(out, "test_probs.json"), ids["test"], P_test)
-    if cfg["save_train_probs"]:
-        P_tr = predict(clf, docs["train"], cfg, device, bb.pad_id, exact)
+    if cfg["save_train_probs"] or cfg["save_chunks"]:
+        if cfg["save_chunks"]:
+            P_tr, f_, z_ = predict(clf, docs["train"], cfg, device, bb.pad_id, exact, keep=True)
+            chunks["train"] = dict(feats=f_, logits=z_)
+        else:
+            P_tr = predict(clf, docs["train"], cfg, device, bb.pad_id, exact)
         L.save_probs(os.path.join(out, "train_probs.json"), ids["train"], P_tr)
         log(f"[kd] saved train_probs.json ({len(P_tr)} training documents) for knowledge distillation")
+    if cfg["save_chunks"]:
+        for s in chunks:
+            chunks[s]["ids"] = ids[s]
+        path = os.path.join(out, "chunks.pt")
+        torch.save(dict(labels=labels, eval_chunks=cfg["eval_chunks"], splits=chunks), path + ".tmp")
+        os.replace(path + ".tmp", path)
+        log(f"[hier] saved chunk vectors and scores of every train / dev / test document to {path} "
+            f"({os.path.getsize(path) / 2 ** 20:.0f} MB) for the whole-document stage")
     subs = dict(chosen=L.write_submission(data["test"], labels, P_test, th["thresholds"],
                                           os.path.join(out, "submission")),
                 global_=L.write_submission(data["test"], labels, P_test, th["t_global"],
@@ -388,7 +463,7 @@ def run(bb, name: str = "model", **overrides) -> dict:
         torch.save({"state": snapshot(), "config": cfg, "technique": tech, "model": name, "labels": labels}, path)
         saved_mb = os.path.getsize(path) / 2 ** 20
     metrics = dict(run_name=cfg["run_name"], model=name, technique=tech, kind=bb.kind, pooling=clf.pool.kind,
-                   chunk_pool=cfg["chunk_pool"], max_len=cfg["max_len"], statutes=n_lab,
+                   chunk_pool=cfg["chunk_pool"], loss=cfg["loss"], max_len=cfg["max_len"], statutes=n_lab,
                    data={s: len(ds) for s, ds in data.items()}, history=history, best_epoch=best_epoch,
                    threshold_kind=th["kind"], t_global=th["t_global"], cv_global=th["cv_global"],
                    cv_per_label=th["cv_per_label"], dev_global=L.short(th["dev_global"]),

@@ -20,7 +20,8 @@ from collections import Counter
 
 import numpy as np
 
-import cj_data as C
+import p5_paths  # noqa: F401  (Phase 4 building blocks)
+import cj_data as C  # noqa: E402
 
 DEFAULT_ROOT = "/kaggle/working/data/Phase_5_LSI"
 LABEL_KEYS = ("labels", "label", "statutes", "statute_ids", "statute", "y", "target")
@@ -131,6 +132,35 @@ def summary(data: dict) -> str:
                  f"{freq[len(freq) // 2]}, max {freq[-1]}; statutes with < 10 training documents: "
                  f"{sum(c < 10 for c in freq)}; only in dev: {len(dev_only)} {dev_only[:10]}")
     lines.append("most frequent: " + ", ".join(f"{x} ({c})" for x, c in cnt.most_common(8)))
+    return "\n".join(lines)
+
+
+def explore(data: dict, top: int = 12) -> str:
+    """What the documents look like, for choosing the method and for the report: lengths, statutes per document,
+    whether statute numbers are still written in the text (or masked), the most frequent bracketed placeholders,
+    and the statutes that most often occur together."""
+    import re
+    lines = []
+    tr = data["train"]
+    n = len(tr)
+    k = Counter(len(d["labels"]) for d in tr)
+    lines.append("statutes per training document: " + ", ".join(f"{c}: {k[c] / n:.1%}" for c in sorted(k)[:8]))
+    pats = {"'section <number>'": r"\bsection\s+\d+", "'s. <number>'": r"\bs\.\s*\d+", "'u/s'": r"\bu/s\b",
+            "'IPC' / 'Penal Code'": r"\bi\.?\s?p\.?\s?c\b|penal code", "'Act'": r"\bact\b"}
+    sample = tr[:3000]
+    for name, p in pats.items():
+        rx = re.compile(p, re.I)
+        lines.append(f"documents mentioning {name}: {sum(bool(rx.search(d['text'])) for d in sample) / len(sample):.1%}"
+                     f" (first {len(sample)} training documents)")
+    ph = Counter(m for d in sample for m in re.findall(r"\[[A-Za-z_ ]{2,30}\d*\]", d["text"]))
+    lines.append("bracketed placeholders (masked names / statutes): "
+                 + (", ".join(f"{t} ({c})" for t, c in ph.most_common(top)) or "none"))
+    pairs = Counter((a, b) for d in tr for i, a in enumerate(d["labels"]) for b in d["labels"][i + 1:])
+    lines.append("statutes that most often occur together: "
+                 + ", ".join(f"{a}+{b} ({c})" for (a, b), c in pairs.most_common(top)))
+    single = Counter(d["labels"][0] for d in tr if len(d["labels"]) == 1)
+    lines.append("most frequent statutes when a document has only one: "
+                 + ", ".join(f"{x} ({c})" for x, c in single.most_common(8)))
     return "\n".join(lines)
 
 
