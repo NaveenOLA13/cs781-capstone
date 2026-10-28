@@ -103,6 +103,17 @@ def test_thresholds():
     assert L.tune_per_label(Yr, rng.rand(50, 2), 0.37, min_pos=3)[1] == 0.37
 
 
+def test_plan_steps():
+    # plenty of time: every planned step
+    assert L.plan_steps(20, 1000, 1.0, seconds_left=5000, predict_seconds=600) == 1000
+    # 400 s left after the predictions at 2 s per step: 200 more steps
+    assert L.plan_steps(20, 1000, 2.0, seconds_left=1000, predict_seconds=600) == 220
+    # deadline already passed: stop at the steps done (at least min_steps)
+    assert L.plan_steps(50, 1000, 1.0, seconds_left=-10, predict_seconds=600) == 50
+    assert L.plan_steps(5, 1000, 1.0, seconds_left=-10, predict_seconds=600, min_steps=20) == 20
+    assert L.plan_steps(5, 12, 1.0, seconds_left=-10, predict_seconds=600, min_steps=20) == 12
+
+
 def test_submission():
     with tempfile.TemporaryDirectory() as tmp:
         docs = [{"id": "a"}, {"id": "b"}, {"id": "c"}]

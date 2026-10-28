@@ -1,7 +1,8 @@
 """Self-test of Phase 5 training (lsi_train.py) on tiny stand-in models and fake documents whose statutes are given
 by keywords. Needs torch. About 2-4 minutes.     python test_lsi_train.py  -> every line PASS
 
-Checks: chunking helpers; the asymmetric loss; full fine-tuning learns the fake task with max-pooling over chunks
+Checks: chunking helpers; the asymmetric loss; LoRA and QLoRA (4-bit NF4 round trip, runs on a transformer and on
+the GRU encoder-decoder); the finishing-time control (finish_by); full fine-tuning learns the fake task with max-pooling over chunks
 and saves every chunk's vector and scores (chunks.pt) for Stage B; LoRMA with the asymmetric loss and a model whose
 output changes with padding (same-length chunk groups) run end to end; submissions are valid; the teacher's
 train_probs.json drives a half-size KD student; the ensemble combines the runs (and averages their train_probs).
@@ -102,6 +103,62 @@ def test_runs_kd_ensemble():
         assert ens["members"] and os.path.exists(ens["submission"])
         assert ens["train_probs"] == (set(ens["members"]) <= {"llama_full"})   # only llama_full saved train probs
         assert G.compare_all(out).count("\n") >= 5
+
+
+def test_lora_qlora():
+    import cj_tech as T
+    torch.manual_seed(0)
+    W = torch.randn(70, 33)                         # 2,310 values: not a multiple of the block (64) -> padding
+    packed, absmax = T.nf4_quantize(W, 64)
+    lv = torch.tensor(T.NF4)
+    back = T.nf4_dequantize(packed, absmax, lv, W.shape, 64)
+    assert back.shape == W.shape and packed.dtype == torch.uint8 and packed.numel() == 37 * 64 // 2
+    rel = ((back - W).norm() / W.norm()).item()
+    assert rel < 0.2, rel
+    exact = lv[torch.randint(0, 16, (4, 64))] * 3.0     # NF4 values x one scale (3 = the block maximum): no error
+    exact[:, 0] = 3.0
+    p2, a2 = T.nf4_quantize(exact, 64)
+    assert torch.allclose(T.nf4_dequantize(p2, a2, lv, exact.shape, 64), exact, atol=1e-5)
+    lo = T.LoRA(5, 4, 2, 4.0)
+    w = torch.randn(5, 4)
+    assert torch.equal(lo(w), w)                     # B starts at 0: no change at the start
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_fake_lsi(tmp, n_train=120, n_dev=30, n_test=10, n_words=(20, 70), at_end=True)
+        common = dict(FAST, data_root=root, out_dir=os.path.join(tmp, "runs"), cache_dir=os.path.join(tmp, "cache"),
+                      epochs=1)
+        for kind, tech in (("llama", "lora"), ("llama", "qlora"), ("encdec", "qlora")):
+            r = S.run(_bb(kind), name=kind, technique=tech, **common)
+            m = r["metrics"]
+            assert m["trainable_params"] < m["total_params"], (kind, tech)
+            assert os.path.exists(os.path.join(r["out_dir"], "submission", "submission.zip"))
+            if tech == "qlora":
+                info = m["technique_info"]
+                assert info["quantized_params"] > 0 and info["rel_error_mean"] < 0.2, info
+                assert info["frozen_mb_4bit"] < info["frozen_mb_full"] / 4, info
+                assert "4-bit NF4" in open(os.path.join(r["out_dir"], "log.txt")).read()
+
+
+def test_deadline():
+    import time
+    with tempfile.TemporaryDirectory() as tmp:
+        root = make_fake_lsi(tmp, n_train=400, n_dev=40, n_test=10, n_words=(20, 70), at_end=True)
+        common = dict(FAST, data_root=root, out_dir=os.path.join(tmp, "runs"), cache_dir=os.path.join(tmp, "cache"),
+                      batch_size=4)
+        common.pop("epochs")
+        # deadline already passed: only the 20 probe steps, then every result is still written
+        r = S.run(_bb("llama"), name="llama", technique="full", run_name="cut", epochs=3, finish_by=time.time() + 1,
+                  **common)
+        b = r["metrics"]["budget"]
+        per_epoch = -(-r["metrics"]["data"]["train"] // 4)
+        assert b["planned_steps"] == 3 * per_epoch and b["steps"] == 20 and b["cut"], b
+        assert len(r["metrics"]["history"]) == 1 and "[budget] trained 20 of" in open(
+            os.path.join(r["out_dir"], "log.txt")).read()
+        assert os.path.exists(os.path.join(r["out_dir"], "submission", "submission.zip"))
+        # plenty of time: every planned step
+        r2 = S.run(_bb("llama"), name="llama", technique="lorma", run_name="free", epochs=1,
+                   finish_by=time.time() + 3600, **common)
+        b2 = r2["metrics"]["budget"]
+        assert b2["steps"] == b2["planned_steps"] == per_epoch and not b2["cut"], b2
 
 
 if __name__ == "__main__":

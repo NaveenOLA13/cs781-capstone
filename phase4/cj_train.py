@@ -368,7 +368,7 @@ def run(bb, name: str = "model", **overrides) -> dict:
         p.requires_grad_(True)
     body = hooks.body_params
     n_trainable = sum(p.numel() for p in {id(p): p for p in head + body}.values())
-    n_total = count_params(clf, trainable_only=False)
+    n_total = count_params(clf, trainable_only=False) + hooks.info.get("quantized_params", 0)   # QLoRA: 4-bit W0
     log(f"[setup] {tech}: {n_trainable / 1e6:.3f}M trained weights of {n_total / 1e6:.1f}M "
         f"({n_trainable / n_total:.2%}); case vector: '{clf.pool.kind}' pooling; body lr {cfg['lr_body']}, "
         f"head lr {cfg['lr_head']}")

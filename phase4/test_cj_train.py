@@ -190,10 +190,13 @@ def test_trainable_sets():
                 before = _logits(clf, seqs["train"], bb.pad_id)
                 h = T.apply(clf, tech, used, cfg, total_steps=30, log=lambda *a: None)
                 after = _logits(clf, seqs["train"], bb.pad_id)
-                assert torch.allclose(before, after, atol=1e-4), (kind, tech, (before - after).abs().max())
+                if tech == "qlora":                  # 4-bit copy of the fixed weights: close, not equal
+                    assert (before - after).abs().max() < 0.5 * before.abs().max() + 1e-3, (kind, tech)
+                else:
+                    assert torch.allclose(before, after, atol=1e-4), (kind, tech, (before - after).abs().max())
                 model = clf.encoder.model
                 names = _trained_names(clf)
-                bottom, layers, top, _ = T.layer_groups(model, used) if tech not in ("lorma", "adalora") else (
+                bottom, layers, top, _ = T.layer_groups(model, used) if tech not in T.LOW_RANK else (
                     None, None, None, None)
                 if tech in ("frozen", "unfreeze"):
                     assert names == set(), (kind, tech, names)                  # unfreeze starts with the head only
@@ -205,8 +208,8 @@ def test_trainable_sets():
                     assert names and all(n.split(".")[-1].startswith("bias") for n in names), names
                     if kind == "llama":
                         assert h.info["added_biases"] == 21 and h.info["existing_biases"] == 7, h.info
-                elif tech in ("lorma", "adalora"):
-                    want = ("A", "B") if tech == "lorma" else ("P", "lam", "Q")
+                elif tech in T.LOW_RANK:
+                    want = ("P", "lam", "Q") if tech == "adalora" else ("A", "B")
                     assert names and all(n.split(".")[-1] in want for n in names), names
                     assert not any("original" in n for n in names)
                 elif tech == "adapter":
@@ -220,7 +223,7 @@ def test_updates_change_the_model():
     """After one optimiser step, every technique's model output changes (also through the parametrized GRU)."""
     with tempfile.TemporaryDirectory() as tmp:
         for kind in TOYS:
-            for tech in ("lorma", "adalora", "adapter", "bitfit", "partial"):
+            for tech in ("lorma", "adalora", "adapter", "bitfit", "partial", "lora", "qlora"):
                 bb, clf, used, seqs, _, _ = _setup(kind, os.path.join(tmp, f"{kind}_{tech}"))
                 h = T.apply(clf, tech, used, dict(T.TECH_DEFAULTS), total_steps=30, log=lambda *a: None)
                 before = _logits(clf, seqs["train"], bb.pad_id)
@@ -298,7 +301,7 @@ def _check_run(res, root, tech):
     assert set(json.load(open(os.path.join(out, "test_probs.json")))) == {d["id"] for d in data["test"]}
     saved = torch.load(os.path.join(out, "trained.pt"), map_location="cpu", weights_only=False)["state"]
     assert any(k.startswith("head.") for k in saved)
-    if tech in ("lorma", "adalora", "adapter", "bitfit", "frozen"):
+    if tech in ("lorma", "adalora", "adapter", "bitfit", "frozen", "lora", "qlora"):
         assert not any("original" in k for k in saved) and m["trainable_share"] < 0.6, (tech, m["trainable_share"])
     for k in ("dev_050", "dev_tuned", "threshold", "train_fit", "trainable_params", "train_seconds",
               "dev_infer_seconds", "history", "technique_info"):

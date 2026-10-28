@@ -11,11 +11,12 @@ prediction, never for training or mid-training).
 |---|---|---|
 | pretraining | our Phase 1 model (decoder-only 80M, encoder-decoder 86M, Llama 85M, MoE 214M) | (Phase 1) |
 | mid-training | next-token prediction on the LSI train + dev text (40M tokens; MoE 20M); not for the encoder-decoder | `lsi_mid.py` |
-| fine-tuning (SFT) | 8 techniques (full, LoRMA, partial, gradual unfreezing, BitFit, AdaLoRA, adapters, frozen), all our own code (Phase 4 `cj_tech.py`) | `lsi_train.py`, `lsi_grid.py` |
+| fine-tuning (SFT) | 10 techniques (LoRA, LoRMA, QLoRA (own 4-bit NF4), adapters, full, partial, gradual unfreezing, BitFit, AdaLoRA, frozen; Phase 5 runs LoRA, LoRMA, QLoRA, adapter per model), all our own code (Phase 4 `cj_tech.py`) | `lsi_train.py`, `lsi_grid.py` |
 | long documents | the first 8,192 tokens are cut into 512-token chunks; training reads 3 random chunks spread over the document, prediction reads all of them; document score of a statute = maximum over its chunks (multiple-instance view: one part of the document is enough evidence) | `lsi_train.py` |
 | whole-document stage (Stage B) | statute-wise attention over all chunk vectors of a document (+ BiGRU over the chunks, optional statute co-occurrence layer) | `lsi_hier.py` |
 | thresholds | one global threshold or one per statute, chosen by 2-fold cross-fitting on dev; every document gets at least its top statute | `lsi_data.py` |
 | knowledge distillation | teacher = best Stage B version of llama_full (whole document, full size); student = the mid-trained Llama with half its blocks, reading chunks; same student without the teacher for comparison | `lsi_grid.run_kd` |
+| deadline | `finish_by` (a clock time): every run measures its own speed (prediction before training, training steps after 20 and every 100 steps) and trains only the steps that fit before it, then predicts and writes everything; `phase5_run.ipynb` gives each stage its share of the time until `FINISH_IST` | `lsi_train.py`, `lsi_data.plan_steps` |
 | ensemble | greedy forward selection of results on dev (any models / techniques / Stage B versions), cross-fitted thresholds | `lsi_grid.ensemble` |
 
 Imbalance: BCE with pos_weight = (negatives/positives)^0.5 (capped at 30) and head bias = statute frequency; the
@@ -36,7 +37,7 @@ asymmetric loss (`loss="asl"`) is available as an alternative.
 ## How to run (Kaggle, GPU T4 x2, internet on, secrets GH_TOKEN + HF_TOKEN)
 
 1. Inputs: dataset `checkpoints-models` (decoder, encoder-decoder, Llama) and `moe-checkpoint`.
-2. `phase5_run.ipynb` with `MODEL = "llama"`, then `"decoder"` (your account), `"moe"`, then `"encdec"` (friend's
+2. `phase5_run.ipynb` (set `MODEL` and `FINISH_IST`; each model: 2 main techniques + whole-document stage + KD + 2 more techniques, spares if one fails) with `MODEL = "llama"`, then `"decoder"` (your account), `"moe"`, then `"encdec"` (friend's
    account), each as Save Version -> Save & Run All. A notebook stops starting new stages after 10.5 h; to continue,
    attach its output as input and set `RESUME = "auto"`.
 3. `phase5_final.ipynb` with the four outputs attached: best mix of everything, its submission, `all_results.txt`.

@@ -8,6 +8,12 @@ Phase 1 model are trained; the classification head (pooling + linear layer) is a
   bitfit    only the bias values; a model without biases gets zero biases added to its linear layers
   lorma     LoRMA+ (Bihany, Patel, Modi 2025): every weight matrix becomes (I + alpha/r * B A) W0;
             W0 stays fixed, only B (d_out x r, starts at 0) and A (r x d_out) are trained
+  lora      LoRA (Hu et al. 2021): every weight matrix becomes W0 + alpha/r * B A; W0 stays fixed, only
+            B (d_out x r, starts at 0) and A (r x d_in) are trained
+  qlora     QLoRA (Dettmers et al. 2023): LoRA on top of a 4-bit copy of the fixed weights: W0 is stored as
+            4-bit NormalFloat (NF4) codes with one scale (absolute maximum) per block of 64 values, and is
+            rebuilt from them at every use (W0 itself is freed); the low-rank B A is trained in full precision.
+            Not done here: quantising the scales again ("double quantisation") and paged optimiser states.
   adalora   AdaLoRA (Zhang et al. 2023): W0 + alpha/r0 * P diag(lambda) Q with a total rank budget that
             shrinks during training; rank is kept where it matters most (importance scores)
   adapter   a bottleneck layer after every block, x + up(gelu(down(x))) with d -> 64 -> d, starts as identity
@@ -30,9 +36,9 @@ import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
 
-TECHNIQUES = ("frozen", "full", "partial", "unfreeze", "bitfit", "lorma", "adalora", "adapter")
+TECHNIQUES = ("frozen", "full", "partial", "unfreeze", "bitfit", "lorma", "adalora", "adapter", "lora", "qlora")
 BODY_LR = {"frozen": None, "full": 3e-5, "partial": 3e-5, "unfreeze": 3e-5, "bitfit": 5e-4,
-           "lorma": 5e-4, "adalora": 5e-4, "adapter": 1e-3}
+           "lorma": 5e-4, "adalora": 5e-4, "adapter": 1e-3, "lora": 5e-4, "qlora": 5e-4}
 TECH_DEFAULTS = dict(
     partial_frac=1 / 3,          # partial: share of the blocks (from the top) that are trained
     unfreeze_stages=4,           # unfreeze: number of stages (stage 0 = head only)
@@ -41,7 +47,10 @@ TECH_DEFAULTS = dict(
     adalora_tinit=0.1, adalora_tfinal=0.2, adalora_deltaT=10, adalora_orth=0.1,
     adalora_beta=0.85,
     adapter_dim=64,
+    lora_r=8, lora_alpha=16.0,   # LoRA / QLoRA rank and alpha (scale alpha / r)
+    qlora_block=64,              # QLoRA: values per quantisation block (one scale each)
 )
+LOW_RANK = ("lorma", "adalora", "lora", "qlora")       # techniques that parametrize weight matrices
 _RNN_LAYER = re.compile(r"_l(\d+)(_reverse)?$")
 
 
@@ -189,6 +198,73 @@ class LoRMA(nn.Module):
 
     def forward(self, W):
         return W + self.scale * (self.B @ (self.A @ W))
+
+
+class LoRA(nn.Module):
+    """Parametrization W -> W + scale * B A, scale = alpha / r (B starts at 0: no change at the start)."""
+
+    def __init__(self, d_out: int, d_in: int, r: int, alpha: float):
+        super().__init__()
+        self.A = nn.Parameter(torch.empty(r, d_in))
+        self.B = nn.Parameter(torch.zeros(d_out, r))
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+        self.scale = alpha / r
+
+    def forward(self, W):
+        return W + self.scale * (self.B @ self.A)
+
+
+# the 16 NormalFloat-4 values (QLoRA paper, appendix E / bitsandbytes): quantiles of a standard normal, scaled to [-1, 1]
+NF4 = (-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635,
+       -0.18477343022823334, -0.09105003625154495, 0.0, 0.07958029955625534, 0.16093020141124725,
+       0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0)
+
+
+def nf4_quantize(W: torch.Tensor, block: int = 64):
+    """(packed codes uint8 [two 4-bit codes per byte], absmax per block float32): every block of `block` values is
+    divided by its absolute maximum and each value replaced by the nearest of the 16 NF4 values."""
+    flat = W.detach().float().reshape(-1)
+    pad = (-flat.numel()) % block
+    if pad:
+        flat = torch.cat([flat, flat.new_zeros(pad)])
+    blocks = flat.view(-1, block)
+    absmax = blocks.abs().amax(1).clamp(min=1e-12)
+    levels = torch.tensor(NF4, device=flat.device)
+    codes = torch.bucketize(blocks / absmax[:, None], (levels[1:] + levels[:-1]) / 2).reshape(-1).to(torch.uint8)
+    if codes.numel() % 2:
+        codes = torch.cat([codes, codes.new_zeros(1)])
+    return codes[0::2] | (codes[1::2] << 4), absmax
+
+
+def nf4_dequantize(packed: torch.Tensor, absmax: torch.Tensor, levels: torch.Tensor, shape, block: int = 64):
+    codes = torch.stack([packed & 15, packed >> 4], 1).reshape(-1).long()
+    n = math.prod(shape)
+    w = levels[codes[:absmax.numel() * block]].view(-1, block) * absmax[:, None]
+    return w.reshape(-1)[:n].view(*shape)
+
+
+class QLoRA(nn.Module):
+    """Parametrization W -> dequantize(NF4 codes of W0) + scale * B A. The incoming W is not used: apply() frees
+    the full-precision original after registering, so only the 4-bit codes and the block scales are kept."""
+
+    def __init__(self, W: torch.Tensor, r: int, alpha: float, block: int = 64):
+        super().__init__()
+        packed, absmax = nf4_quantize(W, block)
+        self.register_buffer("packed", packed)
+        self.register_buffer("absmax", absmax)
+        self.register_buffer("levels", torch.tensor(NF4, device=W.device))
+        self.shape = tuple(W.shape)
+        self.block = block
+        self.A = nn.Parameter(torch.empty(r, W.shape[1], device=W.device))
+        self.B = nn.Parameter(torch.zeros(W.shape[0], r, device=W.device))
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+        self.scale = alpha / r
+
+    def weight0(self):
+        return nf4_dequantize(self.packed, self.absmax, self.levels, self.shape, self.block)
+
+    def forward(self, W):
+        return self.weight0().to(self.B.dtype) + self.scale * (self.B @ self.A)
 
 
 # -------------------------------------------------------------------------- AdaLoRA
@@ -381,27 +457,54 @@ def apply(clf: nn.Module, technique: str, used: set[str], cfg: dict, total_steps
             + (f" + {len(added)} zero biases added to linear layers that had none" if added else ""))
         if not biases and not added:
             raise RuntimeError("BitFit: the model has no bias values and no linear layers to add them to")
-    elif technique in ("lorma", "adalora"):
+    elif technique in LOW_RANK:
         tg = targets(model, used)
         if not tg:
             raise RuntimeError(f"{technique}: no weight matrices found")
         mods, rnns = [], {}
+        q_err, q_bytes, full_bytes = [], 0, 0
         for mname, m, pn in tg:
             W = getattr(m, pn)
             if technique == "lorma":
                 pm = LoRMA(W.shape[0], cfg["lorma_r"], cfg["lorma_alpha"])
+            elif technique == "lora":
+                pm = LoRA(W.shape[0], W.shape[1], cfg["lora_r"], cfg["lora_alpha"])
+            elif technique == "qlora":
+                pm = QLoRA(W, cfg["lora_r"], cfg["lora_alpha"], cfg["qlora_block"])
             else:
                 pm = AdaLoRA(W.shape[0], W.shape[1], cfg["adalora_r0"], cfg["adalora_alpha"] / cfg["adalora_r0"])
             pm = pm.to(device=W.device, dtype=W.dtype)
+            if technique == "qlora":
+                with torch.no_grad():
+                    q_err.append(((pm.weight0() - W).norm() / W.norm().clamp(min=1e-12)).item())
+                q_bytes += pm.packed.numel() + pm.absmax.numel() * 4
+                full_bytes += W.numel() * W.element_size()
             parametrize.register_parametrization(m, pn, pm)
-            m.parametrizations[pn].original.requires_grad_(False)
+            orig = m.parametrizations[pn].original
+            orig.requires_grad_(False)
+            if technique == "qlora":            # the 4-bit codes replace the full-precision original
+                orig.data = torch.empty(0, device=orig.device, dtype=orig.dtype)
             mods.append((f"{mname}.{pn}" if mname else pn, pm))
             if isinstance(m, nn.RNNBase):
                 rnns[id(m)] = m
         for r in rnns.values():
             _rnn_without_cudnn(r)
         n_lin = sum(1 for _, m, _ in tg if isinstance(m, nn.Linear))
-        if technique == "lorma":
+        if technique in ("lora", "qlora"):
+            info = dict(matrices=len(mods), linear=n_lin, rnn=len(mods) - n_lin, r=cfg["lora_r"],
+                        alpha=cfg["lora_alpha"])
+            if technique == "qlora":
+                info.update(block=cfg["qlora_block"], quantized_params=sum(math.prod(pm.shape) for _, pm in mods),
+                            frozen_mb_4bit=q_bytes / 2 ** 20,
+                            frozen_mb_full=full_bytes / 2 ** 20, rel_error_mean=sum(q_err) / len(q_err))
+            hooks = Hooks(technique, [p for _, pm in mods for p in (pm.A, pm.B)], info)
+            log(f"[technique] {'QLoRA' if technique == 'qlora' else 'LoRA'} rank {cfg['lora_r']} (scale "
+                f"{cfg['lora_alpha'] / cfg['lora_r']:g}) on {len(mods)} weight matrices ({n_lin} linear, "
+                f"{len(mods) - n_lin} RNN)"
+                + (f"; fixed weights in 4-bit NF4 (blocks of {cfg['qlora_block']}): {q_bytes / 2 ** 20:.1f} MB instead "
+                   f"of {full_bytes / 2 ** 20:.1f} MB, mean relative error {info['rel_error_mean']:.3f}"
+                   if technique == "qlora" else ""))
+        elif technique == "lorma":
             hooks = Hooks(technique, [p for _, pm in mods for p in (pm.A, pm.B)],
                           dict(matrices=len(mods), linear=n_lin, rnn=len(mods) - n_lin, r=cfg["lorma_r"],
                                alpha=cfg["lorma_alpha"]))

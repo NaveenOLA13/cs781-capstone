@@ -27,7 +27,7 @@ if HERE not in sys.path:
 import p5_paths  # noqa: E402,F401  (Phase 4 building blocks)
 
 COST = {"frozen": 1.0, "full": 3.0, "partial": 2.0, "unfreeze": 2.4, "bitfit": 2.0, "lorma": 2.3,
-        "adalora": 2.4, "adapter": 2.0}
+        "adalora": 2.4, "adapter": 2.0, "lora": 2.3, "qlora": 2.6}
 OUT_DIR = "/kaggle/working/lsi_runs"
 
 
@@ -204,7 +204,8 @@ def run_kd(teacher_dir: str, student_layers=0.5, kd_alpha: float = 0.5, kd_T: fl
           f"{max(tm['cv_global'], tm['cv_per_label']):.4f}); fine-tuned run {sm['run_name']}, "
           f"{sm['total_params'] / 1e6:.1f}M weights" + (f" + Stage B {tm['params'] / 1e6:.2f}M" if "params" in tm
                                                        else ""))
-    print(f"[kd] student: {p['model']} from {p['ckpt']}, first {student_layers} of its blocks, {technique}; loss = "
+    size = f"first {student_layers} of its blocks" if student_layers else "same size as the teacher's model"
+    print(f"[kd] student: {p['model']} from {p['ckpt']}, {size}, {technique}; loss = "
           f"{1 - kd_alpha:.2f} x gold + {kd_alpha:.2f} x teacher (temperature {kd_T})"
           + ("; also the same student without the teacher" if plain else ""))
     names = [j["run_name"] for j in p["jobs"]]
@@ -237,7 +238,7 @@ def report(base_dirs, out_path: str | None = None) -> str:
                 continue
             name = _short_name(root, base, base_dirs)
             kind = ("ensemble" if "members" in m else "Stage B" if "version" in m
-                    else "KD student" if m.get("student") else "fine-tuned")
+                    else "KD student" if m.get("student") or m.get("kd") else "fine-tuned")
             size = (f"{m['trainable_params'] / 1e6:.2f}M/{m['total_params'] / 1e6:.0f}M" if "trainable_params" in m
                     else f"+{m['params'] / 1e6:.2f}M" if "params" in m else f"{len(m.get('members', []))} runs")
             rows.append((max(m["cv_global"], m["cv_per_label"]), name, kind, size, m))

@@ -20,6 +20,10 @@ submission: global or per statute, chosen by cross-fitting on dev (lsi_data.choo
 Knowledge distillation: student_layers keeps only the first blocks (a smaller student); kd_teacher = a teacher run's
 train_probs.json (+ its labels.json): loss = (1 - kd_alpha) x gold BCE + kd_alpha x T^2 x BCE with the teacher's
 probabilities softened at temperature kd_T.
+Deadline: finish_by (a UNIX time; 0 = none) = when the whole run must be finished. The run measures its own speed
+(prediction before training, training steps after 20 steps and every 100 steps) and trains only as many steps as fit
+before finish_by after the predictions still to come; the epoch is cut short (the documents are shuffled, so a cut
+epoch reads a random part of the training documents), and the learning rate decays to 0 at the new last step.
 
 Outputs in out_dir/run_name/: log.txt, config.json, labels.json, metrics.json, per_label.json (dev F1 and support
 of every statute), dev_probs.json, test_probs.json (+ train_probs.json with save_train_probs), submission/
@@ -53,7 +57,7 @@ DEFAULTS = dict(
     asl_gamma_neg=4.0, asl_gamma_pos=0.0, asl_clip=0.05, dropout=0.1, head="linear", pooling=None,
     min_pos=3, limit_train=0, fit_sample=500, ckpt_path=None, tok_workers=4, cache_dir="/kaggle/working/lsi_cache",
     log_every=200, save_weights=True, save_train_probs=False, save_chunks=False, fetch_data=True,
-    student_layers=0, kd_teacher=None, kd_alpha=0.5, kd_T=2.0,
+    student_layers=0, kd_teacher=None, kd_alpha=0.5, kd_T=2.0, finish_by=0.0,
     **T.TECH_DEFAULTS,
 )
 POOLS = ("max", "mean", "lse")
@@ -300,7 +304,7 @@ def run(bb, name: str = "model", **overrides) -> dict:
     pw = np.minimum(((len(Y_tr) - pos) / np.maximum(pos, 1)) ** cfg["pos_weight_power"], cfg["pos_weight_max"])
     pos_weight = torch.tensor(pw, dtype=torch.float32, device=device)
     n_trainable = sum(p.numel() for p in {id(p): p for p in head + body}.values())
-    n_total = count_params(clf, trainable_only=False)
+    n_total = count_params(clf, trainable_only=False) + hooks.info.get("quantized_params", 0)   # QLoRA: 4-bit W0
     log(f"[setup] {tech}: {n_trainable / 1e6:.3f}M trained weights of {n_total / 1e6:.1f}M "
         f"({n_trainable / n_total:.2%}); {n_lab} statutes; chunk vector '{clf.pool.kind}' pooling, document score = "
         f"{cfg['chunk_pool']} over chunks; body lr {cfg['lr_body']}, head lr {cfg['lr_head']}; loss "
@@ -313,7 +317,13 @@ def run(bb, name: str = "model", **overrides) -> dict:
         wd = cfg["weight_decay"] if p.dim() >= 2 else 0.0
         groups.setdefault((lr, wd), []).append(p)
     opt = torch.optim.AdamW([dict(params=v, lr=k[0], weight_decay=k[1]) for k, v in groups.items()])
-    sched = R.warmup_linear(opt, int(cfg["warmup"] * total), total)
+    plan = dict(total=total, warm=int(cfg["warmup"] * total))      # same as R.warmup_linear, but total can shrink
+
+    def lr_factor(s):
+        if s < plan["warm"]:
+            return (s + 1) / max(1, plan["warm"])
+        return max(0.0, (plan["total"] - s) / max(1, plan["total"] - plan["warm"]))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_factor)
     scaler = R._scaler(device, cfg["amp"])
     all_params = head + body
     keep_ids = {id(p) for p in all_params}
@@ -329,9 +339,46 @@ def run(bb, name: str = "model", **overrides) -> dict:
     if device.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
+    budget = None
+    if cfg["finish_by"]:                     # measure the prediction speed now, the training speed after 20 steps
+        def n_pred(ds):
+            return sum(min(len(d), cfg["eval_chunks"]) for d in ds)
+        predict(clf, docs["dev"][:8], cfg, device, bb.pad_id, exact)                  # warm-up
+        sample = docs["dev"][8:136]
+        t_p = time.time()
+        predict(clf, sample, cfg, device, bb.pad_id, exact)
+        sec_chunk = (time.time() - t_p) / max(1, n_pred(sample))
+        fit_share = min(cfg["fit_sample"], len(docs["train"])) / max(1, len(docs["train"]))
+        final = n_pred(docs["test"]) + fit_share * n_pred(docs["train"])
+        if cfg["save_chunks"]:
+            final += 1.15 * (n_pred(docs["dev"]) + n_pred(docs["test"]) + n_pred(docs["train"]))
+        budget = dict(finish_by=cfg["finish_by"], planned_steps=total, probe=min(20, total),
+                      dev_seconds=n_pred(docs["dev"]) * sec_chunk, final_seconds=final * sec_chunk,
+                      margin_seconds=150 + (90 if cfg["save_chunks"] else 0), sec_per_step=None, cut=False)
+        log(f"[budget] finish by {time.strftime('%H:%M', time.gmtime(cfg['finish_by']))} UTC "
+            f"({(cfg['finish_by'] - time.time()) / 60:.0f} min from now); predicting dev takes about "
+            f"{budget['dev_seconds'] / 60:.1f} min, the final predictions about {budget['final_seconds'] / 60:.1f} min")
+
+    def replan(ep):
+        """Training steps that still fit before finish_by (budget runs only)."""
+        trained = trained_secs + (time.time() - t0)
+        sps = trained / max(1, step)
+        epochs_left = min(cfg["epochs"], -(-plan["total"] // n_steps)) - ep + 1
+        pred_left = epochs_left * budget["dev_seconds"] + budget["final_seconds"] + budget["margin_seconds"]
+        new = L.plan_steps(step, total, sps, cfg["finish_by"] - time.time(), pred_left, budget["probe"])
+        budget["sec_per_step"] = sps
+        if abs(new - plan["total"]) > max(10, 0.02 * plan["total"]) or (new < plan["total"] and new <= step):
+            plan["total"] = new
+            plan["warm"] = min(plan["warm"], max(1, int(cfg["warmup"] * new)))
+            budget["cut"] = new < total
+            log(f"[budget] {sps:.2f} s per step, {(cfg['finish_by'] - time.time()) / 60:.0f} min left, "
+                f"{pred_left / 60:.0f} min of it for predictions -> {new} of the {total} planned steps "
+                f"({new / n_steps:.2f} epochs)")
+
     best, best_state, best_epoch, history, step = -1.0, None, 0, [], 0
     best_P_dev, best_infer = None, None
     t_start = time.time()
+    trained_secs = 0.0
     rng = random.Random(cfg["seed"])
     for ep in range(1, cfg["epochs"] + 1):
         clf.train()
@@ -339,9 +386,15 @@ def run(bb, name: str = "model", **overrides) -> dict:
         order = list(range(len(docs["train"])))
         rng.shuffle(order)
         for k in range(n_steps):
+            if step >= plan["total"]:
+                break
             b = order[k * cfg["batch_size"]:(k + 1) * cfg["batch_size"]]
             if not b:
                 continue
+            if budget is not None and step >= budget["probe"] and (step == budget["probe"] or step % 100 == 0):
+                replan(ep)
+                if step >= plan["total"]:
+                    break
             hooks.on_step_start(step)
             sel = []
             for i in b:
@@ -388,6 +441,7 @@ def run(bb, name: str = "model", **overrides) -> dict:
                     + (f"teacher term {tot_kd / max(1, seen):.4f}  " if teacher is not None else "")
                     + f"{el / 60:.1f} min, about {el / (k + 1) * (n_steps - k - 1) / 60:.1f} min left in this epoch")
         t_inf = time.time()
+        trained_secs += t_inf - t0
         P_dev = predict(clf, docs["dev"], cfg, device, bb.pad_id, exact)
         infer_ep = time.time() - t_inf
         t_g, m_g = L.tune_global(Y_dev, P_dev)
@@ -401,7 +455,13 @@ def run(bb, name: str = "model", **overrides) -> dict:
         log(f"[train] epoch {ep}/{cfg['epochs']}  loss {rec['loss']:.4f}  dev macro-F1 {m_g:.4f} at threshold "
             f"{t_g:.2f}  {rec['seconds'] / 60:.1f} min{mark}" + (f"  ({skipped} steps skipped)" if skipped else ""))
         history.append(rec)
+        if step >= plan["total"]:
+            break
     train_seconds = time.time() - t_start
+    if budget is not None:
+        budget.update(steps=step, share_of_planned=step / max(1, total), epochs_done=step / max(1, n_steps))
+        log(f"[budget] trained {step} of the {total} planned steps ({budget['epochs_done']:.2f} epochs"
+            + (", cut to finish in time)" if budget["cut"] else ")"))
     peak = R._peak_gb(device)
     clf.load_state_dict(best_state, strict=False)
     log(f"[train] using epoch {best_epoch}")
@@ -470,7 +530,8 @@ def run(bb, name: str = "model", **overrides) -> dict:
                    dev_chosen=L.short(th["dev_chosen"]), train_fit=L.short(fit), trainable_params=n_trainable,
                    total_params=n_total, trainable_share=n_trainable / n_total, peak_gpu_gb=peak,
                    train_seconds=train_seconds, dev_infer_seconds=infer_s, saved_mb=saved_mb,
-                   technique_info=hooks.summary(), submissions=subs, student=student, kd=kd, config=cfg)
+                   technique_info=hooks.summary(), submissions=subs, student=student, kd=kd, budget=budget,
+                   config=cfg)
     with open(os.path.join(out, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=1, default=str)
     log(f"[done] dev macro-F1 {th['dev_chosen']['macro_f1']:.4f} ({th['kind']} thresholds; cross-fitted "

@@ -259,6 +259,18 @@ def choose_thresholds(Y: np.ndarray, P: np.ndarray, min_pos: int = 3, seed: int 
                 dev_global=scores(Y, apply(P, tg, min_one)), dev_chosen=scores(Y, apply(P, thr, min_one)))
 
 
+# ---------------------------------------------------------------------------- deadline
+def plan_steps(step: int, planned: int, sec_per_step: float, seconds_left: float, predict_seconds: float,
+               min_steps: int = 20) -> int:
+    """Training steps that fit before a deadline: the steps already done + those that fit in the time left after the
+    predictions still to come. Never more than planned; never fewer than min(planned, max(step, min_steps)), so a
+    run always trains a little and always writes its results."""
+    spare = seconds_left - predict_seconds
+    more = int(spare / sec_per_step) if sec_per_step > 0 and spare > 0 else 0
+    floor = min(planned, max(step, min_steps))
+    return max(floor, min(planned, step + more))
+
+
 # ------------------------------------------------------------------------------ files
 def save_probs(path: str, ids: list[str], P: np.ndarray) -> None:
     with open(path, "w") as f:
