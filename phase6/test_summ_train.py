@@ -34,9 +34,18 @@ FAST = dict(max_len=128, tgt_tokens=32, enc_window=48, epochs=2, batch_size=8, g
             gen_batch=4, log_every=2, fetch_data=False, lr_body=3e-3, empty_frac=0.3)
 
 
+class ToyEncDecE(TOYS["encdec"]):
+    """The toy encoder-decoder with model.encode(src) (as our Phase 1 encoder-decoder has): the pointer-generator
+    can be added."""
+
+    def encode(self, src):
+        return self.encoder(self.emb(src))[0]
+
+
 def bb_of(kind):
     torch.manual_seed(1)
-    return make_backbone(TOYS[kind](), WordTok(), max_len=128, verbose=False)
+    model = ToyEncDecE() if kind == "encdec_e" else TOYS[kind]()
+    return make_backbone(model, WordTok(), max_len=128, verbose=False)
 
 
 def word_decoder(root):
@@ -104,6 +113,7 @@ def _check(res, n_test, tech):
     assert {"held", "held_raw", "trainable_params", "steps", "submission", "decoding", "decodings"} <= set(m), m.keys()
     assert set(m["decodings"]) == {"beam", "top_p"} and m["decoding"] in m["decodings"]
     assert m["held"]["rouge_mean"] == max(v["held"]["rouge_mean"] for v in m["decodings"].values())
+    assert len(m["val_history"]) >= 2 and 0 <= m["best_epoch"] <= len(m["val_history"]), m["val_history"]
     rows = json.loads(zipfile.ZipFile(os.path.join(out, "submission", "submission.zip")).read("prediction.json"))
     assert len(rows) == n_test and all(isinstance(r["summary"], str) and r["summary"] for r in rows), rows[:2]
     assert os.path.exists(os.path.join(out, "trained.pt")) and os.path.exists(os.path.join(out, "held_summaries.json"))
@@ -123,11 +133,16 @@ def test_runs_kd_deadline_report():
         assert len(h) >= 2 and h[-1]["loss"] < h[0]["loss"], h
         print(f"    toy llama full: held-out {SD.fmt(r['metrics']['held'])}")
         for kind, tech in (("gpt", "lora"), ("llama", "lorma"), ("llama", "qlora"), ("gpt", "adapter"),
-                           ("encdec", "adapter"), ("encdec", "lora")):
+                           ("encdec", "adapter"), ("encdec_e", "lora"), ("encdec_e", "qlora")):
             rr = S.run(bb_of(kind), name=kind, technique=tech, decode=dec, **common)
             _check(rr, 6, tech)
-            if kind == "encdec" and tech == "lora":
-                assert "linear layers only" in open(os.path.join(rr["out_dir"], "log.txt")).read()
+            text = open(os.path.join(rr["out_dir"], "log.txt")).read()
+            if kind == "encdec":                                  # no encode(): no pointer-generator
+                assert not rr["metrics"]["copy"] and "no pointer-generator" in text
+            if kind == "encdec_e":                                # pointer-generator trained with the technique
+                assert rr["metrics"]["copy"] and "[copy] pointer-generator" in text and "linear layers only" in text
+                st_ = torch.load(os.path.join(rr["out_dir"], "trained.pt"), weights_only=False)["state"]
+                assert any(k.startswith("copy.") for k in st_), list(st_)[:5]
         # knowledge distillation: half-size student (evenly spaced blocks) with the llama_full teacher
         st = S.run(bb_of("llama"), name="llama", technique="full", run_name="llama_student_kd", decode=dec,
                    student_layers=0.5, kd_teacher=r["out_dir"], **common)

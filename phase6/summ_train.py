@@ -28,6 +28,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 import p6_paths  # noqa: F401
 import cj_tech as T  # noqa: E402
@@ -45,7 +46,7 @@ DEFAULTS = dict(
     beams=4, no_repeat=3, len_pen=1.0, min_frac=0.0, max_new_scale=1.3, length_scale=1.0, gen_batch=8,
     decodings=("beam", "top_p"), top_p=0.9, top_k=0, temperature=0.7,
     eval_docs=40, gen_test=True, ckpt_path=None, cache_dir="/kaggle/working/summ_cache", log_every=200,
-    save_weights=True, fetch_data=True, lowrank_rnn=False, limit_train=0,
+    save_weights=True, fetch_data=True, lowrank_rnn=False, limit_train=0, copy=True, val_docs=60,
     **T.TECH_DEFAULTS,
 )
 
@@ -77,7 +78,7 @@ def prepare(encode, cfg: dict, encdec: bool, log=print) -> dict:
     window = SM.window_budget(encdec, cfg["max_len"], len(prompt), tgt, cfg["enc_window"])
     fp = hashlib.md5(json.dumps([list(encode("The appeal is allowed, Section 302 I.P.C.")), window, tgt,
                                  cfg["empty_frac"], cfg["seed"], cfg["heldout_frac"], cfg["limit_train"],
-                                 len(data["train"]), len(data["test"]), "v1"]).encode()).hexdigest()[:12]
+                                 len(data["train"]), len(data["test"]), cfg["val_docs"], "v2"]).encode()).hexdigest()[:12]
     path = os.path.join(cfg["cache_dir"], f"summ_{fp}.pkl")
     if os.path.exists(path):
         try:
@@ -104,8 +105,10 @@ def prepare(encode, cfg: dict, encdec: bool, log=print) -> dict:
             for wi, ((a, e), al) in enumerate(zip(wins, alloc)):
                 out.append(dict(doc=di, w=wi, src=ids[a:e], alloc=al))
         return out
+    held_pairs, _ = SD.make_pairs(data["held"][:cfg["val_docs"]], encode, window, tgt, 0.0, cfg["seed"])
     prep = dict(pairs=pairs, info=info, window=window, tgt_tokens=tgt, prompt=prompt, length_model=lm,
-                tokens_per_word=tpw, held_items=items(data["held"]), test_items=items(data["test"]))
+                tokens_per_word=tpw, held_items=items(data["held"]), test_items=items(data["test"]),
+                held_pairs=held_pairs)
     log(f"[data] windows of {window} tokens, targets up to {tgt} tokens: {info['pairs']} training pairs from "
         f"{info['docs']} documents ({info['empty_targets']} with an empty target, {info['targets_cut']} targets cut, "
         f"mean target {info['target_tokens_mean']:.0f} tokens); summary length model: words = exp({lm['a']:.2f} + "
@@ -152,6 +155,21 @@ def _bytes_to_unicode():
             cs.append(256 + n)
             n += 1
     return {chr(c): b for b, c in zip(bs, cs)}
+
+
+@torch.no_grad()
+def valid_loss(wrap, pairs, ids, device, batch_size, encdec, amp) -> float:
+    """Mean next-token cross-entropy (no label smoothing) on the summary parts of held-out windows."""
+    was = wrap.training
+    wrap.eval()
+    tot, n = 0.0, 0
+    for b in SM.batches(pairs, batch_size, encdec, random.Random(0)):
+        with R._autocast(device, amp):
+            lg, y = SM.logits_and_targets(wrap, [pairs[i] for i in b], ids, device)
+        tot += F.cross_entropy(lg.float(), y, reduction="sum").item()
+        n += y.numel()
+    wrap.train(was)
+    return tot / max(1, n)
 
 
 def default_decode(log=print):
@@ -238,7 +256,10 @@ def run(bb, name: str = "model", decode=None, **overrides) -> dict:
     per_epoch = max(1, n_batches // cfg["grad_accum"])
     total = per_epoch * cfg["epochs"]
     hooks = SM.apply_technique(wrap, tech, cfg, total, probe, ids, device, log)
-    body = hooks.body_params
+    copy_params = []
+    if encdec and cfg["copy"] and wrap.enable_copy(probe, ids, device, log):
+        copy_params = list(wrap.copy.parameters())
+    body = list(hooks.body_params) + copy_params
     n_train = sum(p.numel() for p in {id(p): p for p in body}.values())
     n_total = SM.count(wrap) + hooks.info.get("quantized_params", 0)
     teacher, kd = None, None
@@ -295,6 +316,21 @@ def run(bb, name: str = "model", decode=None, **overrides) -> dict:
             f"generating held-out + test summaries takes about {gsec / 60:.0f} min")
 
     # ------------------------------------------------------------------------ training
+    keep = [n for n, p in wrap.named_parameters() if p.requires_grad]
+
+    def snapshot():
+        sd = wrap.state_dict()
+        return {n: sd[n].detach().to("cpu", copy=True) for n in keep if n in sd}
+    vpairs = prep["held_pairs"]
+    t_v = time.time()
+    v0 = valid_loss(wrap, vpairs, ids, device, cfg["batch_size"], encdec, cfg["amp"]) if vpairs else float("nan")
+    t_v = time.time() - t_v
+    if budget is not None:
+        budget["margin"] += t_v * (cfg["epochs"] + 1)
+    val_history = [dict(epoch=0, step=0, loss=v0)]
+    best_v, best_state, best_ep = v0, None, 0
+    log(f"[valid] held-out target loss before training: {v0:.4f} ({len(vpairs)} windows of "
+        f"{min(cfg['val_docs'], len(data['held']))} held-out documents)")
     step, micro, t_start, tot, tot_kd, seen = 0, 0, time.time(), 0.0, 0.0, 0
     history = []
     wrap.train()
@@ -352,8 +388,18 @@ def run(bb, name: str = "model", decode=None, **overrides) -> dict:
                     + (f"  teacher term {rec['kd']:.4f}" if teacher is not None else "")
                     + f"  {el / 60:.1f} min, about {el / step * (plan['total'] - step) / 60:.1f} min left")
                 tot, tot_kd, seen = 0.0, 0.0, 0
+        if vpairs and step > val_history[-1]["step"]:          # after every (possibly cut) epoch: keep the best
+            v = valid_loss(wrap, vpairs, ids, device, cfg["batch_size"], encdec, cfg["amp"])
+            val_history.append(dict(epoch=ep + 1, step=step, loss=v))
+            mark = ""
+            if not v > best_v:                                  # (also when the start value is nan)
+                best_v, best_state, best_ep, mark = v, snapshot(), ep + 1, "  <- best so far"
+            log(f"[valid] epoch {ep + 1}: held-out target loss {v:.4f}{mark}")
         if stop:
             break
+    if best_state is not None and best_ep != val_history[-1]["epoch"]:
+        wrap.load_state_dict(best_state, strict=False)
+        log(f"[valid] using the weights after epoch {best_ep} (lowest held-out loss {best_v:.4f})")
     train_seconds = time.time() - t_start
     if budget is not None:
         budget.update(steps=step, epochs_done=step / per_epoch)
@@ -414,6 +460,7 @@ def run(bb, name: str = "model", decode=None, **overrides) -> dict:
                    decoding=best, decodings=decodings,
                    trainable_params=n_train, total_params=n_total, trainable_share=n_train / max(1, n_total),
                    steps=step, epochs_done=step / per_epoch, train_seconds=train_seconds, held_gen_seconds=held_s,
+                   val_history=val_history, best_epoch=best_ep, copy=wrap.copy is not None,
                    test_gen_seconds=test_s, peak_gpu_gb=R._peak_gb(device), saved_mb=saved_mb, history=history,
                    data=prep["info"], window=prep["window"], tgt_tokens=prep["tgt_tokens"], student=student, kd=kd,
                    budget=budget, technique_info=hooks.summary(), submission=sub, config=cfg)

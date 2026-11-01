@@ -19,7 +19,7 @@ import p6_paths  # noqa: F401
 import cj_tech as T  # noqa: E402
 import cj_train as R  # noqa: E402
 from cj_mid import is_encoder_decoder  # noqa: E402
-from rr_head import first_tensor  # noqa: E402
+from rr_head import find_lm_head, first_tensor  # noqa: E402
 
 PROMPT = " Summary:"
 
@@ -35,13 +35,43 @@ class _Enc(nn.Module):
         return self.model(ids, ids[:, :4]) if self.encdec else self.model(ids)
 
 
+class CopyHead(nn.Module):
+    """Pointer-generator (See, Liu & Manning 2017) added to our encoder-decoder: an attention of every decoder state
+    s_t (the input of the LM head) over the encoder states h_i gives a_t and the context c_t = sum_i a_ti h_i;
+    p_gen = sigmoid(w . [s_t ; c_t] + b) mixes the model's own word distribution with copying source tokens:
+    P(w) = p_gen P_vocab(w) + (1 - p_gen) sum_{i: src_i = w} a_ti. Rare words of the document (names, section
+    numbers, dates) can then be copied exactly. Starts with p_gen about 0.88 (close to the model alone).
+    Scaled dot-product attention (an additive one would need a [B, T, S, d] tensor)."""
+
+    def __init__(self, d_dec: int, d_enc: int, d_att: int = 256):
+        super().__init__()
+        self.q = nn.Linear(d_dec, d_att, bias=False)
+        self.k = nn.Linear(d_enc, d_att, bias=False)
+        self.gate = nn.Linear(d_dec + d_enc, 1)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, 2.0)
+        self.scale = 1.0 / math.sqrt(d_att)
+
+    def forward(self, h, enc, src_ids, vocab_logits):
+        """h [B, T, d_dec], enc [B, S, d_enc], src_ids [B, S], vocab_logits [B, T, V] -> (log P [B, T, V], p_gen)."""
+        h, enc = h.float(), enc.float()
+        att = torch.softmax((self.q(h) @ self.k(enc).transpose(1, 2)) * self.scale, -1)
+        ctx = att @ enc
+        p_gen = torch.sigmoid(self.gate(torch.cat([h, ctx], -1)))
+        p = p_gen * torch.softmax(vocab_logits.float(), -1)
+        p = p.scatter_add(-1, src_ids.unsqueeze(1).expand(-1, h.size(1), -1), (1 - p_gen) * att)
+        return torch.log(p.clamp_min(1e-10)), p_gen
+
+
 class Wrap(nn.Module):
-    """Holds the Phase 1 model as .encoder.model (the layout cj_tech.apply expects); adapters are added as .adapters.
-    Its state_dict therefore contains everything a technique trains."""
+    """Holds the Phase 1 model as .encoder.model (the layout cj_tech.apply expects); adapters are added as .adapters,
+    the encoder-decoder's pointer-generator as .copy. Its state_dict therefore contains everything that is trained."""
 
     def __init__(self, model):
         super().__init__()
         self.encoder = _Enc(model, is_encoder_decoder(model))
+        self.copy = None
+        self._hold: dict = {}
 
     @property
     def model(self):
@@ -50,6 +80,44 @@ class Wrap(nn.Module):
     @property
     def encdec(self):
         return self.encoder.encdec
+
+    def enable_copy(self, probe, ids, device, log=print) -> bool:
+        """Adds the pointer-generator to an encoder-decoder (needs model.encode(src) and an LM head whose input is the
+        decoder state). Returns False (and changes nothing) if the model does not offer them."""
+        m = self.model
+        name = find_lm_head(m)
+        if not self.encdec or not hasattr(m, "encode") or name is None:
+            log("[copy] no pointer-generator: the model has no encode() or no LM head")
+            return False
+        head = m.get_submodule(name)
+        hold = self._hold
+        handle = head.register_forward_hook(lambda mod, inp, out: hold.__setitem__("h", inp[0]))
+        try:
+            with torch.no_grad():
+                src, seq, _ = ed_batch(probe, ids["bos"], ids["eos"], ids["pad"], device)
+                lg = ed_logits(m, src, seq)
+                enc = first_tensor(m.encode(src))
+                h = hold.get("h")
+            if (h is None or h.dim() != 3 or tuple(h.shape[:2]) != tuple(lg.shape[:2]) or enc is None or enc.dim() != 3
+                    or tuple(enc.shape[:2]) != tuple(src.shape)):
+                raise RuntimeError(f"unexpected shapes: decoder states {None if h is None else tuple(h.shape)}, "
+                                   f"encoder states {None if enc is None else tuple(enc.shape)}")
+        except Exception as e:  # noqa: BLE001
+            handle.remove()
+            log(f"[copy] no pointer-generator: {type(e).__name__}: {e}")
+            return False
+        self.copy = CopyHead(h.size(-1), enc.size(-1)).to(device)
+        self._handle = handle
+        log(f"[copy] pointer-generator on '{name}' (decoder state {h.size(-1)}, encoder state {enc.size(-1)}): "
+            f"{sum(p.numel() for p in self.copy.parameters()) / 1e6:.2f}M weights, trained with the technique")
+        return True
+
+    def copy_logp(self, src, vocab_logits, enc=None):
+        """log P of the pointer-generator for the positions of the last forward (decoder states from the hook)."""
+        h = self._hold["h"][:, -vocab_logits.size(1):]
+        if enc is None:
+            enc = first_tensor(self.model.encode(src))
+        return self.copy(h, enc, src, vocab_logits)[0]
 
 
 def full_logits(model, x):
@@ -146,6 +214,8 @@ def logits_and_targets(wrap, batch, ids, device):
     if wrap.encdec:
         src, seq, y = ed_batch(batch, ids["bos"], ids["eos"], ids["pad"], device)
         lg = ed_logits(m, src, seq)
+        if wrap.copy is not None:            # log-probabilities; cross-entropy of log-probabilities is unchanged
+            lg = wrap.copy_logp(src, lg)
     else:
         x, y = dec_batch(batch, ids["prompt"], ids["eos"], ids["pad"], device)
         lg = full_logits(m, x[:, :-1])
@@ -413,6 +483,7 @@ class Generator:
         m, ids = self.w.model, self.ids
         if self.w.encdec:
             shift = getattr(m, "_p6_shift", 0)
+            enc_once: dict = {}
 
             def step(rows):
                 src = ctx if ctx.size(0) == rows.size(0) else ctx.repeat_interleave(rows.size(0) // ctx.size(0), 0)
@@ -421,6 +492,10 @@ class Generator:
                     seq = torch.cat([seq, torch.full((rows.size(0), 1), ids["pad"], device=self.device)], 1)
                 with R._autocast(self.device, self.amp):
                     lg = first_tensor(m(src, seq))
+                    if self.w.copy is not None:
+                        if "enc" not in enc_once:                # encoder states once per batch of windows
+                            enc_once["enc"] = first_tensor(m.encode(src))
+                        return self.w.copy_logp(src, lg[:, -1:], enc_once["enc"])[:, -1].float()
                 return F.log_softmax(lg[:, -1].float(), -1)
             return step
 
