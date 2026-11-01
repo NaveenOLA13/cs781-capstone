@@ -41,6 +41,7 @@ MID_DEFAULTS = dict(
     lr=1e-4, min_lr_frac=0.1, warmup_steps=100, weight_decay=0.01, beta2=0.95, grad_clip=1.0, amp=True,
     heldout_docs=300, heldout_windows=256, eval_every=500, log_every=100,
     data_parallel=True, tok_workers=4, seed=42, device=None,
+    finish_by=0.0,               # UNIX time by which training must stop (0 = none); fewer steps if needed
 )
 
 _ENC = None
@@ -173,7 +174,24 @@ def mid_train_model(model, encode, eos_id, train_texts, heldout_texts, cfg, log=
         f"{steps} steps x {bs} windows x {L} tokens = {steps * bs * L / 1e6:.1f}M tokens, lr {cfg['lr']}")
     history = [dict(step=0, heldout=before)]
     t0, tot, n, skipped = time.time(), 0.0, 0, 0
-    for s in range(steps):
+    planned, t_eval = steps, time.time()
+    heldout_loss(net, held[:16], device, cfg["amp"])
+    t_eval = (time.time() - t_eval) * max(1, len(held)) / 16          # seconds for one held-out evaluation
+    done = 0
+    for s in range(planned):
+        if s >= steps:
+            break
+        if cfg["finish_by"] and s >= 20 and (s == 20 or s % 100 == 0):   # steps that still fit before finish_by
+            sps = (time.time() - t0) / s
+            left = cfg["finish_by"] - time.time() - 1.5 * t_eval - 60
+            new = max(s, min(planned, s + int(max(0.0, left) / sps)))
+            if new != steps:
+                steps = new
+                log(f"[mid] {sps:.2f} s per step, {left / 60:.0f} min left -> {steps} of {planned} steps "
+                    f"({steps * bs * L / 1e6:.1f}M tokens)")
+            if s >= steps:
+                break
+        done = s + 1
         w = torch.from_numpy(wins[s * bs:(s + 1) * bs].astype(np.int64)).to(device)
         with _autocast(device, cfg["amp"]):
             loss = lm_loss(net, w[:, :-1], w[:, 1:])
@@ -199,6 +217,7 @@ def mid_train_model(model, encode, eos_id, train_texts, heldout_texts, cfg, log=
             h = heldout_loss(net, held, device, cfg["amp"])
             history.append(dict(step=s + 1, heldout=h))
             log(f"[mid] step {s + 1}: held-out loss {h:.4f}")
+    steps = done
     after = heldout_loss(net, held, device, cfg["amp"])
     history.append(dict(step=steps, heldout=after))
     minutes = (time.time() - t0) / 60

@@ -250,9 +250,10 @@ def _shrink_layer_count(model: nn.Module, n: int, k: int) -> list[str]:
     return changed
 
 
-def cut_blocks(model: nn.Module, keep) -> dict:
-    """Keeps only the first blocks of the model (in place). keep: a number of blocks, or a share (< 1).
-    The blocks are the nn.ModuleList of same-class layers with the most weights."""
+def cut_blocks(model: nn.Module, keep, pick: str = "first") -> dict:
+    """Keeps only some blocks of the model (in place). keep: a number of blocks, or a share (< 1).
+    The blocks are the nn.ModuleList of same-class layers with the most weights. pick="first": the first blocks;
+    pick="spread": evenly spaced blocks including the first and the last (DistilBART-style "shrink and fine-tune")."""
     best = None
     for name, m in model.named_modules():
         if isinstance(m, nn.ModuleList) and len(m) >= 2 and len({type(x) for x in m}) == 1:
@@ -270,11 +271,16 @@ def cut_blocks(model: nn.Module, keep) -> dict:
     before = sum(p.numel() for p in model.parameters())
     parent_name, _, attr = name.rpartition(".")
     parent = model.get_submodule(parent_name) if parent_name else model
-    setattr(parent, attr, nn.ModuleList(list(blocks)[:k]))
+    if pick == "spread":
+        idx = sorted({int(round(x)) for x in np.linspace(0, n - 1, k)})
+    else:
+        idx = list(range(k))
+    k = len(idx)
+    setattr(parent, attr, nn.ModuleList([blocks[i] for i in idx]))
     changed = _shrink_layer_count(model, n, k)
     after = sum(p.numel() for p in model.parameters())
     return dict(blocks=name, layers_full=n, layers_student=k, params_full=before, params_student=after,
-                layer_count_fields=changed)
+                layer_count_fields=changed, kept=idx)
 
 
 def make_model(bb, cfg: dict, log=print):
