@@ -101,7 +101,7 @@ def test_batches():
     pairs = [dict(src=[5, 6, 7], tgt=[8, 9]), dict(src=[5, 6], tgt=[8]), dict(src=[1, 2, 3], tgt=[])]
     x, y = SM.dec_batch(pairs[:2], [4], eos_id=2, pad_id=0, device="cpu")
     assert x[0].tolist() == [2, 5, 6, 7, 4, 8, 9, 2] and y[0].tolist() == [-100] * 5 + [8, 9, 2]
-    assert x[1].tolist()[:6] == [2, 5, 6, 4, 8, 2] and y[1].tolist()[-3:] == [-100, -100, -100]
+    assert x[1].tolist() == [2, 5, 6, 4, 8, 2, 0, 0] and y[1].tolist() == [-100] * 4 + [8, 2, -100, -100]
     src, seq, yy = SM.ed_batch([pairs[0], pairs[2]], bos_id=1, eos_id=2, pad_id=0, device="cpu")
     assert seq.tolist() == [[1, 8, 9, 2], [1, 2, 0, 0]] and yy.tolist() == [[8, 9, 2], [2, -100, -100]]
     b = SM.batches(pairs, 2, exact=True, rng=random.Random(0))
@@ -167,8 +167,9 @@ def test_mid_training():
         data = SD.load_data(root, fetch=False)
         pool, held = SMID.split_texts(data, dict(SMID.MID_DEFAULTS, heldout_docs=10))
         test_docs = {d["document"] for d in data["test"]}
-        held_all = {d["document"] for d in data["held"]} | {d["summary"] for d in data["held"]}
-        assert not (set(pool) & test_docs) and not (set(pool) & held_all) and len(pool) == 2 * len(data["train"])
+        held_docs = {d["document"] for d in data["held"]}        # (fake summaries repeat across documents)
+        assert not (set(pool) & test_docs) and not (set(pool) & held_docs) and len(pool) == 2 * len(data["train"])
+        assert set(held) <= held_docs
         torch.manual_seed(0)
         model = TOYS["llama"]()
         cfg = dict(tokens=8_000, seq_len=32, batch_size=8, lr=3e-3, warmup_steps=5, eval_every=0, log_every=0,
