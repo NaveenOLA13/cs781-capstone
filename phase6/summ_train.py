@@ -51,6 +51,11 @@ DEFAULTS = dict(
 )
 
 
+# decoding name -> (search, minimum share of the length budget written, length budget scale)
+DECODINGS = {"beam": ("beam", None, 1.0), "top_p": ("top_p", None, 1.0), "beam_long": ("beam", 0.5, 1.3)}
+LABELS = {"beam": "beam search", "top_p": "top-p sampling", "beam_long": "beam search, longer"}
+
+
 def resolve_cfg(overrides: dict) -> dict:
     unknown = set(overrides) - set(DEFAULTS)
     if unknown:
@@ -61,8 +66,8 @@ def resolve_cfg(overrides: dict) -> dict:
     if cfg["lr_body"] is None:
         cfg["lr_body"] = T.BODY_LR[cfg["technique"]] or 1e-3
     cfg["decodings"] = [cfg["decodings"]] if isinstance(cfg["decodings"], str) else list(cfg["decodings"])
-    if not cfg["decodings"] or set(cfg["decodings"]) - {"beam", "top_p"}:
-        raise ValueError("decodings: a list of 'beam' and / or 'top_p'")
+    if not cfg["decodings"] or set(cfg["decodings"]) - set(DECODINGS):
+        raise ValueError(f"decodings: a list of {DECODINGS}")
     return cfg
 
 
@@ -123,14 +128,15 @@ def prepare(encode, cfg: dict, encdec: bool, log=print) -> dict:
     return prep
 
 
-def gen_items(prep, split, n_docs, cfg):
-    items = [it for it in prep[f"{split}_items"] if n_docs is None or it["doc"] < n_docs]
+def gen_items(prep, split, n_docs, cfg, scale: float = 1.0):
+    items = [dict(it) for it in prep[f"{split}_items"] if n_docs is None or it["doc"] < n_docs]
     for it in items:
-        it["max_new"] = max(8, min(prep["tgt_tokens"], int(it["alloc"] * cfg["max_new_scale"] * cfg["length_scale"])))
+        it["max_new"] = max(8, min(prep["tgt_tokens"],
+                                   int(it["alloc"] * cfg["max_new_scale"] * cfg["length_scale"] * scale)))
     return items
 
 
-def summaries(prep, items, outs, docs, decode, cfg, special) -> tuple[dict, dict]:
+def summaries(prep, items, outs, docs, decode, cfg, special, scale: float = 1.0) -> tuple[dict, dict]:
     """(cleaned summary per document id, raw joined parts per id)."""
     parts: dict[int, list] = {}
     for it, o in zip(items, outs):
@@ -139,7 +145,7 @@ def summaries(prep, items, outs, docs, decode, cfg, special) -> tuple[dict, dict
     for di, ps in parts.items():
         d = docs[di]
         texts = [t for _, t in sorted(ps)]
-        mw = int(SD.predict_words(prep["length_model"], d["document"], cfg["length_scale"]) * 1.15)
+        mw = int(SD.predict_words(prep["length_model"], d["document"], cfg["length_scale"] * scale) * 1.15)
         clean[d["id"]] = SD.postprocess(texts, max_words=mw)
         raw[d["id"]] = " ".join(texts)
     return clean, raw
@@ -409,23 +415,27 @@ def run(bb, name: str = "model", decode=None, **overrides) -> dict:
 
     # ---------------------------------------------------------------- held-out + test
     def gen_kw(dname):
+        search, mf, _ = DECODINGS[dname]
         return dict(beams=cfg["beams"], no_repeat=cfg["no_repeat"], len_pen=cfg["len_pen"], batch=cfg["gen_batch"],
-                    min_frac=cfg["min_frac"], decoding=dname, top_p=cfg["top_p"], top_k=cfg["top_k"],
-                    temperature=cfg["temperature"], seed=cfg["seed"])
+                    min_frac=cfg["min_frac"] if mf is None else mf, decoding=search, top_p=cfg["top_p"],
+                    top_k=cfg["top_k"], temperature=cfg["temperature"], seed=cfg["seed"])
+    n_held = len({it["doc"] for it in held_items})
     hdocs = data["held"]
     decodings, best = {}, None
     held_s = 0.0
     for dname in cfg["decodings"]:                 # each decoding on the held-out documents; the best one is used
         t0 = time.time()
-        outs = gen.run(held_items, **gen_kw(dname))
-        clean, raw = summaries(prep, held_items, outs, hdocs, decode, cfg, special)
+        sc_len = DECODINGS[dname][2]
+        h_items = gen_items(prep, "held", n_held, cfg, sc_len)
+        outs = gen.run(h_items, **gen_kw(dname))
+        clean, raw = summaries(prep, h_items, outs, hdocs, decode, cfg, special, sc_len)
         used = [d for d in hdocs if d["id"] in clean]
         sc = SD.score_all([d["summary"] for d in used], [clean[d["id"]] for d in used], [d["document"] for d in used])
         sc_raw = SD.score_all([d["summary"] for d in used], [raw[d["id"]] for d in used])
         sec = time.time() - t0
         held_s += sec
         decodings[dname] = dict(held=sc, held_raw=sc_raw, seconds=sec)
-        label = "beam search" if dname == "beam" else "top-p sampling"
+        label = LABELS[dname]
         log(f"[held-out, {label}] " + SD.fmt(sc) + f"  ({len(used)} documents, {sec / 60:.1f} min)")
         log(f"[held-out, {label}] before clean-up: ROUGE-1 {sc_raw['rouge1']:.4f}, ROUGE-L {sc_raw['rougeL']:.4f}, "
             f"words {sc_raw['words_hyp']:.0f}, repeated trigrams {sc_raw['repetition3']:.1%}")
@@ -441,8 +451,9 @@ def run(bb, name: str = "model", decode=None, **overrides) -> dict:
     sub, test_s = None, 0.0
     if test_items:
         t0 = time.time()
+        test_items = gen_items(prep, "test", None, cfg, DECODINGS[best][2])
         outs = gen.run(test_items, log=log, **gen_kw(best))
-        tclean, traw = summaries(prep, test_items, outs, data["test"], decode, cfg, special)
+        tclean, traw = summaries(prep, test_items, outs, data["test"], decode, cfg, special, DECODINGS[best][2])
         sub = SD.write_submission(data["test"], tclean, os.path.join(out, "submission"), fallback=traw)
         with open(os.path.join(out, "test_summaries.json"), "w", encoding="utf-8") as f:
             json.dump(tclean, f, ensure_ascii=False)
@@ -486,8 +497,8 @@ def load_metrics(out_dir: str, run_name: str) -> dict | None:
 
 
 def comparison(rows: list[dict]) -> str:
-    hdr = (f"{'run':28s} {'trained':>9s} {'share':>7s} {'decode':>6s} {'R-1':>7s} {'R-2':>7s} {'R-L':>7s} {'words':>6s} "
-           f"{'ref':>6s} {'rep3':>6s} {'new2':>6s} {'beam':>7s} {'top-p':>7s} {'epochs':>6s} {'train':>7s}")
+    hdr = (f"{'run':28s} {'trained':>9s} {'share':>7s} {'decode':>9s} {'R-1':>7s} {'R-2':>7s} {'R-L':>7s} {'words':>6s} "
+           f"{'ref':>6s} {'rep3':>6s} {'new2':>6s} {'beam':>7s} {'top-p':>7s} {'long':>7s} {'epochs':>6s} {'train':>7s}")
     lines = [hdr, "-" * len(hdr)]
     for m in sorted(rows, key=lambda m: -m["held"]["rouge_mean"]):
         h = m["held"]
@@ -496,12 +507,13 @@ def comparison(rows: list[dict]) -> str:
         def rm(k):
             return f"{dec[k]['held']['rouge_mean']:7.4f}" if k in dec else f"{'-':>7s}"
         lines.append(f"{m['run_name']:28s} {m['trainable_params'] / 1e6:8.2f}M {m['trainable_share']:7.2%} "
-                     f"{str(m.get('decoding', 'beam')):>6s} {h['rouge1']:7.4f} {h['rouge2']:7.4f} {h['rougeL']:7.4f} "
+                     f"{str(m.get('decoding', 'beam')):>9s} {h['rouge1']:7.4f} {h['rouge2']:7.4f} {h['rougeL']:7.4f} "
                      f"{h['words_hyp']:6.0f} {h['words_ref']:6.0f} {h['repetition3']:6.1%} "
-                     f"{h.get('novel_bigrams', math.nan):6.1%} {rm('beam')} {rm('top_p')} {m['epochs_done']:6.2f} "
+                     f"{h.get('novel_bigrams', math.nan):6.1%} {rm('beam')} {rm('top_p')} {rm('beam_long')} {m['epochs_done']:6.2f} "
                      f"{m['train_seconds'] / 60:6.1f}m")
     lines.append("decode: the decoding chosen on the held-out documents and used for the test summaries; R-1 / R-2 / "
                  "R-L: ROUGE F1 on held-out training documents with it (our scorer, word level, no stemming); words: "
                  "mean summary length (ref = reference); rep3: repeated trigrams; new2: word pairs not in the document "
-                 "(how abstractive); beam / top-p: (ROUGE-1 + ROUGE-L) / 2 with each decoding.")
+                 "(how abstractive); beam / top-p / long: (ROUGE-1 + ROUGE-L) / 2 with each decoding (long = beam search, "
+                 "each window writes at least half of a 30% larger length budget).")
     return "\n".join(lines)

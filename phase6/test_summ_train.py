@@ -113,7 +113,7 @@ def test_batches():
 def _check(res, n_test, tech):
     m, out = res["metrics"], res["out_dir"]
     assert {"held", "held_raw", "trainable_params", "steps", "submission", "decoding", "decodings"} <= set(m), m.keys()
-    assert set(m["decodings"]) == {"beam", "top_p"} and m["decoding"] in m["decodings"]
+    assert {"beam", "top_p"} <= set(m["decodings"]) and m["decoding"] in m["decodings"]
     assert m["held"]["rouge_mean"] == max(v["held"]["rouge_mean"] for v in m["decodings"].values())
     assert len(m["val_history"]) >= 2 and 0 <= m["best_epoch"] <= len(m["val_history"]), m["val_history"]
     rows = json.loads(zipfile.ZipFile(os.path.join(out, "submission", "submission.zip")).read("prediction.json"))
@@ -147,7 +147,8 @@ def test_runs_kd_deadline_report():
                 assert any(k.startswith("copy.") for k in st_), list(st_)[:5]
         # knowledge distillation: half-size student (evenly spaced blocks) with the llama_full teacher
         st = S.run(bb_of("llama"), name="llama", technique="full", run_name="llama_student_kd", decode=dec,
-                   student_layers=0.5, kd_teacher=r["out_dir"], **common)
+                   student_layers=0.5, kd_teacher=r["out_dir"], decodings=("beam", "top_p", "beam_long"), **common)
+        assert set(st["metrics"]["decodings"]) == {"beam", "top_p", "beam_long"}
         ms = st["metrics"]
         assert ms["student"]["kept"] == [0, 2] and ms["total_params"] < r["metrics"]["total_params"], ms["student"]
         assert ms["kd"]["teacher_technique"] == "full" and all(x["kd"] is not None for x in ms["history"])
