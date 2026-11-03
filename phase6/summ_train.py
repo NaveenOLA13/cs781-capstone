@@ -248,6 +248,7 @@ def run(bb, name: str = "model", decode=None, **overrides) -> dict:
     model = copy.deepcopy(bb.model)
     student = SM.make_student(model, cfg["student_layers"], log) if cfg["student_layers"] else None
     wrap = SM.Wrap(model).to(device).float()
+    wrap.train()                                  # Phase 1 checkpoints are loaded in eval mode
     long_ = [p for p in pairs if len(p["src"]) >= 48 and p["tgt"]]
     probe = ([dict(src=list(p["src"][:48]), tgt=list(p["tgt"][:16])) for p in long_[:2]] if long_ else
              [dict(src=list(pairs[0]["src"]), tgt=list(pairs[0]["tgt"][:16]) or [eos])])

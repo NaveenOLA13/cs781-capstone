@@ -45,7 +45,9 @@ class ToyEncDecE(TOYS["encdec"]):
 def bb_of(kind):
     torch.manual_seed(1)
     model = ToyEncDecE() if kind == "encdec_e" else TOYS[kind]()
-    return make_backbone(model, WordTok(), max_len=128, verbose=False)
+    bb = make_backbone(model, WordTok(), max_len=128, verbose=False)
+    bb.model.eval()                 # as cj_models.load_model returns the real checkpoints (cuDNN RNNs: eval mode!)
+    return bb
 
 
 def word_decoder(root):

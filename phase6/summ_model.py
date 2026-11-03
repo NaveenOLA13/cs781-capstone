@@ -251,6 +251,8 @@ def used_params(wrap, probe, ids, device) -> set[str]:
     """Names of the Phase 1 parameters that get a gradient from the summarization loss."""
     m = wrap.model
     flags = {n: p.requires_grad for n, p in m.named_parameters()}
+    was = wrap.training
+    wrap.train()                    # cuDNN RNNs refuse a backward pass in eval mode (checkpoints load in eval mode)
     for p in m.parameters():
         p.requires_grad_(True)
     m.zero_grad(set_to_none=True)
@@ -260,6 +262,7 @@ def used_params(wrap, probe, ids, device) -> set[str]:
     m.zero_grad(set_to_none=True)
     for n, p in m.named_parameters():
         p.requires_grad_(flags[n])
+    wrap.train(was)
     return used
 
 
