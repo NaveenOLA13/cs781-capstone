@@ -17,6 +17,11 @@ Phase 1 model are trained; the classification head (pooling + linear layer) is a
   adalora   AdaLoRA (Zhang et al. 2023): W0 + alpha/r0 * P diag(lambda) Q with a total rank budget that
             shrinks during training; rank is kept where it matters most (importance scores)
   adapter   a bottleneck layer after every block, x + up(gelu(down(x))) with d -> 64 -> d, starts as identity
+  ia3       (IA)^3 (Liu et al. 2022, T-Few): learned vectors (start at 1) that multiply activations channel-wise;
+            the Phase 1 weights stay fixed. On every linear layer of the blocks: its output (attention projections,
+            the first feed-forward layer) or, for layers that shrink the width (the second feed-forward layer), its
+            input = the feed-forward hidden activations, as in the paper; on RNN layers: their outputs. Tiny layers
+            (fewer than 32 inputs or outputs, e.g. MoE routers) are left alone.
 
 "Blocks" are the repeated layers of a transformer (an nn.ModuleList); for the encoder-decoder, whose encoder
 is a bidirectional RNN, the RNN layers play that role. LoRMA and AdaLoRA also change RNN weight matrices
@@ -36,9 +41,10 @@ import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
 
-TECHNIQUES = ("frozen", "full", "partial", "unfreeze", "bitfit", "lorma", "adalora", "adapter", "lora", "qlora")
+TECHNIQUES = ("frozen", "full", "partial", "unfreeze", "bitfit", "lorma", "adalora", "adapter", "lora", "qlora",
+              "ia3")
 BODY_LR = {"frozen": None, "full": 3e-5, "partial": 3e-5, "unfreeze": 3e-5, "bitfit": 5e-4,
-           "lorma": 5e-4, "adalora": 5e-4, "adapter": 1e-3, "lora": 5e-4, "qlora": 5e-4}
+           "lorma": 5e-4, "adalora": 5e-4, "adapter": 1e-3, "lora": 5e-4, "qlora": 5e-4, "ia3": 3e-3}
 TECH_DEFAULTS = dict(
     partial_frac=1 / 3,          # partial: share of the blocks (from the top) that are trained
     unfreeze_stages=4,           # unfreeze: number of stages (stage 0 = head only)
@@ -49,6 +55,8 @@ TECH_DEFAULTS = dict(
     adapter_dim=64,
     lora_r=8, lora_alpha=16.0,   # LoRA / QLoRA rank and alpha (scale alpha / r)
     qlora_block=64,              # QLoRA: values per quantisation block (one scale each)
+    ia3_min_dim=32,              # (IA)^3: linear layers with fewer inputs or outputs are left alone (routers)
+    rnn_cudnn=False,             # low-rank on RNN weights: keep cuDNN (weights refreshed before every call)
 )
 LOW_RANK = ("lorma", "adalora", "lora", "qlora")       # techniques that parametrize weight matrices
 _RNN_LAYER = re.compile(r"_l(\d+)(_reverse)?$")
@@ -401,17 +409,87 @@ def _first_tensor(out):
     return None
 
 
-def _rnn_without_cudnn(rnn: nn.RNNBase) -> None:
-    """Parametrized RNN weights are recomputed every call; cuDNN would copy them into its own flat buffer, so
-    it is switched off for this RNN and its weight list is refreshed before every call."""
+def _rnn_without_cudnn(rnn: nn.RNNBase, keep_cudnn: bool = False) -> None:
+    """Parametrized RNN weights are recomputed every call, so the RNN's weight list is refreshed before every call.
+    keep_cudnn=False: cuDNN is switched off for this RNN (slow on long inputs). keep_cudnn=True: cuDNN copies the
+    fresh weights into its own buffer at every call (gradients still reach them; much faster)."""
     orig = rnn.forward
 
     def forward(*args, **kwargs):
+        rnn._init_flat_weights()
+        if keep_cudnn:
+            return orig(*args, **kwargs)
         with torch.backends.cudnn.flags(enabled=False):
-            rnn._init_flat_weights()
             return orig(*args, **kwargs)
 
     rnn.forward = forward
+
+
+# ---------------------------------------------------------------------------- (IA)^3
+class IA3(nn.Module):
+    """A learned vector l (starts at 1, so no change at the start) that multiplies a tensor channel-wise."""
+
+    def __init__(self, d: int):
+        super().__init__()
+        self.l = nn.Parameter(torch.ones(d))
+
+    def forward(self, x):
+        return x * self.l.to(x.dtype)
+
+
+def _ia3_out_hook(vec):
+    from torch.nn.utils.rnn import PackedSequence
+
+    def scale(t):
+        if isinstance(t, PackedSequence):
+            return t._replace(data=vec(t.data))
+        return vec(t)
+
+    def hook(mod, args, out):
+        if torch.is_tensor(out) or isinstance(out, PackedSequence):
+            return scale(out)
+        if isinstance(out, (tuple, list)) and out and (torch.is_tensor(out[0]) or isinstance(out[0], PackedSequence)):
+            return type(out)([scale(out[0])] + list(out[1:])) if isinstance(out, list) else \
+                (scale(out[0]),) + tuple(out[1:])
+        raise RuntimeError(f"(IA)^3: cannot handle an output of type {type(out).__name__}")
+    return hook
+
+
+def _ia3_in_hook(vec):
+    def hook(mod, args):
+        return (vec(args[0]),) + tuple(args[1:])
+    return hook
+
+
+def apply_ia3(clf: nn.Module, model: nn.Module, used: set[str], cfg: dict, log=print) -> Hooks:
+    lin = [(n, m) for n, m, _ in targets(model, used) if isinstance(m, nn.Linear)
+           and min(m.in_features, m.out_features) >= cfg["ia3_min_dim"]]
+    rnns = rnn_modules(model, used)
+    if not lin and not rnns:
+        raise RuntimeError("(IA)^3: no linear layers or RNN modules found")
+    vecs, n_in, n_out = [], 0, 0
+    dev = next(model.parameters()).device
+    for _, m in lin:
+        if m.in_features > m.out_features:             # second feed-forward layer: scale its input
+            v = IA3(m.in_features).to(dev)
+            m.register_forward_pre_hook(_ia3_in_hook(v))
+            n_in += 1
+        else:
+            v = IA3(m.out_features).to(dev)
+            m.register_forward_hook(_ia3_out_hook(v))
+            n_out += 1
+        vecs.append(v)
+    for _, r in rnns:
+        v = IA3(r.hidden_size * (2 if r.bidirectional else 1)).to(dev)
+        r.register_forward_hook(_ia3_out_hook(v))
+        vecs.append(v)
+    clf.ia3 = nn.ModuleList(vecs)
+    hooks = Hooks("ia3", list(clf.ia3.parameters()),
+                  dict(vectors=len(vecs), linear_out=n_out, linear_in=n_in, rnn=len(rnns),
+                       values=sum(v.l.numel() for v in vecs)))
+    log(f"[technique] (IA)^3: {len(vecs)} learned scaling vectors ({n_out} on linear-layer outputs, {n_in} on the "
+        f"inputs of width-reducing linear layers, {len(rnns)} on RNN outputs), {hooks.info['values']} values")
+    return hooks
 
 
 # ---------------------------------------------------------------------------- apply
@@ -488,7 +566,10 @@ def apply(clf: nn.Module, technique: str, used: set[str], cfg: dict, total_steps
             if isinstance(m, nn.RNNBase):
                 rnns[id(m)] = m
         for r in rnns.values():
-            _rnn_without_cudnn(r)
+            _rnn_without_cudnn(r, keep_cudnn=bool(cfg["rnn_cudnn"]))
+        if rnns:
+            log(f"[technique] {len(rnns)} RNN module(s) with changed weights: cuDNN "
+                + ("kept (weights copied at every call)" if cfg["rnn_cudnn"] else "switched off for them"))
         n_lin = sum(1 for _, m, _ in tg if isinstance(m, nn.Linear))
         if technique in ("lora", "qlora"):
             info = dict(matrices=len(mods), linear=n_lin, rnn=len(mods) - n_lin, r=cfg["lora_r"],
@@ -514,6 +595,8 @@ def apply(clf: nn.Module, technique: str, used: set[str], cfg: dict, total_steps
             hooks = AdaLoRAHooks(mods, total_steps, cfg)
             log(f"[technique] AdaLoRA on {len(mods)} weight matrices ({n_lin} linear, {len(mods) - n_lin} RNN): "
                 f"rank {cfg['adalora_r0']} each at the start, {cfg['adalora_r']} on average at the end")
+    elif technique == "ia3":
+        hooks = apply_ia3(clf, model, used, cfg, log)
     else:  # adapter
         found = blocks_of(model, used)
         if found:

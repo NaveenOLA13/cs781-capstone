@@ -138,12 +138,6 @@ def test_scores_by_hand():
     assert abs(s["macro_f1"] - (fa + fb) / 3) < 1e-9 and s["confusion"][2][1] == 1
     s2 = D.scores([0, 1], [0, 1], labels)                 # C absent from gold and pred
     assert s2["macro_f1"] == 1.0 and abs(s2["macro_f1_all13"] - 2 / 3) < 1e-9
-    try:
-        from sklearn.metrics import f1_score
-        assert abs(f1_score(gold, pred, average="macro") - s["macro_f1"]) < 1e-9
-        print("      matches sklearn f1_score(average='macro')")
-    except ImportError:
-        pass
 
 
 def test_evaluate_report_and_submission():

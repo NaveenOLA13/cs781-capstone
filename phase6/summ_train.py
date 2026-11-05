@@ -179,9 +179,9 @@ def valid_loss(wrap, pairs, ids, device, batch_size, encdec, amp) -> float:
 
 
 def default_decode(log=print):
-    """ids -> text for the bpe12k tokenizer: its own decode() if it has one and it round-trips, else the
-    tokenizers library on the same tokenizer.json, else the vocabulary of tokenizer.json read directly (byte-level
-    or 'Ġ' / '▁' word markers). Checked on a sample sentence."""
+    """ids -> text for our bpe12k tokenizer: its own decode() if it has one and it round-trips, else the
+    vocabulary of our tokenizer.json read directly by our own code (byte-level or 'Ġ' / '▁' word markers). No
+    tokenizer library is used. Checked on a sample sentence."""
     from cj_models import load_tokenizer, tokenizer_candidates
     from rr_backbone import make_encode
     tok = load_tokenizer(log)
@@ -198,12 +198,6 @@ def default_decode(log=print):
         cands.append(("tokenizer.decode", lambda ids: tok.decode(list(ids))))
     files = [c for c in tokenizer_candidates() if c.endswith(".json") and os.path.isfile(c)]
     for path in files[:1]:
-        try:
-            from tokenizers import Tokenizer
-            hf = Tokenizer.from_file(path)
-            cands.append(("tokenizers library", lambda ids, hf=hf: hf.decode(list(ids))))
-        except Exception:  # noqa: BLE001
-            pass
         try:
             with open(path, encoding="utf-8") as f:
                 vocab = json.load(f)["model"]["vocab"]
