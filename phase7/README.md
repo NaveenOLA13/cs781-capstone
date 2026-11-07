@@ -25,6 +25,7 @@ Rules followed:
 | Fusion (learning to rank) | Per query, BM25 top 100 plus our model's top 50 candidates; features (each standardised within the query): BM25 1-5-gram scores, their average and its rank, year features, citation counts, our model's mean / maxsim scores and ranks. Logistic regression (and coordinate ascent on the number of hits in the top 7, started from it). Measured by 5-fold cross-fitting on dev; the test ranker is fitted on all of dev (our model's scores on the training queries are too good to fit on). | `pcr_data.fused_submission` |
 | Knowledge distillation | Teacher: the better of the full / LoRMA runs on dev (its case vectors of the training split are saved). Student: the same (mid-trained) model with half of its blocks, evenly spaced (encoder-decoder: half of its GRU layers), trained with 0.5 x InfoNCE + 0.5 x KL(teacher || student) between the teacher's and the student's similarity distributions over the batch's candidates (listwise; Margin-MSE also available). The same student without the teacher is trained for comparison. | `pcr_grid.run_kd` |
 | Ensembles | Several runs: the average of their per-query standardised scores as features of the same ranker. | `pcr_grid.ensemble` |
+| Final ranking (07/11, CPU) | Exact judgment dates from the header (DATE OF JUDGMENT, else CITATION year, else the latest year outside CITATOR INFO): candidates certainly decided after the query removed. Votes of the 20 most similar labelled queries (BM25 3-5-grams between query texts) for the cases they cite. Citation contexts: the 40 words before and after each `<CITATION>` mask in the query (masks are in every query) are short queries about one cited case; BM25 2-/3-gram scores of the best-matching context and of all contexts together (He et al. 2010, context-aware citation recommendation). Candidates from the 3/4/5-gram and averaged BM25 lists, the votes, the contexts and each model score. Our scores: per model the average of its 4 best runs (mean, maxsim, maxsim_sym), and the average over the four models. Citation strings in the headnotes (variants with / without): the query's own AIR citation listed in a candidate's CITATOR INFO, a candidate's citation written in the query, later cases that cited both; this uses the publisher's citator metadata and is reported separately. Rankers: logistic regression, pairwise logistic regression, coordinate ascent; 48 variants compared by 5-fold cross-fitting on dev; the best written as named submissions. | `pcr_final.py` |
 | Time control | `finish_by`: each run measures its encoding and training speed, fewer chunks per case for the final encoding if needed, and trains only the steps that fit. | `pcr_train.py` |
 
 ## Files
@@ -34,6 +35,7 @@ Rules followed:
 - `pcr_train.py`: one model + one technique (or a KD student); `comparison()` table.
 - `pcr_grid.py`: `run_grid`, `run_variants`, `run_kd`, `best_run`, `ensemble`, `report` (one worker process per GPU).
 - `pcr_mid.py`: mid-training.
+- `pcr_final.py` (no torch): the final ranking over all runs' saved scores; `test_pcr_final.py`.
 - Tests: `test_pcr_data.py` (no torch), `test_pcr_train.py` (tiny stand-in models; the notebook runs both first).
 
 ## Research basis
@@ -49,4 +51,5 @@ Rules followed:
 - Liu et al. 2022, (IA)^3 / T-Few. https://arxiv.org/abs/2205.05638
 - Dettmers et al. 2023, QLoRA; Bihany, Patel & Modi 2025, LoRMA.
 - Metzler & Croft 2007, coordinate ascent for learning to rank.
+- He et al. 2010 (WWW), context-aware citation recommendation: the text around a citation placeholder as the query.
 - Gao et al. 2021, gradient caching / memory-efficient contrastive training (here: gradient checkpointing).
