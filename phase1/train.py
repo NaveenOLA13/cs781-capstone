@@ -1,14 +1,6 @@
-"""Pretrain a language model from scratch on the token files from prepare_data.py.
+"""Pretrain a language model from scratch on the token files from prepare_data.py."""
 
-    python train.py --config configs/decoder_80m.yaml
-    python train.py --config configs/decoder_80m.yaml --set train.max_steps=50 train.eval_every=25   # quick test
-    python train.py --config configs/decoder_80m.yaml --resume /kaggle/input/<prev-run>/runs/<name>/last.pt
-
-Everything that defines an experiment is in the YAML config (copied into the run folder).
-Outputs in runs/<run_name>/: config.yaml, log.jsonl, last.pt (resume), best.pt (weights only).
-"""
 import argparse
-import copy
 import json
 import math
 import os
@@ -23,10 +15,10 @@ from data import TokenData
 from models import build_model, count_params, init_weights
 
 
-# ---------------------------------------------------------------------- config helpers
+# --- config helpers
 def load_config(path, overrides):
     cfg = yaml.safe_load(open(path))
-    for o in overrides:                                   # e.g. train.lr=3e-4
+    for o in overrides:
         key, val = o.split("=", 1)
         d = cfg
         *parents, last = key.split(".")
@@ -51,11 +43,11 @@ def make_optimizer(model, t):
         if not p.requires_grad:
             continue
         (decay if p.dim() >= 2 else no_decay).append(p)
-    groups = [{"params": decay, "weight_decay": t["weight_decay"]},
-              {"params": no_decay, "weight_decay": 0.0}]
+    groups = [{"params": decay, "weight_decay": t["weight_decay"]}, {"params": no_decay, "weight_decay": 0.0}]
     fused = torch.cuda.is_available()
-    return torch.optim.AdamW(groups, lr=t["lr"], betas=tuple(t["betas"]), eps=1e-8,
-                             **({"fused": True} if fused else {}))
+    return torch.optim.AdamW(
+        groups, lr=t["lr"], betas=tuple(t["betas"]), eps=1e-8, **({"fused": True} if fused else {})
+    )
 
 
 def lm_loss(model, x, y):
@@ -82,7 +74,7 @@ def evaluate(model, data, t, device, amp_ctx):
     return float(np.mean(losses))
 
 
-# ---------------------------------------------------------------------- main
+# --- main
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -101,14 +93,14 @@ def main():
     os.makedirs(out, exist_ok=True)
     yaml.safe_dump(cfg, open(os.path.join(out, "config.yaml"), "w"), sort_keys=False)
 
-    # ---- data + model
+    # --- data + model
     data = TokenData(d["dir"], d["block_size"], d["weights"], seed=t["seed"])
     model = build_model(cfg["arch"], cfg["model"], data.vocab_size)
     if t.get("init_std"):
         init_weights(model, t["init_std"])
     model = model.to(device)
     n_params = count_params(model)
-    print(f"[train] {cfg['arch']} params={n_params/1e6:.2f}M device={device}")
+    print(f"[train] {cfg['arch']} params={n_params / 1e6:.2f}M device={device}")
     print(f"[train] data mix: {data.describe()}")
     assert 50e6 <= n_params <= 300e6 or cfg.get("allow_any_size"), "capstone rule: 50M-300M params"
 
@@ -126,24 +118,32 @@ def main():
         scaler.load_state_dict(ck["scaler"])
         step, best_val, tokens_seen = ck["step"], ck["best_val"], ck["tokens_seen"]
         elapsed_prev = ck.get("elapsed", 0.0)
-        data.rng = np.random.default_rng(t["seed"] + step)   # new windows after resume
+        data.rng = np.random.default_rng(t["seed"] + step)
         print(f"[train] resumed from {a.resume} at step {step}")
 
     tokens_per_step = t["batch_size"] * t["grad_accum"] * d["block_size"]
-    print(f"[train] tokens/step={tokens_per_step:,}  max_steps={t['max_steps']:,}  "
-          f"=> {tokens_per_step * t['max_steps'] / 1e9:.3f}B tokens planned")
+    print(
+        f"[train] tokens/step={tokens_per_step:,}  max_steps={t['max_steps']:,}  "
+        f"=> {tokens_per_step * t['max_steps'] / 1e9:.3f}B tokens planned"
+    )
     log = open(os.path.join(out, "log.jsonl"), "a")
 
     def save(path, full=True):
-        state = {"model": model.state_dict(), "config": cfg, "step": step, "best_val": best_val,
-                 "tokens_seen": tokens_seen, "vocab_size": data.vocab_size,
-                 "elapsed": elapsed_prev + time.time() - t_start}
+        state = {
+            "model": model.state_dict(),
+            "config": cfg,
+            "step": step,
+            "best_val": best_val,
+            "tokens_seen": tokens_seen,
+            "vocab_size": data.vocab_size,
+            "elapsed": elapsed_prev + time.time() - t_start,
+        }
         if full:
             state.update(opt=opt.state_dict(), scaler=scaler.state_dict())
         torch.save(state, path + ".tmp")
-        os.replace(path + ".tmp", path)                       # never leaves a half-written file
+        os.replace(path + ".tmp", path)
 
-    # ---- loop
+    # --- loop
     model.train()
     t_start = t_log = time.time()
     tok_since_log = 0
@@ -171,20 +171,27 @@ def main():
 
         if step % t["log_every"] == 0:
             now = time.time()
-            rec = {"step": step, "tokens": tokens_seen, "loss": round(loss_acc, 4), "lr": lr,
-                   "gnorm": round(gnorm, 3), "tok_per_s": int(tok_since_log / (now - t_log)),
-                   "elapsed_h": round((elapsed_prev + now - t_start) / 3600, 3)}
+            rec = {
+                "step": step,
+                "tokens": tokens_seen,
+                "loss": round(loss_acc, 4),
+                "lr": lr,
+                "gnorm": round(gnorm, 3),
+                "tok_per_s": int(tok_since_log / (now - t_log)),
+                "elapsed_h": round((elapsed_prev + now - t_start) / 3600, 3),
+            }
             print(json.dumps(rec), flush=True)
-            log.write(json.dumps(rec) + "\n"); log.flush()
+            log.write(json.dumps(rec) + "\n")
+            log.flush()
             t_log, tok_since_log = now, 0
 
         stop = (time.time() - t_start) > time_limit
         if step % t["eval_every"] == 0 or step == t["max_steps"] or stop:
             vl = evaluate(model, data, t, device, amp_ctx)
-            rec = {"step": step, "tokens": tokens_seen, "val_loss": round(vl, 4),
-                   "val_ppl": round(math.exp(vl), 2)}
+            rec = {"step": step, "tokens": tokens_seen, "val_loss": round(vl, 4), "val_ppl": round(math.exp(vl), 2)}
             print("[eval]", json.dumps(rec), flush=True)
-            log.write(json.dumps(rec) + "\n"); log.flush()
+            log.write(json.dumps(rec) + "\n")
+            log.flush()
             if vl < best_val:
                 best_val = vl
                 save(os.path.join(out, "best.pt"), full=False)
@@ -193,7 +200,7 @@ def main():
             print(f"[train] time limit reached at step {step}; resume with --resume {out}/last.pt")
             break
 
-    print(f"[train] done. step={step} tokens={tokens_seen/1e9:.3f}B best_val={best_val:.4f}")
+    print(f"[train] done. step={step} tokens={tokens_seen / 1e9:.3f}B best_val={best_val:.4f}")
 
 
 if __name__ == "__main__":

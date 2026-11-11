@@ -1,12 +1,5 @@
-"""Self-test of the PEFT code (rr_peft.py and its use in rr_train.py / rr_cv.py) on tiny stand-in
-models and fake data. Needs torch and peft. About a minute on GPU or CPU.
-    python test_rr_peft.py   -> every line PASS
+"""Self-test of the PEFT code (rr_peft.py and its use in rr_train.py / rr_cv.py) on tiny stand-in models and fake data."""
 
-Checks: which layers get adapters (LoRA family: every Linear but the LM head; IA3: key, value and the
-feed-forward down-projection), a full run per method (LoRA, rsLoRA, AdaLoRA, IA3) with the right number
-of trained weights, Phase 1 weights unchanged, adapters changed, AdaLoRA rank budget applied, only the
-adapters saved, run_methods (comparison, re-use of finished runs, a failing method), and cross-validation.
-"""
 import json
 import math
 import os
@@ -26,11 +19,11 @@ from test_rr_data import make_fake_data  # noqa: E402
 from test_rr_pipeline import D_, V, ToyEncDec, ToyGPT, _bb  # noqa: E402
 
 torch.manual_seed(0)
-HEAD = (D_ + 32) * 13 + 13 + 10 * 32            # Linear(d + position 32 -> 13) + position table 10 x 32
+HEAD = (D_ + 32) * 13 + 13 + 10 * 32
 FAST = dict(epochs=3, b_epochs=2, batch_size=16, max_len=32, lr_head=3e-3, log_every=0)
 
 
-# --------------------------------------------------------------- a Llama-style toy model
+# --- a Llama-style toy model
 class Attention(nn.Module):
     def __init__(self, d):
         super().__init__()
@@ -43,7 +36,7 @@ class Attention(nn.Module):
         return self.wo(att.softmax(-1) @ self.wv(x))
 
 
-class FeedForward(nn.Module):                     # SwiGLU: w2(silu(w1 x) * w3 x)
+class FeedForward(nn.Module):
     def __init__(self, d, hidden):
         super().__init__()
         self.w1 = nn.Linear(d, hidden, bias=False)
@@ -82,10 +75,12 @@ class ToyLlama(nn.Module):
         return self.output(self.norm(x))
 
 
-# ------------------------------------------------------------------------------- tests
+# --- tests
 def test_compact_names():
     assert P.compact(["layers.0.attention.wq", "layers.1.attention.wq", "h.0.ff.2"]) == [
-        "layers.*.attention.wq (2)", "h.*.ff.2 (1)"]
+        "layers.*.attention.wq (2)",
+        "h.*.ff.2 (1)",
+    ]
 
 
 def test_choose_targets():
@@ -95,7 +90,7 @@ def test_choose_targets():
     t, ff, note = P.choose_targets(llama, "ia3", D_, V)
     assert t == [f"layers.{i}.{n}" for i in (0, 1) for n in ("attention.wk", "attention.wv", "feed_forward.w2")], t
     assert ff == ["layers.0.feed_forward.w2", "layers.1.feed_forward.w2"] and "key and value" in note, (ff, note)
-    gpt = ToyGPT()                                                 # fused qkv, tied LM head
+    gpt = ToyGPT()
     t, _, _ = P.choose_targets(gpt, "lora", D_, V)
     assert len(t) == 8 and "lm_head" not in t, t
     t, ff, note = P.choose_targets(gpt, "ia3", D_, V)
@@ -117,11 +112,11 @@ def _expected_trainable(model, method, cfg_r=8, init_r=12):
     n = 0
     for t in targets:
         i, o = mods[t].in_features, mods[t].out_features
-        if method == "ia3":                 # one scale per input (feed-forward) or per output
+        if method == "ia3":
             n += i if t in ff else o
-        elif method == "adalora":           # P (r x in), Q (out x r), E (r)
+        elif method == "adalora":
             n += init_r * (i + o + 1)
-        else:                               # LoRA / rsLoRA: A (r x in), B (out x r)
+        else:
             n += cfg_r * (i + o)
     return n + HEAD, targets
 
@@ -150,14 +145,13 @@ def test_each_method_runs():
             assert m["stage_a"]["trainable_params"] == want, (method, m["stage_a"]["trainable_params"], want)
             assert m["config"]["lr_peft"] == P.DEFAULT_LR[method] and m["stage_a"]["method"] == method
             assert set(m["stage_a"]["dev"]) == {"all", "CL", "IT"}
-            for k, v in model.state_dict().items():                      # the original model is untouched
+            for k, v in model.state_dict().items():
                 assert torch.equal(v.cpu(), before[k]), f"{method}: original weights changed: {k}"
             trained = res["stage_a"].encoder.model
             mods = dict(trained.named_modules())
-            for t in targets:                                             # Phase 1 weights inside: unchanged
+            for t in targets:
                 assert torch.equal(mods[t].base_layer.weight.detach().cpu(), before[t + ".weight"]), (method, t)
             assert torch.equal(trained.tok_embeddings.weight.detach().cpu(), before["tok_embeddings.weight"])
-            # the adapters did change
             if method in ("lora", "rslora"):
                 assert any(mods[t].lora_B["default"].weight.abs().sum() > 0 for t in targets), method
                 scale = 16 / 8 if method == "lora" else 16 / math.sqrt(8)
@@ -165,7 +159,7 @@ def test_each_method_runs():
             elif method == "ia3":
                 assert any((mods[t].ia3_l["default"] - 1).abs().sum() > 0 for t in targets)
                 assert [t for t in targets if mods[t].is_feedforward] == [t for t in targets if "w2" in t]
-            else:                                                         # adalora
+            else:
                 hooks = res["stage_a"].peft_hooks
                 total = hooks.total_steps
                 assert 0 < hooks.step <= total and hooks.step >= total - int(0.2 * total), (hooks.step, total)
@@ -175,17 +169,20 @@ def test_each_method_runs():
                 assert any(mods[t].lora_E["default"].abs().sum() > 0 for t in targets)
                 reg = hooks.extra_loss()
                 assert torch.is_tensor(reg) and reg.item() >= 0
-            # only the small trained part is saved
             assert not os.path.exists(os.path.join(out, "stageA_model.pt"))
             saved = torch.load(os.path.join(out, "stageA_adapter.pt"), map_location="cpu", weights_only=False)
             keys = list(saved["trained_weights"])
-            assert keys and all(("lora_" in k or "ia3_" in k or ".ranknum." in k
-                                 or k.split(".")[0] in ("pool", "head", "pos_emb")) for k in keys), keys
+            assert keys and all(
+                ("lora_" in k or "ia3_" in k or ".ranknum." in k or k.split(".")[0] in ("pool", "head", "pos_emb"))
+                for k in keys
+            ), keys
             assert saved["peft_config"] is not None
             assert m["stage_a"]["saved_mb"] < 1.0
             a13, b13 = (m[s]["dev"]["all"]["macro_f1_all13"] for s in ("stage_a", "stage_b"))
-            print(f"      {method:8s} trainable {m['stage_a']['trainable_params']:6d} (incl. head), "
-                  f"dev 13-role avg A {a13:.3f} B {b13:.3f} (fake data)")
+            print(
+                f"      {method:8s} trainable {m['stage_a']['trainable_params']:6d} (incl. head), "
+                f"dev 13-role avg A {a13:.3f} B {b13:.3f} (fake data)"
+            )
 
 
 def test_lora_on_tied_gpt():
@@ -193,11 +190,17 @@ def test_lora_on_tied_gpt():
         data = make_fake_data(os.path.join(tmp, "data"), n_train=3)
         model = ToyGPT()
         before = {k: v.clone() for k, v in model.state_dict().items()}
-        res = run(_bb(model), data_root=data, out_dir=os.path.join(tmp, "runs"), run_name="g", method="lora",
-                  **{**FAST, "epochs": 1})
+        res = run(
+            _bb(model),
+            data_root=data,
+            out_dir=os.path.join(tmp, "runs"),
+            run_name="g",
+            method="lora",
+            **{**FAST, "epochs": 1},
+        )
         trained = res["stage_a"].encoder.model
         assert isinstance(trained.lm_head, nn.Linear) and not hasattr(trained.lm_head, "base_layer")
-        assert trained.lm_head.weight is trained.wte.weight                   # still tied
+        assert trained.lm_head.weight is trained.wte.weight
         assert torch.equal(trained.wte.weight.detach().cpu(), before["wte.weight"])
         assert res["metrics"]["stage_a"]["trainable_params"] == _expected_trainable(ToyGPT(), "lora")[0]
 
@@ -216,7 +219,7 @@ def test_run_methods_compare_reuse_and_failure():
         rows = json.load(open(os.path.join(out, "t_comparison.json")))
         assert rows["frozen"]["trainable"] == HEAD < rows["lora"]["trainable"]
         assert rows["lora"]["peft"]["layers"] == 14 and os.path.exists(rows["lora"]["submission"])
-        again = P.run_methods(bb, methods=("frozen", "lora"), prefix="t", **common)        # read, not retrained
+        again = P.run_methods(bb, methods=("frozen", "lora"), prefix="t", **common)
         assert again["lora"]["stage_a"]["trainable_params"] == res["lora"]["stage_a"]["trainable_params"]
         bad = P.run_methods(_bb(ToyEncDec()), methods=("frozen", "lora"), prefix="ed", **common)
         assert bad["lora"] is None and bad["frozen"], "the RNN model has no Linear layers for LoRA"
@@ -232,8 +235,15 @@ def test_run_methods_compare_reuse_and_failure():
 def test_cross_validation_with_adalora():
     with tempfile.TemporaryDirectory() as tmp:
         data = make_fake_data(os.path.join(tmp, "data"), n_train=4)
-        res = run_cv(_bb(ToyLlama()), data_root=data, out_dir=os.path.join(tmp, "runs"), run_name="cv",
-                     method="adalora", folds=2, **{**FAST, "epochs": 2})
+        res = run_cv(
+            _bb(ToyLlama()),
+            data_root=data,
+            out_dir=os.path.join(tmp, "runs"),
+            run_name="cv",
+            method="adalora",
+            folds=2,
+            **{**FAST, "epochs": 2},
+        )
         saved = torch.load(os.path.join(res["out_dir"], "stageA_fold1.pt"), map_location="cpu", weights_only=False)
         keys = list(saved["trained_weights"])
         assert keys and all("lora_" in k or k.split(".")[0] in ("pool", "head", "pos_emb") for k in keys), keys
@@ -242,8 +252,8 @@ def test_cross_validation_with_adalora():
 if __name__ == "__main__":
     try:
         import peft
-        print(f"peft {peft.__version__}, torch {torch.__version__}, "
-              f"{'GPU' if torch.cuda.is_available() else 'CPU'}")
+
+        print(f"peft {peft.__version__}, torch {torch.__version__}, {'GPU' if torch.cuda.is_available() else 'CPU'}")
     except ImportError:
         print("peft is not installed: pip install peft")
         sys.exit(1)
@@ -255,6 +265,7 @@ if __name__ == "__main__":
                 print(f"PASS {name}")
             except Exception as e:  # noqa: BLE001
                 import traceback
+
                 traceback.print_exc()
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}")

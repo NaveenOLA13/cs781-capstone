@@ -1,12 +1,5 @@
-"""Phase 4 (court judgment prediction, CJPE): data, tokenising, metrics and the submission file.
-No torch here, so this file and its test run anywhere.
+"""Phase 4 (court judgment prediction, CJPE): data, tokenising, metrics and the submission file."""
 
-    import cj_data as D
-    data = D.load_data()                      # {"train": [...], "dev": [...], "test": [...]}
-    ids = D.encode_docs(data["train"], encode, 512, window="tail")
-
-Every case is a dict: id (str), text (str), label (0 / 1, or None for test).
-"""
 from __future__ import annotations
 
 import glob
@@ -27,13 +20,18 @@ ID_KEYS = ("id", "case_id", "doc_id", "name", "uid")
 WINDOWS = ("tail", "head", "head_tail")
 
 
-# ------------------------------------------------------------------------------ loading
+# --- loading
 def download(root: str = DEFAULT_ROOT) -> str:
     """Downloads Phase_4_CJPE from the course's Hugging Face dataset if the folder is missing."""
     if not os.path.isdir(root):
         from huggingface_hub import snapshot_download
-        snapshot_download(repo_id=HF_REPO, repo_type="dataset", local_dir=os.path.dirname(root),
-                          allow_patterns=[os.path.basename(root) + "/*"])
+
+        snapshot_download(
+            repo_id=HF_REPO,
+            repo_type="dataset",
+            local_dir=os.path.dirname(root),
+            allow_patterns=[os.path.basename(root) + "/*"],
+        )
     return root
 
 
@@ -42,8 +40,7 @@ def _records(obj) -> list[dict]:
         for k in ("data", "records", "cases", "examples"):
             if isinstance(obj.get(k), list):
                 return obj[k]
-        return [dict(v, id=v.get("id", k)) if isinstance(v, dict) else {"id": k, "text": v}
-                for k, v in obj.items()]
+        return [dict(v, id=v.get("id", k)) if isinstance(v, dict) else {"id": k, "text": v} for k, v in obj.items()]
     if not isinstance(obj, list):
         raise ValueError(f"expected a list or dict of cases, got {type(obj).__name__}")
     return obj
@@ -67,8 +64,8 @@ def to_label(v) -> int:
 
 
 def load_split(path: str, need_label: bool, read_label: bool = True) -> list[dict]:
-    """Cases of one file. read_label=False ignores any label field (used for test.json: its labels, if the
-    file has any, are never read, so they cannot influence training, selection or thresholds)."""
+    """Cases of one file. read_label=False ignores any label field (used for test.json: its labels, if the file has
+    any, are never read, so they cannot influence training, selection or thresholds)."""
     with open(path, encoding="utf-8") as f:
         recs = _records(json.load(f))
     if not recs:
@@ -94,8 +91,13 @@ def find_files(root: str) -> dict[str, str]:
     files = {}
     for p in sorted(glob.glob(os.path.join(root, "**", "*.json"), recursive=True)):
         name = os.path.basename(p).lower()
-        split = "test" if "test" in name else "dev" if ("dev" in name or "val" in name) else (
-            "train" if "train" in name else None)
+        split = (
+            "test"
+            if "test" in name
+            else "dev"
+            if ("dev" in name or "val" in name)
+            else ("train" if "train" in name else None)
+        )
         if split is not None:
             if split in files:
                 raise ValueError(f"two {split} files: {files[split]} and {p}")
@@ -111,11 +113,8 @@ def _key(d: dict) -> str:
 
 
 def clean_splits(data: dict[str, list[dict]]) -> dict:
-    """Removes repeated cases and overlaps between splits (in place) and returns what was removed:
-    - test cases (same id or same text) from dev and train: the course's dev.json contains every test case
-      with its label, so selecting epochs / thresholds on it would use the test labels;
-    - dev cases whose text is also in train;
-    - repeated texts inside train and inside dev (ILDC_single is a subset of ILDC_multi), keeping the first."""
+    """Removes repeated cases and overlaps between splits (in place) and returns what was removed: - test cases (same
+    id or same text) from dev and train."""
     test_ids = {d["id"] for d in data["test"]}
     test_keys = {_key(d) for d in data["test"]}
     rep = {}
@@ -134,8 +133,13 @@ def clean_splits(data: dict[str, list[dict]]) -> dict:
             else:
                 seen.add(k)
                 kept.append(d)
-        rep[split] = dict(before=len(data[split]), after=len(kept), test_cases_removed=n_test,
-                          repeats_removed=n_dup, train_cases_removed=n_train)
+        rep[split] = dict(
+            before=len(data[split]),
+            after=len(kept),
+            test_cases_removed=n_test,
+            repeats_removed=n_dup,
+            train_cases_removed=n_train,
+        )
         data[split] = kept
         if split == "train":
             seen_train = seen
@@ -147,8 +151,9 @@ def load_data(root: str = DEFAULT_ROOT, fetch: bool = True, clean: bool = True, 
     if fetch:
         download(root)
     files = find_files(root)
-    data = {s: load_split(files[s], need_label=(s != "test"), read_label=(s != "test"))
-            for s in ("train", "dev", "test")}
+    data = {
+        s: load_split(files[s], need_label=(s != "test"), read_label=(s != "test")) for s in ("train", "dev", "test")
+    }
     dup = [k for k, c in Counter(d["id"] for d in data["test"]).items() if c > 1]
     if dup:
         raise ValueError(f"test.json has repeated ids, e.g. {dup[:3]}")
@@ -156,9 +161,12 @@ def load_data(root: str = DEFAULT_ROOT, fetch: bool = True, clean: bool = True, 
         rep = clean_splits(data)
         if log is not None:
             for s, r in rep.items():
-                log(f"[data] {s}: {r['before']} -> {r['after']} cases (removed {r['test_cases_removed']} test cases, "
-                    f"{r['repeats_removed']} repeats" + (f", {r['train_cases_removed']} also in train" if s == "dev"
-                                                         else "") + ")")
+                log(
+                    f"[data] {s}: {r['before']} -> {r['after']} cases (removed {r['test_cases_removed']} test cases, "
+                    f"{r['repeats_removed']} repeats"
+                    + (f", {r['train_cases_removed']} also in train" if s == "dev" else "")
+                    + ")"
+                )
     return data
 
 
@@ -171,14 +179,14 @@ def summary(data: dict[str, list[dict]]) -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------- tokenising
+# --- tokenising
 def tail_text(text: str, n_chars: int) -> str:
     """The last n_chars characters, starting at a word boundary (no half word at the cut)."""
     if n_chars >= len(text):
         return text
     part = text[-n_chars:]
     cut = part.find(" ")
-    return part[cut + 1:] if 0 <= cut < len(part) - 1 else part
+    return part[cut + 1 :] if 0 <= cut < len(part) - 1 else part
 
 
 def head_text(text: str, n_chars: int) -> str:
@@ -191,7 +199,7 @@ def head_text(text: str, n_chars: int) -> str:
 
 
 def _grow(text, encode, n_tokens, take_part, keep):
-    take = int(n_tokens * 6) + 64                      # ~4-5 characters per token, with room to spare
+    take = int(n_tokens * 6) + 64
     while True:
         part = take_part(text, take)
         ids = [int(x) for x in encode(part)]
@@ -201,8 +209,7 @@ def _grow(text, encode, n_tokens, take_part, keep):
 
 
 def encode_window(text: str, encode, n_tokens: int, window: str = "tail") -> list[int]:
-    """Token ids of one case's window of at most n_tokens tokens, tokenising only that end of the text.
-    tail: the last n_tokens; head: the first n_tokens; head_tail: the first quarter + the last 3/4."""
+    """Token ids of one case's window of at most n_tokens tokens, tokenising only that end of the text."""
     if window not in WINDOWS:
         raise ValueError(f"window must be one of {WINDOWS}")
     if n_tokens <= 0:
@@ -212,13 +219,12 @@ def encode_window(text: str, encode, n_tokens: int, window: str = "tail") -> lis
     if window == "head":
         return _grow(text, encode, n_tokens, head_text, lambda ids: ids[:n_tokens])
     n_head = n_tokens // 4
-    if len(text) <= n_tokens * 8:                     # short enough to tokenise whole
+    if len(text) <= n_tokens * 8:
         whole = [int(x) for x in encode(text)]
         if len(whole) <= n_tokens:
             return whole
-        return whole[:n_head] + whole[len(whole) - (n_tokens - n_head):]
-    return (encode_window(text, encode, n_head, "head")
-            + encode_window(text, encode, n_tokens - n_head, "tail"))
+        return whole[:n_head] + whole[len(whole) - (n_tokens - n_head) :]
+    return encode_window(text, encode, n_head, "head") + encode_window(text, encode, n_tokens - n_head, "tail")
 
 
 _ENC = None
@@ -235,10 +241,16 @@ def fingerprint(encode) -> str:
     return hashlib.md5(json.dumps(list(map(int, encode(s)))).encode()).hexdigest()[:10]
 
 
-def encode_docs(docs: list[dict], encode, n_tokens: int, window: str = "tail", workers: int = 1,
-                cache_dir: str | None = None, log=print) -> list[list[int]]:
-    """Window token ids for every case (same order). With cache_dir, results are stored per
-    (tokenizer, window, n_tokens) and reused: tokenising tens of thousands of long cases takes a while."""
+def encode_docs(
+    docs: list[dict],
+    encode,
+    n_tokens: int,
+    window: str = "tail",
+    workers: int = 1,
+    cache_dir: str | None = None,
+    log=print,
+) -> list[list[int]]:
+    """Window token ids for every case (same order)."""
     global _ENC
     out: list[list[int] | None] = [None] * len(docs)
     cache, path = {}, None
@@ -272,7 +284,7 @@ def encode_docs(docs: list[dict], encode, n_tokens: int, window: str = "tail", w
             out[i] = ids
             cache[key] = ids
         if path:
-            tmp = f"{path}.{os.getpid()}.tmp"   # one file per process: parallel workers may write the same cache
+            tmp = f"{path}.{os.getpid()}.tmp"
             with open(tmp, "wb") as f:
                 pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
             os.replace(tmp, path)
@@ -285,10 +297,7 @@ def chunk_span(max_len: int, stride: int, k: int) -> int:
 
 
 def chunk_ids(ids: list[int], max_len: int, stride: int, k: int) -> list[list[int]]:
-    """The last (up to) k chunks of max_len tokens, in reading order. Each chunk ends `stride` tokens before the
-    next one (neighbours overlap by max_len - stride tokens). At the start of the case the first chunk is taken
-    as the first max_len tokens, unless that would add fewer than stride // 2 new tokens. A case of at most
-    max_len tokens is one chunk."""
+    """The last (up to) k chunks of max_len tokens, in reading order."""
     n = len(ids)
     if n <= max_len:
         return [list(ids)]
@@ -310,15 +319,17 @@ def length_report(lengths: list[int], n_tokens: int) -> str:
     if not s:
         return "no cases"
     full = sum(1 for x in s if x >= n_tokens)
-    return (f"window tokens per case: median {s[len(s) // 2]}, min {s[0]}, max {s[-1]}; "
-            f"{full} of {len(s)} ({full / len(s):.0%}) fill the whole {n_tokens}-token window")
+    return (
+        f"window tokens per case: median {s[len(s) // 2]}, min {s[0]}, max {s[-1]}; "
+        f"{full} of {len(s)} ({full / len(s):.0%}) fill the whole {n_tokens}-token window"
+    )
 
 
-# ------------------------------------------------------------------------------- batching
-def batches(lengths: list[int], batch_size: int, shuffle: bool, seed: int = 0, exact: bool = False,
-            pool: int = 50) -> list[list[int]]:
-    """Index batches of similar length. exact=True: every batch has cases of exactly one length (for
-    models whose outputs change with padding). shuffle=False keeps a fixed order (prediction)."""
+# --- batching
+def batches(
+    lengths: list[int], batch_size: int, shuffle: bool, seed: int = 0, exact: bool = False, pool: int = 50
+) -> list[list[int]]:
+    """Index batches of similar length."""
     idx = list(range(len(lengths)))
     rng = random.Random(seed)
     if exact:
@@ -330,18 +341,18 @@ def batches(lengths: list[int], batch_size: int, shuffle: bool, seed: int = 0, e
             g = groups[L]
             if shuffle:
                 rng.shuffle(g)
-            out += [g[i:i + batch_size] for i in range(0, len(g), batch_size)]
+            out += [g[i : i + batch_size] for i in range(0, len(g), batch_size)]
         if shuffle:
             rng.shuffle(out)
         return out
     if not shuffle:
         idx.sort(key=lambda i: lengths[i])
-        return [idx[i:i + batch_size] for i in range(0, len(idx), batch_size)]
+        return [idx[i : i + batch_size] for i in range(0, len(idx), batch_size)]
     rng.shuffle(idx)
     out = []
     for c in range(0, len(idx), batch_size * pool):
-        part = sorted(idx[c:c + batch_size * pool], key=lambda i: lengths[i])
-        out += [part[i:i + batch_size] for i in range(0, len(part), batch_size)]
+        part = sorted(idx[c : c + batch_size * pool], key=lambda i: lengths[i])
+        out += [part[i : i + batch_size] for i in range(0, len(part), batch_size)]
     rng.shuffle(out)
     return out
 
@@ -365,10 +376,10 @@ def make_folds(docs: list[dict], k: int = 5, seed: int = 0) -> list[list[int]]:
     return [sorted(f) for f in folds]
 
 
-# -------------------------------------------------------------------------------- metrics
+# --- metrics
 def report(y: list[int], p1: list[float], threshold: float = 0.5) -> dict:
-    """Binary scores for P(label 1) = p1 cut at `threshold`: per class precision / recall / F1,
-    macro-F1 (Codabench's main metric), macro precision / recall, accuracy and the confusion counts."""
+    """Binary scores for P(label 1) = p1 cut at `threshold`: per class precision / recall / F1, macro-F1 (Codabench's
+    main metric), macro precision / recall, accuracy and the confusion counts."""
     pred = [int(p >= threshold) for p in p1]
     tp = sum(1 for a, b in zip(y, pred) if a == 1 and b == 1)
     tn = sum(1 for a, b in zip(y, pred) if a == 0 and b == 0)
@@ -380,12 +391,22 @@ def report(y: list[int], p1: list[float], threshold: float = 0.5) -> dict:
         r = t / (t + f_neg) if t + f_neg else 0.0
         per[c] = dict(precision=p, recall=r, f1=2 * p * r / (p + r) if p + r else 0.0, support=t + f_neg)
     n = len(y)
-    return dict(threshold=threshold, n=n, accuracy=(tp + tn) / n if n else 0.0,
-                macro_f1=(per[0]["f1"] + per[1]["f1"]) / 2,
-                macro_precision=(per[0]["precision"] + per[1]["precision"]) / 2,
-                macro_recall=(per[0]["recall"] + per[1]["recall"]) / 2,
-                class0=per[0], class1=per[1], tp=tp, tn=tn, fp=fp, fn=fn,
-                predicted_1=sum(pred), gold_1=sum(y))
+    return dict(
+        threshold=threshold,
+        n=n,
+        accuracy=(tp + tn) / n if n else 0.0,
+        macro_f1=(per[0]["f1"] + per[1]["f1"]) / 2,
+        macro_precision=(per[0]["precision"] + per[1]["precision"]) / 2,
+        macro_recall=(per[0]["recall"] + per[1]["recall"]) / 2,
+        class0=per[0],
+        class1=per[1],
+        tp=tp,
+        tn=tn,
+        fp=fp,
+        fn=fn,
+        predicted_1=sum(pred),
+        gold_1=sum(y),
+    )
 
 
 def tune_threshold(y: list[int], p1: list[float], grid=None) -> tuple[float, float]:
@@ -401,21 +422,25 @@ def tune_threshold(y: list[int], p1: list[float], grid=None) -> tuple[float, flo
 
 
 def format_report(rep: dict, title: str = "") -> str:
-    lines = [f"{title}macro-F1 {rep['macro_f1']:.4f} | accuracy {rep['accuracy']:.4f} | "
-             f"threshold {rep['threshold']:.2f}"]
+    lines = [
+        f"{title}macro-F1 {rep['macro_f1']:.4f} | accuracy {rep['accuracy']:.4f} | threshold {rep['threshold']:.2f}"
+    ]
     for c in (0, 1):
         r = rep[f"class{c}"]
-        lines.append(f"    class {c}: precision {r['precision']:.3f} recall {r['recall']:.3f} "
-                     f"F1 {r['f1']:.3f} (n={r['support']})")
-    lines.append(f"    confusion: true 0 -> predicted 0 {rep['tn']}, predicted 1 {rep['fp']} | "
-                 f"true 1 -> predicted 0 {rep['fn']}, predicted 1 {rep['tp']}")
+        lines.append(
+            f"    class {c}: precision {r['precision']:.3f} recall {r['recall']:.3f} "
+            f"F1 {r['f1']:.3f} (n={r['support']})"
+        )
+    lines.append(
+        f"    confusion: true 0 -> predicted 0 {rep['tn']}, predicted 1 {rep['fp']} | "
+        f"true 1 -> predicted 0 {rep['fn']}, predicted 1 {rep['tp']}"
+    )
     return "\n".join(lines)
 
 
-# ----------------------------------------------------------------------------- submission
+# --- submission
 def write_submission(test_docs: list[dict], preds: dict[str, int], out_dir: str) -> str:
-    """prediction.json = [{"id": ..., "pred": 0 or 1}, ...] in test.json order, and submission.zip holding it.
-    Checks: one integer 0/1 prediction for every test case, no other ids; the zip is read back."""
+    """prediction.json = [{"id": ..., "pred": 0 or 1}, ...] in test.json order, and submission.zip holding it."""
     os.makedirs(out_dir, exist_ok=True)
     want = [d["id"] for d in test_docs]
     missing = [i for i in want if i not in preds]

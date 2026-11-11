@@ -1,24 +1,5 @@
-"""Tokenize the Phase-1 corpus ONCE into flat uint16 token files (one pair per source).
+"""Tokenize the Phase-1 corpus ONCE into flat uint16 token files (one pair per source)."""
 
-All data decisions live in one place: the --plan string.
-    source=BUDGET:STRIDE,source=BUDGET:STRIDE,...
-    BUDGET = number of TRAIN tokens to keep (e.g. 300M, 1.5B) or "all" (read until file end)
-    STRIDE = keep every k-th doc of the file (1 = every doc)
-
-Example (current choice):
-    python prepare_data.py --out data/v1 \
-        --plan "acts=all:1,supreme_court=all:1,high_courts=300M:5,tribunals=200M:5"
-
-To try a different pool later, just change --plan and --out (e.g. data/v2). Nothing else.
-Note: the MIX used during training is NOT set here -- it is a weight in data.py/config.
-This only decides what is stored on disk.
-
-Output folder (attach it to every training notebook):
-    {source}_train.bin, {source}_val.bin   uint16 token ids, docs separated by <eos>
-    tokenizer.json                         copy of the tokenizer used (ids must match!)
-    val_docs.jsonl                         raw held-out docs -> local test prompts later
-    meta.json                              plan, token counts, vocab, eos id, timings
-"""
 import argparse
 import json
 import multiprocessing as mp
@@ -32,7 +13,7 @@ import numpy as np
 SOURCE_ORDER = ["acts", "supreme_court", "high_courts", "tribunals"]
 
 
-# ---------------------------------------------------------------------- plan parsing
+# --- plan parsing
 def parse_size(s):
     s = s.strip().lower()
     if s == "all":
@@ -51,7 +32,7 @@ def parse_plan(plan):
     return out
 
 
-# ---------------------------------------------------------------------- writer
+# --- writer
 class BinWriter:
     """Buffers ids in memory and appends them to a .bin file in big chunks."""
 
@@ -75,7 +56,7 @@ class BinWriter:
         self.f.close()
 
 
-# ---------------------------------------------------------------------- one source (runs in its own process)
+# --- one source (runs in its own process)
 def process_source(job):
     import corpus
     from bpe import BPETokenizer
@@ -83,7 +64,7 @@ def process_source(job):
     src, budget, stride, a = job
     tok = BPETokenizer.load(a.tokenizer)
     eos = tok.token_to_id("<eos>")
-    rng = random.Random(f"{a.seed}-{src}")          # reproducible, independent per source
+    rng = random.Random(f"{a.seed}-{src}")
 
     tr = BinWriter(os.path.join(a.out, f"{src}_train.bin"))
     va = BinWriter(os.path.join(a.out, f"{src}_val.bin"))
@@ -93,9 +74,9 @@ def process_source(job):
 
     for text in corpus.iter_docs(src, local_dir=a.local_dir, min_chars=a.min_chars, stride=stride):
         ids = tok.encode(text)
-        ids.append(eos)                              # mark document end
+        ids.append(eos)
         n_docs += 1
-        if rng.random() < a.val_frac:                # whole doc -> validation (no leakage)
+        if rng.random() < a.val_frac:
             va.add(ids)
             n_val_docs += 1
             if len(val_docs) < a.val_docs_keep:
@@ -105,23 +86,30 @@ def process_source(job):
             n_words += len(text.split())
         if time.time() - last > 30:
             last = time.time()
-            print(f"[{src}] docs={n_docs:,} train={tr.n/1e6:.1f}M val={va.n/1e6:.2f}M "
-                  f"({last - t0:.0f}s)", flush=True)
+            print(
+                f"[{src}] docs={n_docs:,} train={tr.n / 1e6:.1f}M val={va.n / 1e6:.2f}M ({last - t0:.0f}s)", flush=True
+            )
         if budget is not None and tr.n >= budget:
             break
 
     tr.close()
     va.close()
-    stats = {"budget": budget, "stride": stride, "docs": n_docs, "val_docs": n_val_docs,
-             "train_tokens": tr.n, "val_tokens": va.n,
-             "tokens_per_word": round(tr.n / max(n_words, 1), 4),
-             "reached_end_of_file": budget is None or tr.n < budget,
-             "seconds": round(time.time() - t0)}
+    stats = {
+        "budget": budget,
+        "stride": stride,
+        "docs": n_docs,
+        "val_docs": n_val_docs,
+        "train_tokens": tr.n,
+        "val_tokens": va.n,
+        "tokens_per_word": round(tr.n / max(n_words, 1), 4),
+        "reached_end_of_file": budget is None or tr.n < budget,
+        "seconds": round(time.time() - t0),
+    }
     print(f"[{src}] DONE {stats}", flush=True)
     return src, stats, val_docs
 
 
-# ---------------------------------------------------------------------- main
+# --- main
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", required=True, help='e.g. "acts=all:1,high_courts=300M:5"')
@@ -143,7 +131,7 @@ def main():
 
     jobs = [(s, b, k, a) for s, (b, k) in plan.items()]
     t0 = time.time()
-    ctx = mp.get_context("spawn")                    # fresh processes: safe with network file handles
+    ctx = mp.get_context("spawn")
     with ctx.Pool(min(a.workers, len(jobs))) as pool:
         results = pool.map(process_source, jobs)
 
@@ -155,12 +143,20 @@ def main():
                 f.write(json.dumps({"source": src, "text": d}) + "\n")
 
     from bpe import BPETokenizer
+
     tok = BPETokenizer.load(a.tokenizer)
-    meta = {"plan": a.plan, "vocab_size": tok.get_vocab_size(), "eos_id": tok.token_to_id("<eos>"),
-            "dtype": "uint16", "val_frac": a.val_frac, "seed": a.seed,
-            "total_train_tokens": sum(s["train_tokens"] for s in stats.values()),
-            "total_val_tokens": sum(s["val_tokens"] for s in stats.values()),
-            "seconds": round(time.time() - t0), "sources": stats}
+    meta = {
+        "plan": a.plan,
+        "vocab_size": tok.get_vocab_size(),
+        "eos_id": tok.token_to_id("<eos>"),
+        "dtype": "uint16",
+        "val_frac": a.val_frac,
+        "seed": a.seed,
+        "total_train_tokens": sum(s["train_tokens"] for s in stats.values()),
+        "total_val_tokens": sum(s["val_tokens"] for s in stats.values()),
+        "seconds": round(time.time() - t0),
+        "sources": stats,
+    }
     with open(os.path.join(a.out, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
     print(json.dumps(meta, indent=2))

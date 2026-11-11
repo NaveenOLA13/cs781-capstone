@@ -1,13 +1,6 @@
 """Self-test of Phase 6 training and generation on tiny stand-in models (decoder-only with a tied head, Llama-style,
-encoder-decoder with a bidirectional GRU) and fake documents. Needs torch. About 2-4 minutes.
-python test_summ_train.py  -> every line PASS
+encoder-decoder with a bidirectional GRU) and fake documents."""
 
-Checks: beam search (lengths, minimum length, no repeated trigrams, several problems at once); batches; LoRA,
-LoRMA, QLoRA, adapter and full runs write held-out scores, test summaries, a valid submission and trained.pt; the
-loss goes down; the encoder-decoder path (exact batches, encoder cache, low-rank only on linear layers); a
-half-size KD student learns from a finished teacher run; finish_by cuts training and still writes everything;
-mid-training on documents + summaries (with finish_by); report and best_run.
-"""
 import json
 import os
 import random
@@ -30,13 +23,26 @@ from cj_models import make_backbone  # noqa: E402
 from test_cj_train import TOYS, WordTok  # noqa: E402
 from test_summ_data import make_fake_summ  # noqa: E402
 
-FAST = dict(max_len=128, tgt_tokens=32, enc_window=48, epochs=2, batch_size=8, grad_accum=1, eval_docs=5, beams=2,
-            gen_batch=4, log_every=2, fetch_data=False, lr_body=3e-3, empty_frac=0.3)
+FAST = dict(
+    max_len=128,
+    tgt_tokens=32,
+    enc_window=48,
+    epochs=2,
+    batch_size=8,
+    grad_accum=1,
+    eval_docs=5,
+    beams=2,
+    gen_batch=4,
+    log_every=2,
+    fetch_data=False,
+    lr_body=3e-3,
+    empty_frac=0.3,
+)
 
 
 class ToyEncDecE(TOYS["encdec"]):
-    """The toy encoder-decoder with model.encode(src) (as our Phase 1 encoder-decoder has): the pointer-generator
-    can be added."""
+    """The toy encoder-decoder with model.encode(src) (as our Phase 1 encoder-decoder has): the pointer-generator can
+    be added."""
 
     def encode(self, src):
         return self.encoder(self.emb(src))[0]
@@ -46,7 +52,7 @@ def bb_of(kind):
     torch.manual_seed(1)
     model = ToyEncDecE() if kind == "encdec_e" else TOYS[kind]()
     bb = make_backbone(model, WordTok(), max_len=128, verbose=False)
-    bb.model.eval()                 # as cj_models.load_model returns the real checkpoints (cuDNN RNNs: eval mode!)
+    bb.model.eval()
     return bb
 
 
@@ -66,17 +72,18 @@ def test_beam_search():
 
     def step(rows):
         lp = torch.full((rows.size(0), V), -6.0)
-        lp[:, 3 + rows.size(1) % 3] = 0.0                        # prefers 3 4 5 3 4 5 ...
+        lp[:, 3 + rows.size(1) % 3] = 0.0
         lp[:, eos] = -1.0 if rows.size(1) >= 7 else -40.0
         return F.log_softmax(lp, -1)
+
     out = SM.beam_search(step, 2, eos, beams=3, max_new=[5, 12], min_new=[0, 9], no_repeat=3)
     assert len(out) == 2 and len(out[0]) <= 5 and 9 <= len(out[1]) <= 12, out
     for o in out:
         g = list(zip(o, o[1:], o[2:]))
-        assert len(g) == len(set(g)), o                           # no repeated trigram
+        assert len(g) == len(set(g)), o
         assert eos not in o
     one = SM.beam_search(step, 1, eos, beams=1, max_new=4, no_repeat=0)
-    assert one == [[3, 4, 5, 3]], one                             # greedy without the ban
+    assert one == [[3, 4, 5, 3]], one
 
 
 def test_top_p_sampling():
@@ -84,19 +91,20 @@ def test_top_p_sampling():
 
     def step(rows):
         lp = torch.full((rows.size(0), V), -8.0)
-        lp[:, 3 + rows.size(1) % 3] = 0.0                        # one clear favourite at every step
-        lp[:, 7] = -0.5                                          # and a second likely token
+        lp[:, 3 + rows.size(1) % 3] = 0.0
+        lp[:, 7] = -0.5
         lp[:, eos] = -1.0 if rows.size(1) >= 6 else -40.0
         return F.log_softmax(lp, -1)
+
     a = SM.sample_search(step, 3, eos, max_new=[4, 10, 10], min_new=[0, 8, 0], no_repeat=3, top_p=0.9, seed=1)
     b = SM.sample_search(step, 3, eos, max_new=[4, 10, 10], min_new=[0, 8, 0], no_repeat=3, top_p=0.9, seed=1)
-    assert a == b                                                 # seeded: reproducible
+    assert a == b
     assert len(a[0]) <= 4 and 8 <= len(a[1]) <= 10 and len(a[2]) <= 10, a
     for o in a:
         g = list(zip(o, o[1:], o[2:]))
         assert len(g) == len(set(g)) and eos not in o, o
     tiny = SM.sample_search(step, 1, eos, max_new=3, no_repeat=0, top_p=0.01, temperature=1.0)
-    assert tiny == [[3, 4, 5]], tiny                              # top-p near 0 = greedy
+    assert tiny == [[3, 4, 5]], tiny
 
 
 def test_batches():
@@ -134,27 +142,48 @@ def test_runs_kd_deadline_report():
         h = r["metrics"]["history"]
         assert len(h) >= 2 and h[-1]["loss"] < h[0]["loss"], h
         print(f"    toy llama full: held-out {SD.fmt(r['metrics']['held'])}")
-        for kind, tech in (("gpt", "lora"), ("llama", "lorma"), ("llama", "qlora"), ("gpt", "adapter"),
-                           ("encdec", "adapter"), ("encdec_e", "lora"), ("encdec_e", "qlora")):
+        for kind, tech in (
+            ("gpt", "lora"),
+            ("llama", "lorma"),
+            ("llama", "qlora"),
+            ("gpt", "adapter"),
+            ("encdec", "adapter"),
+            ("encdec_e", "lora"),
+            ("encdec_e", "qlora"),
+        ):
             rr = S.run(bb_of(kind), name=kind, technique=tech, decode=dec, **common)
             _check(rr, 6, tech)
             text = open(os.path.join(rr["out_dir"], "log.txt")).read()
-            if kind == "encdec":                                  # no encode(): no pointer-generator
+            if kind == "encdec":
                 assert not rr["metrics"]["copy"] and "no pointer-generator" in text
-            if kind == "encdec_e":                                # pointer-generator trained with the technique
+            if kind == "encdec_e":
                 assert rr["metrics"]["copy"] and "[copy] pointer-generator" in text and "linear layers only" in text
                 st_ = torch.load(os.path.join(rr["out_dir"], "trained.pt"), weights_only=False)["state"]
                 assert any(k.startswith("copy.") for k in st_), list(st_)[:5]
-        # knowledge distillation: half-size student (evenly spaced blocks) with the llama_full teacher
-        st = S.run(bb_of("llama"), name="llama", technique="full", run_name="llama_student_kd", decode=dec,
-                   student_layers=0.5, kd_teacher=r["out_dir"], decodings=("beam", "top_p", "beam_long"), **common)
+        st = S.run(
+            bb_of("llama"),
+            name="llama",
+            technique="full",
+            run_name="llama_student_kd",
+            decode=dec,
+            student_layers=0.5,
+            kd_teacher=r["out_dir"],
+            decodings=("beam", "top_p", "beam_long"),
+            **common,
+        )
         assert set(st["metrics"]["decodings"]) == {"beam", "top_p", "beam_long"}
         ms = st["metrics"]
         assert ms["student"]["kept"] == [0, 2] and ms["total_params"] < r["metrics"]["total_params"], ms["student"]
         assert ms["kd"]["teacher_technique"] == "full" and all(x["kd"] is not None for x in ms["history"])
-        # finish_by: no time left -> only the first steps, everything still written
-        fb = S.run(bb_of("gpt"), name="gpt", technique="lora", run_name="gpt_cut", decode=dec,
-                   finish_by=time.time() + 1, **dict(common, epochs=5))
+        fb = S.run(
+            bb_of("gpt"),
+            name="gpt",
+            technique="lora",
+            run_name="gpt_cut",
+            decode=dec,
+            finish_by=time.time() + 1,
+            **dict(common, epochs=5),
+        )
         assert fb["metrics"]["budget"]["cut"] and fb["metrics"]["steps"] <= 20, fb["metrics"]["budget"]
         _check(fb, 6, "lora")
         text = G.report([out], out_path=os.path.join(tmp, "all.txt"))
@@ -165,23 +194,41 @@ def test_runs_kd_deadline_report():
 def test_mid_training():
     import cj_mid as M
     import summ_mid as SMID
+
     with tempfile.TemporaryDirectory() as tmp:
         root = make_fake_summ(tmp, n_train=100, n_test=5)
         data = SD.load_data(root, fetch=False)
         pool, held = SMID.split_texts(data, dict(SMID.MID_DEFAULTS, heldout_docs=10))
         test_docs = {d["document"] for d in data["test"]}
-        held_docs = {d["document"] for d in data["held"]}        # (fake summaries repeat across documents)
+        held_docs = {d["document"] for d in data["held"]}
         assert not (set(pool) & test_docs) and not (set(pool) & held_docs) and len(pool) == 2 * len(data["train"])
         assert set(held) <= held_docs
         torch.manual_seed(0)
         model = TOYS["llama"]()
-        cfg = dict(tokens=8_000, seq_len=32, batch_size=8, lr=3e-3, warmup_steps=5, eval_every=0, log_every=0,
-                   heldout_windows=16, tok_workers=1, data_parallel=False)
+        cfg = dict(
+            tokens=8_000,
+            seq_len=32,
+            batch_size=8,
+            lr=3e-3,
+            warmup_steps=5,
+            eval_every=0,
+            log_every=0,
+            heldout_windows=16,
+            tok_workers=1,
+            data_parallel=False,
+        )
         res = M.mid_train_model(model, WordTok().encode, 2, pool, held, cfg, log=lambda *a: None)
         assert res["heldout_after"] < res["heldout_before"], res
-        res2 = M.mid_train_model(TOYS["llama"](), WordTok().encode, 2, pool, held,
-                                 dict(cfg, tokens=200_000, finish_by=time.time() + 1), log=lambda *a: None)
-        assert res2["steps"] == 20, res2["steps"]                 # deadline passed: stopped at the first check
+        res2 = M.mid_train_model(
+            TOYS["llama"](),
+            WordTok().encode,
+            2,
+            pool,
+            held,
+            dict(cfg, tokens=200_000, finish_by=time.time() + 1),
+            log=lambda *a: None,
+        )
+        assert res2["steps"] == 20, res2["steps"]
 
 
 if __name__ == "__main__":
@@ -193,6 +240,7 @@ if __name__ == "__main__":
                 print(f"PASS {name}")
             except Exception as e:  # noqa: BLE001
                 import traceback
+
                 traceback.print_exc()
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}")

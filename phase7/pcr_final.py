@@ -1,28 +1,5 @@
-"""Phase 7 final ranking (CPU only, no training): our runs' saved similarity scores + better lexical signals.
+"""Phase 7 final ranking (CPU only, no training): our runs' saved similarity scores + better lexical signals."""
 
-What it adds over the ranking each run did on its own:
-  1. exact judgment dates: the header's "DATE OF JUDGMENT: dd/mm/yyyy" (else the year of its CITATION line, else the
-     latest year in the text outside the CITATOR INFO list). A candidate that is certainly decided after the query
-     cannot be cited by it: removed (or, in the other variant, given as a feature).
-  2. "similar cases cite similar cases": the query's most similar labelled queries (BM25 3-5-grams between query
-     texts; train queries for dev, train + dev queries for test) vote for the cases they cite.
-  3. bigger candidate lists: the top cases of the 3-, 4-, 5-gram BM25 lists, the averaged list, the votes and each of
-     our model scores (after the date filter), instead of only the averaged BM25 top 100.
-  4. several of our models together: per model the average of its best runs' standardised scores (mean, maxsim,
-     maxsim_sym), and the average over the four models.
-  5. citation strings in the headnotes (variants with and without them): the query's own citation (e.g. "1966 AIR
-     1053") listed in a candidate's CITATOR INFO (the later cases that cited the candidate), a candidate's citation
-     written in the query, and later cases that cited both. This reads the publisher's citator metadata, not
-     retrieval from the judgment text, so it is reported separately ("citator" vs "nocitator" variants).
-  6. citation contexts: the 40 words before and after every <CITATION> mask of the query are short queries about
-     one cited case each; BM25 2-/3-gram scores of the best-matching context and of all contexts together.
-  7. three rankers (logistic regression, pairwise logistic regression, coordinate ascent on top-7 hits), every
-     variant measured by 5-fold cross-fitting on dev; the best ones are refitted on all of dev and written as
-     named submissions <variant>__dev<score>.zip.
-
-    import pcr_final as PF
-    PF.main(results_roots=["/kaggle/input"], out_dir="/kaggle/working/final")
-"""
 from __future__ import annotations
 
 import glob
@@ -41,22 +18,23 @@ import p7_paths  # noqa: F401
 import pcr_data as PD  # noqa: E402
 
 AGGS3 = ("mean", "maxsim", "maxsim_sym")
-MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov",
-                                      "dec"), 1)}
+MONTHS = {
+    m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)
+}
 _DOJ = r"date\s+of\s+(?:the\s+)?judg(?:e)?ment\s*[:\-]?\s*"
 _DOJ_NUM = re.compile(_DOJ + r"(\d{1,2})\s*[/.\-]\s*(\d{1,2})\s*[/.\-]\s*(\d{4})", re.I)
 _DOJ_DMY = re.compile(_DOJ + r"(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3,9})\.?,?\s+(\d{4})", re.I)
 _DOJ_MDY = re.compile(_DOJ + r"([a-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})", re.I)
-_CIT = re.compile(r"(?<!<)\bcitation\s*:\s*(\d{4})\b", re.I)            # header "CITATION: 1966 ...", not <CITATION>
+_CIT = re.compile(r"(?<!<)\bcitation\s*:\s*(\d{4})\b", re.I)
 _CITATOR = re.compile(r"citator\s+info\s*:?(.{0,4000}?)(?=\b(?:act|headnote|judgment|bench)\s*:)", re.I | re.S)
 _Y = r"(1[89]\d\d|20[0-2]\d)"
 _SEG_CIT = re.compile(r"(?<!<)\bCITATION\s*:\s*(.{0,300}?)(?=CITATOR\s+INFO|\bACT\s*:|HEADNOTE|$)", re.I | re.S)
-_AIR1 = re.compile(_Y + r"\s*AIR\s*(\d{1,4})\b", re.I)                         # 1966 AIR 1053
-_AIR2 = re.compile(r"\bAIR\s*" + _Y + r"\s*S\.?\s*C\.?\s*(\d{1,4})\b", re.I)    # AIR 1966 SC 1053
-_SC = re.compile(r"\b" + _Y + r"\s*S\.?\s*C\.?\s*(\d{1,4})\b")                 # 1966 SC 1053 / 1966 SC1053
+_AIR1 = re.compile(_Y + r"\s*AIR\s*(\d{1,4})\b", re.I)
+_AIR2 = re.compile(r"\bAIR\s*" + _Y + r"\s*S\.?\s*C\.?\s*(\d{1,4})\b", re.I)
+_SC = re.compile(r"\b" + _Y + r"\s*S\.?\s*C\.?\s*(\d{1,4})\b")
 
 
-# ------------------------------------------------------------------ citation strings
+# --- citation strings
 def _keys(s: str) -> set:
     return {(int(a), int(b)) for rx in (_AIR1, _AIR2, _SC) for a, b in rx.findall(s or "")}
 
@@ -74,8 +52,7 @@ def cite_keys(text: str) -> tuple[set, set, set]:
 
 def citation_matrices(q_texts: list[str], p_texts: list[str]):
     """back [Q, P]: the query's own citation is in the candidate's CITATOR INFO (the candidate lists the query among
-    the later cases that cited it); fwd [Q, P]: the candidate's own citation is written in the query; co [Q, P]: how
-    many later cases cited both (log1p)."""
+    the later cases that cited it); fwd [Q, P]: the candidate's own citation is written in the query; co [Q, P]."""
     qk = [cite_keys(t) for t in q_texts]
     pk = [cite_keys(t) for t in p_texts]
     idx_tor, idx_own = {}, {}
@@ -101,7 +78,7 @@ def citation_matrices(q_texts: list[str], p_texts: list[str]):
     return back, fwd, np.log1p(co)
 
 
-# ------------------------------------------------------------------------------ dates
+# --- dates
 def doc_date(text: str) -> dict:
     """{"lo", "hi", "ord", "src"}: the judgment year lies in [lo, hi] (None = unknown); ord = yyyymmdd if the exact
     date is known."""
@@ -136,8 +113,8 @@ def doc_date(text: str) -> dict:
 
 
 def date_matrices(q_dates: list[dict], p_dates: list[dict]):
-    """later [Q, P] (the candidate is certainly decided after the query), gap [Q, P] (query year - candidate year,
-    / 50), known [Q, P]."""
+    """later [Q, P] (the candidate is certainly decided after the query), gap [Q, P] (query year - candidate year, /
+    50), known [Q, P]."""
     Q, P = len(q_dates), len(p_dates)
     later = np.zeros((Q, P), dtype=bool)
     gap = np.zeros((Q, P), dtype=np.float32)
@@ -158,11 +135,10 @@ def date_matrices(q_dates: list[dict], p_dates: list[dict]):
     return later, gap, known
 
 
-# --------------------------------------------------------------- similar cases' citations
+# --- similar cases' citations
 def knn_votes(data: dict, split: str, k: int = 20, ns=(3, 4, 5), log=print) -> np.ndarray:
-    """[Q, P]: for every query of the split, the cases cited by its k most similar labelled queries (BM25 between
-    query texts), each vote weighted by that query's similarity / the best similarity. Labelled queries: train for
-    dev; train + dev for test (a query never votes for itself)."""
+    """[Q, P]: for every query of the split, the cases cited by its k most similar labelled queries (BM25 between query
+    texts), each vote weighted by that query's similarity / the best similarity."""
     q, pool = data[split]
     lab = list(data["train"][0]) + (list(data["dev"][0]) if split == "test" else [])
     pos = {c: j for j, c in enumerate(d["id"] for d in pool)}
@@ -194,18 +170,18 @@ def knn_votes(data: dict, split: str, k: int = 20, ns=(3, 4, 5), log=print) -> n
     return V
 
 
-# ------------------------------------------------------------------ citation contexts
+# --- citation contexts
 MASK = "<CITATION>"
 
 
 def contexts(text: str, width: int = 40) -> list[str]:
-    """The words around every masked citation of a query (width words before and after, other masks removed): each is
-    a short query about one cited case."""
+    """The words around every masked citation of a query (width words before and after, other masks removed): each is a
+    short query about one cited case."""
     toks = text.split()
     out = []
     for i, t in enumerate(toks):
         if MASK in t:
-            win = toks[max(0, i - width):i] + toks[i + 1:i + 1 + width]
+            win = toks[max(0, i - width) : i] + toks[i + 1 : i + 1 + width]
             win = [w for w in win if MASK not in w]
             if len(win) >= 5:
                 out.append(" ".join(win))
@@ -236,19 +212,25 @@ def context_matrices(data: dict, split: str, ns=(2, 3), width: int = 40, log=pri
             al[i] = sc / max(float(sc.max()), 1e-9)
         out[f"ctx_max_{n}"], out[f"ctx_all_{n}"] = mx, al
     n_ctx = [len(c) for c in ctx]
-    msg = (f"[contexts] {split}: {np.mean([c > 0 for c in n_ctx]):.0%} of queries have masked citations, "
-           f"{np.mean(n_ctx):.1f} contexts per query")
+    msg = (
+        f"[contexts] {split}: {np.mean([c > 0 for c in n_ctx]):.0%} of queries have masked citations, "
+        f"{np.mean(n_ctx):.1f} contexts per query"
+    )
     if q and "rel" in q[0]:
-        sp = dict(qids=[d["id"] for d in q], pids=[d["id"] for d in pool],
-                  self=[(i, j) for i, d in enumerate(q) for j, c in enumerate(pool) if c["id"] == d["id"]])
+        sp = dict(
+            qids=[d["id"] for d in q],
+            pids=[d["id"] for d in pool],
+            self=[(i, j) for i, d in enumerate(q) for j, c in enumerate(pool) if c["id"] == d["id"]],
+        )
         gold = {d["id"]: d["rel"] for d in q}
-        msg += "; alone: " + ", ".join(f"{k} {PD.micro_at_k(PD.rank_matrix(sp, M), gold)['f1']:.4f}"
-                                       for k, M in out.items())
+        msg += "; alone: " + ", ".join(
+            f"{k} {PD.micro_at_k(PD.rank_matrix(sp, M), gold)['f1']:.4f}" for k, M in out.items()
+        )
     log(msg)
     return out
 
 
-# ------------------------------------------------------------------------- our runs
+# --- our runs
 def find_runs(roots, L: dict, log=print, unzip_dir: str = "_unzipped") -> dict:
     """{run name: {"model", "dev": {agg: [Q, P]}, "test": {...}, "dev_f1": {agg: f1}}} for every finished run under
     roots (folders of pcr_runs/<run>/scores_dev.npz; pcr_results*.zip files are unpacked into unzip_dir first)."""
@@ -280,8 +262,13 @@ def find_runs(roots, L: dict, log=print, unzip_dir: str = "_unzipped") -> dict:
                     with open(os.path.join(d, "metrics.json")) as fh:
                         model = json.load(fh).get("model", model)
                 dev = {a: sd[a].astype(np.float32) for a in sd.files}
-                runs[name] = dict(model=model, dir=d, dev=dev, test={a: st[a].astype(np.float32) for a in st.files},
-                                  dev_f1={a: PD.eval_matrix(L["dev"], M)["f1"] for a, M in dev.items()})
+                runs[name] = dict(
+                    model=model,
+                    dir=d,
+                    dev=dev,
+                    test={a: st[a].astype(np.float32) for a in st.files},
+                    dev_f1={a: PD.eval_matrix(L["dev"], M)["f1"] for a, M in dev.items()},
+                )
             except Exception as e:  # noqa: BLE001
                 log(f"[runs] {name}: unreadable ({type(e).__name__}: {e})")
     log(f"[runs] {len(runs)} runs: " + ", ".join(f"{n} ({max(r['dev_f1'].values()):.3f})" for n, r in runs.items()))
@@ -294,8 +281,7 @@ def _z(M):
 
 
 def dense_sets(runs: dict, per_model: int = 4, log=print) -> dict:
-    """Feature sets of our model scores: {"all": {...}, "models": {...}} for dev and test. Per model: the average of
-    the standardised scores of its best per_model runs (by dev micro-F1@7 alone; the zero-shot run left out)."""
+    """Feature sets of our model scores: {"all": {...}, "models": {...}} for dev and test."""
     by_model: dict = {}
     for n, r in runs.items():
         if "zeroshot" in n or "frozen" in n:
@@ -305,8 +291,14 @@ def dense_sets(runs: dict, per_model: int = 4, log=print) -> dict:
     for m, lst in sorted(by_model.items()):
         best = [n for _, n in sorted(lst, reverse=True)[:per_model]]
         log(f"[dense] {m}: {', '.join(best)}")
-        per[m] = {s: {a: np.mean([_z(runs[n][s][a]) for n in best if a in runs[n][s]], 0) for a in AGGS3
-                      if any(a in runs[n][s] for n in best)} for s in ("dev", "test")}
+        per[m] = {
+            s: {
+                a: np.mean([_z(runs[n][s][a]) for n in best if a in runs[n][s]], 0)
+                for a in AGGS3
+                if any(a in runs[n][s] for n in best)
+            }
+            for s in ("dev", "test")
+        }
     out = {"all": {"dev": {}, "test": {}}, "models": {"dev": {}, "test": {}}}
     for s in ("dev", "test"):
         for a in AGGS3:
@@ -321,7 +313,7 @@ def dense_sets(runs: dict, per_model: int = 4, log=print) -> dict:
     return out
 
 
-# ---------------------------------------------------------------------- features
+# --- features
 def _ranks(M):
     order = np.argsort(-M, axis=1, kind="stable")
     r = np.empty_like(order)
@@ -329,8 +321,17 @@ def _ranks(M):
     return r
 
 
-def build(L: dict, split: str, extra: dict, dense: dict, filt: bool, k_lex: int = 100, k_vote: int = 40,
-          k_dense: int = 60, use_cit: bool = False) -> dict:
+def build(
+    L: dict,
+    split: str,
+    extra: dict,
+    dense: dict,
+    filt: bool,
+    k_lex: int = 100,
+    k_vote: int = 40,
+    k_dense: int = 60,
+    use_cit: bool = False,
+) -> dict:
     """Candidate lists and standardised feature rows for every query of a split."""
     sp, ex = L[split], extra[split]
     Q, P = len(sp["qids"]), len(sp["pids"])
@@ -342,6 +343,7 @@ def build(L: dict, split: str, extra: dict, dense: dict, filt: bool, k_lex: int 
 
     def masked(M):
         return np.where(bad, -np.inf, M)
+
     R = {f"bm25_{n}": _ranks(masked(sp["bm25"][n])) for n in L["ns"]}
     R["bm25_avg"] = _ranks(masked(sp["sum"]))
     R["votes"] = _ranks(masked(ex["votes"]))
@@ -360,8 +362,18 @@ def build(L: dict, split: str, extra: dict, dense: dict, filt: bool, k_lex: int 
     if use_cit:
         sel |= (ex["back"] > 0) | (ex["fwd"] > 0) | (ex["co"] > 0)
     sel &= ~bad
-    names = [f"bm25_{n}" for n in L["ns"]] + ["bm25_avg", "bm25_avg_lr", "bm25_4_lr", "bm25_5_lr", "later",
-                                               "year_gap", "year_known", "prior", "votes", "votes_lr"]
+    names = [f"bm25_{n}" for n in L["ns"]] + [
+        "bm25_avg",
+        "bm25_avg_lr",
+        "bm25_4_lr",
+        "bm25_5_lr",
+        "later",
+        "year_gap",
+        "year_known",
+        "prior",
+        "votes",
+        "votes_lr",
+    ]
     for k in ctx:
         names += [k, f"{k}_lr"]
     if use_cit:
@@ -373,11 +385,18 @@ def build(L: dict, split: str, extra: dict, dense: dict, filt: bool, k_lex: int 
     for i, q in enumerate(sp["qids"]):
         idx = np.nonzero(sel[i])[0]
         cols = [sp["bm25"][n][i, idx] for n in L["ns"]]
-        cols += [sp["sum"][i, idx], np.log1p(R["bm25_avg"][i, idx]),
-                 np.log1p(R["bm25_4"][i, idx]) if "bm25_4" in R else np.zeros(len(idx)),
-                 np.log1p(R["bm25_5"][i, idx]) if "bm25_5" in R else np.zeros(len(idx)),
-                 ex["later"][i, idx].astype(np.float32), ex["gap"][i, idx], ex["known"][i, idx],
-                 ex["prior"][i, idx], np.log1p(ex["votes"][i, idx]), np.log1p(R["votes"][i, idx])]
+        cols += [
+            sp["sum"][i, idx],
+            np.log1p(R["bm25_avg"][i, idx]),
+            np.log1p(R["bm25_4"][i, idx]) if "bm25_4" in R else np.zeros(len(idx)),
+            np.log1p(R["bm25_5"][i, idx]) if "bm25_5" in R else np.zeros(len(idx)),
+            ex["later"][i, idx].astype(np.float32),
+            ex["gap"][i, idx],
+            ex["known"][i, idx],
+            ex["prior"][i, idx],
+            np.log1p(ex["votes"][i, idx]),
+            np.log1p(R["votes"][i, idx]),
+        ]
         for k in ctx:
             cols += [ctx[k][i, idx], np.log1p(Rc[k][i, idx])]
         if use_cit:
@@ -392,14 +411,23 @@ def build(L: dict, split: str, extra: dict, dense: dict, filt: bool, k_lex: int 
     rec = None
     if gold:
         rec = sum(y.sum() for y in ys) / max(1, sum(len(v) for v in gold.values()))
-    return dict(split=split, names=names, cands=cands, X=PD.standardise(X), ys=ys or None, recall=rec,
-                qids=sp["qids"], pids=sp["pids"], gold=gold)
+    return dict(
+        split=split,
+        names=names,
+        cands=cands,
+        X=PD.standardise(X),
+        ys=ys or None,
+        recall=rec,
+        qids=sp["qids"],
+        pids=sp["pids"],
+        gold=gold,
+    )
 
 
-# ---------------------------------------------------------------------- rankers
+# --- rankers
 def fit_pairwise(Xs, ys, l2: float = 1.0, negs: int = 40, seed: int = 0) -> np.ndarray:
-    """Pairwise logistic regression (RankNet with a linear scorer): P(cited case above a non-cited one) =
-    sigmoid(w . (x_pos - x_neg)); negatives: the hardest by the current lexical average plus random ones."""
+    """Pairwise logistic regression (RankNet with a linear scorer): P(cited case above a non-cited one) = sigmoid(w .
+    (x_pos - x_neg)); negatives: the hardest by the current lexical average plus random ones."""
     rng = np.random.default_rng(seed)
     D = []
     for X, y in zip(Xs, ys):
@@ -430,13 +458,17 @@ def crossfit(B: dict, method: str, folds: int = 5, seed: int = 0) -> dict:
         test = set(order[k::folds])
         tr = [i for i in range(n) if i not in test]
         w = fit([B["X"][i] for i in tr], [B["ys"][i] for i in tr], method)
-        sub = dict(B, qids=[B["qids"][i] for i in sorted(test)], X=[B["X"][i] for i in sorted(test)],
-                   cands=[B["cands"][i] for i in sorted(test)])
+        sub = dict(
+            B,
+            qids=[B["qids"][i] for i in sorted(test)],
+            X=[B["X"][i] for i in sorted(test)],
+            cands=[B["cands"][i] for i in sorted(test)],
+        )
         preds.update(PD.predict(sub, w))
     return PD.micro_at_k(preds, B["gold"])
 
 
-# -------------------------------------------------------------------------- main
+# --- main
 def prepare_extra(data: dict, L: dict, log=print) -> dict:
     extra = {}
     for s in ("dev", "test"):
@@ -466,14 +498,27 @@ def prepare_extra(data: dict, L: dict, log=print) -> dict:
                 for c in L[s]["gold"][qq]:
                     if c in pos:
                         G[i, pos[c]] = True
-            for name, M in (("query in the candidate's CITATOR INFO", back), ("candidate's citation in the query", fwd),
-                            ("cited by the same later case", co)):
+            for name, M in (
+                ("query in the candidate's CITATOR INFO", back),
+                ("candidate's citation in the query", fwd),
+                ("cited by the same later case", co),
+            ):
                 h = M > 0
-                log(f"[citations] {s}, {name}: finds {(h & G).sum()} of {G.sum()} cited cases "
-                    f"({(h & G).sum() / max(1, G.sum()):.1%}), precision {(h & G).sum() / max(1, h.sum()):.1%}")
-        extra[s] = dict(later=later, gap=gap, known=known, prior=PD.prior_counts(L, s),
-                        votes=knn_votes(data, s, log=log), back=back, fwd=fwd, co=co,
-                        ctx=context_matrices(data, s, log=log))
+                log(
+                    f"[citations] {s}, {name}: finds {(h & G).sum()} of {G.sum()} cited cases "
+                    f"({(h & G).sum() / max(1, G.sum()):.1%}), precision {(h & G).sum() / max(1, h.sum()):.1%}"
+                )
+        extra[s] = dict(
+            later=later,
+            gap=gap,
+            known=known,
+            prior=PD.prior_counts(L, s),
+            votes=knn_votes(data, s, log=log),
+            back=back,
+            fwd=fwd,
+            co=co,
+            ctx=context_matrices(data, s, log=log),
+        )
     return extra
 
 
@@ -487,8 +532,15 @@ def write_named(B: dict, w: np.ndarray, L: dict, out_dir: str, name: str) -> str
     return dst
 
 
-def main(results_roots=("/kaggle/input",), out_dir: str = "/kaggle/working/final", data_root: str = PD.DEFAULT_ROOT,
-         lexical_path: str | None = None, fetch: bool = True, top_write: int = 4, log=print) -> list:
+def main(
+    results_roots=("/kaggle/input",),
+    out_dir: str = "/kaggle/working/final",
+    data_root: str = PD.DEFAULT_ROOT,
+    lexical_path: str | None = None,
+    fetch: bool = True,
+    top_write: int = 4,
+    log=print,
+) -> list:
     t0 = time.time()
     os.makedirs(out_dir, exist_ok=True)
     data = PD.load_data(data_root, fetch=fetch, log=log)
@@ -510,18 +562,30 @@ def main(results_roots=("/kaggle/input",), out_dir: str = "/kaggle/working/final
                 Bd = build(L, "dev", extra, ds["dev"], filt, use_cit=use_cit)
                 for method in ("logreg", "pairwise", "coord"):
                     m = crossfit(Bd, method)
-                    rows.append(dict(name=f"{sname}_{'citator' if use_cit else 'nocitator'}_"
-                                          f"{'datefilter' if filt else 'datefeature'}_{method}",
-                                     set=sname, filt=filt, use_cit=use_cit, method=method, f1=m["f1"],
-                                     p=m["precision"], r=m["recall"], recall_cands=Bd["recall"],
-                                     features=len(Bd["names"])))
-                    log(f"[final] {rows[-1]['name']:52s} dev (5-fold cross-fitted) {PD.fmt(m)}; candidates hold "
-                        f"{Bd['recall']:.1%} of the cited cases; {len(Bd['names'])} features")
+                    rows.append(
+                        dict(
+                            name=f"{sname}_{'citator' if use_cit else 'nocitator'}_"
+                            f"{'datefilter' if filt else 'datefeature'}_{method}",
+                            set=sname,
+                            filt=filt,
+                            use_cit=use_cit,
+                            method=method,
+                            f1=m["f1"],
+                            p=m["precision"],
+                            r=m["recall"],
+                            recall_cands=Bd["recall"],
+                            features=len(Bd["names"]),
+                        )
+                    )
+                    log(
+                        f"[final] {rows[-1]['name']:52s} dev (5-fold cross-fitted) {PD.fmt(m)}; candidates hold "
+                        f"{Bd['recall']:.1%} of the cited cases; {len(Bd['names'])} features"
+                    )
     rows.sort(key=lambda r: -r["f1"])
     chosen = rows[:top_write]
     best_plain = next((r for r in rows if not r["use_cit"]), None)
     if best_plain is not None and best_plain not in chosen:
-        chosen.append(best_plain)                     # the best version without the citator lists, for the report
+        chosen.append(best_plain)
     written = []
     for r in chosen:
         ds = sets[r["set"]]
@@ -538,8 +602,11 @@ def main(results_roots=("/kaggle/input",), out_dir: str = "/kaggle/working/final
     shutil.rmtree(os.path.join(out_dir, "_unzipped"), ignore_errors=True)
     with open(os.path.join(out_dir, "final_results.json"), "w") as f:
         json.dump(rows, f, indent=1, default=float)
-    lines = [f"{r['f1']:.4f}  P {r['p']:.4f}  R {r['r']:.4f}  cands {r['recall_cands']:.1%}  {r['name']}"
-             + (f"  -> {os.path.basename(r['submission'])}" if r.get("submission") else "") for r in rows]
+    lines = [
+        f"{r['f1']:.4f}  P {r['p']:.4f}  R {r['r']:.4f}  cands {r['recall_cands']:.1%}  {r['name']}"
+        + (f"  -> {os.path.basename(r['submission'])}" if r.get("submission") else "")
+        for r in rows
+    ]
     text = "final ranking variants, dev micro-F1@7 (5-fold cross-fitted), best first:\n" + "\n".join(lines)
     with open(os.path.join(out_dir, "final_results.txt"), "w") as f:
         f.write(text + "\n")

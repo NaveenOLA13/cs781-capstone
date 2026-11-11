@@ -1,9 +1,6 @@
-"""Self-test of Phase 5 mid-training text selection (lsi_mid.py) and of one short mid-training pass on a tiny
-stand-in model with LSI-like documents. Needs torch. About 30 seconds.     python test_lsi_mid.py -> PASS
+"""Self-test of Phase 5 mid-training text selection (lsi_mid.py) and of one short mid-training pass on a tiny stand-in
+model with LSI-like documents."""
 
-Checks: the held-out documents are never trained on, dev text is used only if use_dev_text, test text never; the
-Phase 4 next-token trainer lowers the held-out loss on these documents.
-"""
 import os
 import sys
 import tempfile
@@ -32,16 +29,33 @@ def test_split_texts():
 def test_mid_training_lowers_heldout_loss():
     import cj_mid as M
     from test_cj_train import TOYS, WordTok
+
     with tempfile.TemporaryDirectory() as tmp:
         data = L.load_data(make_fake_lsi(tmp, n_train=200, n_dev=20, n_words=(40, 90)), fetch=False)
         pool, held = LM.split_texts(data, dict(LM.MID_DEFAULTS, heldout_docs=20))
         torch.manual_seed(0)
         model = TOYS["llama"]()
         tok = WordTok()
-        res = M.mid_train_model(model, tok.encode, 2, pool, held,
-                                dict(tokens=12_000, seq_len=32, batch_size=8, lr=3e-3, warmup_steps=5, eval_every=0,
-                                     log_every=0, heldout_windows=32, tok_workers=1, data_parallel=False),
-                                log=lambda *a: None)
+        res = M.mid_train_model(
+            model,
+            tok.encode,
+            2,
+            pool,
+            held,
+            dict(
+                tokens=12_000,
+                seq_len=32,
+                batch_size=8,
+                lr=3e-3,
+                warmup_steps=5,
+                eval_every=0,
+                log_every=0,
+                heldout_windows=32,
+                tok_workers=1,
+                data_parallel=False,
+            ),
+            log=lambda *a: None,
+        )
         assert res["heldout_after"] < res["heldout_before"], res
 
 
@@ -54,6 +68,7 @@ if __name__ == "__main__":
                 print(f"PASS {name}")
             except Exception as e:  # noqa: BLE001
                 import traceback
+
                 traceback.print_exc()
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}")

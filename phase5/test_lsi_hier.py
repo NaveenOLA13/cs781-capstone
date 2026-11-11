@@ -1,12 +1,6 @@
 """Self-test of the whole-document stage (lsi_hier.py), knowledge distillation from a Stage B teacher (lsi_grid.plan_kd
-+ lsi_train) and the report, on tiny stand-in models. Needs torch. About 2 minutes.
-python test_lsi_hier.py  -> every line PASS
++ lsi_train) and the report, on tiny stand-in models."""
 
-Checks: every Stage B version gives the same scores for a document alone and inside a padded batch; the "_res"
-version starts exactly as the run (max over chunk scores); run_stage_b trains all versions from chunks.pt and writes
-probabilities (also for training documents), metrics, submissions and hier.txt; a Stage B version and an ensemble can
-be KD teachers (the student starts from the run's checkpoint with the run's settings); report() lists everything.
-"""
 import json
 import os
 import sys
@@ -40,11 +34,10 @@ def test_stage_b_padding_and_start():
             alone = m(a_f, a_z, torch.ones(1, 2, dtype=torch.bool))
             batched = m(F_, Z, M)[:1]
         assert torch.allclose(alone, batched, atol=1e-5), (v, alone, batched)
-        if v.endswith("_res"):                                     # starts as the run: max over chunk scores
-            assert torch.allclose(m(F_, Z, M), torch.stack([a_z[0].max(0).values, b_z[0].max(0).values]),
-                                  atol=1e-6)
-    # chunk dropout keeps at least one chunk and never mixes documents
+        if v.endswith("_res"):
+            assert torch.allclose(m(F_, Z, M), torch.stack([a_z[0].max(0).values, b_z[0].max(0).values]), atol=1e-6)
     import random
+
     feats = [torch.randn(3, d).half(), torch.randn(1, d).half()]
     logits = [torch.randn(3, n_lab).half(), torch.randn(1, n_lab).half()]
     F2, Z2, M2 = H.make_batch(feats, logits, [0, 1], "cpu", p_drop=0.9, rng=random.Random(0))
@@ -56,8 +49,9 @@ def test_stage_b_kd_report():
         root = make_fake_lsi(tmp, n_train=200, n_dev=60, n_test=20, n_words=(20, 70), at_end=True)
         out = os.path.join(tmp, "runs")
         common = dict(FAST, data_root=root, out_dir=out, cache_dir=os.path.join(tmp, "cache"), epochs=3)
-        run = S.run(_bb("llama"), name="llama", technique="full", lr_body=1e-3, save_chunks=True, ckpt_path="toy",
-                    **common)["out_dir"]
+        run = S.run(
+            _bb("llama"), name="llama", technique="full", lr_body=1e-3, save_chunks=True, ckpt_path="toy", **common
+        )["out_dir"]
         res = H.run_stage_b(run, epochs=4, hidden=32, batch=16, patience=4, log=lambda *a: None)
         assert set(res) == set(H.VERSIONS)
         for v in H.VERSIONS:
@@ -66,14 +60,14 @@ def test_stage_b_kd_report():
             assert {"cv_global", "cv_per_label", "dev_chosen", "best_epoch", "params", "history"} <= set(m)
             assert json.load(open(os.path.join(folder, "labels.json"))) == [3, 7, 11, 20, 31]
             assert len(json.load(open(os.path.join(folder, "train_probs.json")))) == 200
-            rows = json.loads(zipfile.ZipFile(os.path.join(folder, "submission", "submission.zip"))
-                              .read("prediction.json"))
+            rows = json.loads(
+                zipfile.ZipFile(os.path.join(folder, "submission", "submission.zip")).read("prediction.json")
+            )
             assert len(rows) == 20 and all(r["pred"] for r in rows)
         res_m = json.load(open(os.path.join(run, "stageB", "gru_attn_res", "metrics.json")))
         run_m = json.load(open(os.path.join(run, "metrics.json")))
-        assert abs(res_m["history"][0]["dev_macro_f1"] - run_m["dev_global"]["macro_f1"]) < 0.05   # epoch 0 = run
+        assert abs(res_m["history"][0]["dev_macro_f1"] - run_m["dev_global"]["macro_f1"]) < 0.05
         assert "best on dev" in open(os.path.join(run, "stageB", "hier.txt")).read()
-        # knowledge distillation with a Stage B teacher: the student starts from the run's checkpoint and settings
         teacher = os.path.join(run, "stageB", "gru_attn")
         p = G.plan_kd(teacher, out_dir=out)
         assert p["sft_dir"] == run and p["ckpt"] == "toy" and p["model"] == "llama"
@@ -82,10 +76,16 @@ def test_stage_b_kd_report():
         assert s_kd["kd_teacher"] == os.path.join(teacher, "train_probs.json") and s_kd["student_layers"] == 0.5
         assert s_kd["eval_chunks"] == 6 and s_kd["save_chunks"] is False
         assert "kd_teacher" not in p["jobs"][1]["settings"]
-        st = S.run(_bb("llama"), name="llama", technique="full", run_name="llama_student_kd",
-                   **{k: v for k, v in s_kd.items() if k not in ("data_root", "epochs")}, data_root=root, epochs=1)
+        st = S.run(
+            _bb("llama"),
+            name="llama",
+            technique="full",
+            run_name="llama_student_kd",
+            **{k: v for k, v in s_kd.items() if k not in ("data_root", "epochs")},
+            data_root=root,
+            epochs=1,
+        )
         assert st["metrics"]["kd"]["statutes_shared"] == 5 and st["metrics"]["student"]["layers_student"] == 2
-        # an ensemble as the teacher (needs sft_run for the student's checkpoint and settings)
         ens = G.ensemble([out], out_dir=os.path.join(tmp, "ens"), data_root=root, fetch=False, log=lambda *a: None)
         if ens["train_probs"]:
             pe = G.plan_kd(os.path.join(tmp, "ens"), out_dir=out, sft_run=run)
@@ -103,6 +103,7 @@ if __name__ == "__main__":
                 print(f"PASS {name}")
             except Exception as e:  # noqa: BLE001
                 import traceback
+
                 traceback.print_exc()
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}")

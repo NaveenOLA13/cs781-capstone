@@ -1,12 +1,5 @@
-"""Phase 3 (rhetorical roles): data loading, tokenisation, batching, class weights,
-metrics and the submission writer. No torch in this file.
+"""Phase 3 (rhetorical roles): data loading, tokenisation, batching, class weights, metrics and the submission writer."""
 
-Data layout (Exploration-Lab/CS-781-Capstone, Phase_3_RR):
-    Train/{CL,IT}_train.json, Train/{CL,IT}_dev.json : [{"id", "text": [sent, ...], "labels": [role, ...]}]
-    Test/{CL,IT}_test.json                           : {doc_id: [sent, ...]}
-    Train/label_vocab.json                           : the 13 roles
-Submission: submission.zip containing prediction.json = {doc_id: [one role per sentence, in order]}
-"""
 from __future__ import annotations
 
 import glob
@@ -24,7 +17,7 @@ def _read(path):
         return json.load(f)
 
 
-# ----------------------------------------------------------------------------- loading
+# --- loading
 def load_labels(root: str = DEFAULT_ROOT) -> list[str]:
     """The role names in label_vocab.json order (accepts a list or a dict in either direction)."""
     paths = sorted(glob.glob(os.path.join(root, "**", "label_vocab.json"), recursive=True))
@@ -39,9 +32,9 @@ def load_labels(root: str = DEFAULT_ROOT) -> list[str]:
     if isinstance(v, list):
         labels = [str(x) for x in v]
     elif isinstance(v, dict) and all(isinstance(x, int) for x in v.values()):
-        labels = sorted(v, key=v.get)                               # {"Fact": 0, ...}
+        labels = sorted(v, key=v.get)
     elif isinstance(v, dict) and all(str(k).lstrip("-").isdigit() for k in v):
-        labels = [str(v[k]) for k in sorted(v, key=int)]            # {"0": "Fact", ...}
+        labels = [str(v[k]) for k in sorted(v, key=int)]
     else:
         raise ValueError(f"unrecognised label_vocab.json format: {str(v)[:200]}")
     if len(set(labels)) != len(labels):
@@ -71,9 +64,16 @@ def load_docs(root: str = DEFAULT_ROOT) -> list[dict]:
             labels = r.get("labels")
             if labels is not None and len(labels) != len(sents):
                 raise ValueError(f"{name} / {r.get('id')}: {len(sents)} sentences but {len(labels)} labels")
-            docs.append(dict(id=str(r["id"]), domain=domain, split=split, file=os.path.relpath(path, root),
-                             sents=[str(s) for s in sents],
-                             labels=None if labels is None else [str(l) for l in labels]))
+            docs.append(
+                dict(
+                    id=str(r["id"]),
+                    domain=domain,
+                    split=split,
+                    file=os.path.relpath(path, root),
+                    sents=[str(s) for s in sents],
+                    labels=None if labels is None else [str(l) for l in labels],
+                )
+            )
     if not docs:
         raise FileNotFoundError(f"no data files found under {root}")
     for split in ("train", "dev", "test"):
@@ -101,7 +101,7 @@ def check_labels(docs: list[dict], labels: list[str]) -> None:
         raise ValueError(f"labels not in label_vocab.json: {dict(bad)}")
 
 
-# ------------------------------------------------------------------------ positions
+# --- positions
 def pos_bucket(i: int, n: int, buckets: int = 10) -> int:
     """Relative position of sentence i (0-based) in a judgment of n sentences -> 0..buckets-1."""
     if buckets <= 0 or n <= 0:
@@ -109,19 +109,25 @@ def pos_bucket(i: int, n: int, buckets: int = 10) -> int:
     return min(buckets - 1, (i * buckets) // n)
 
 
-# ----------------------------------------------------------------------- tokenising
+# --- tokenising
 def truncate(ids: list[int], budget: int, tail: int) -> list[int]:
     """Keep the first (budget - tail) and the last `tail` tokens of a long sentence."""
     if len(ids) <= budget:
         return ids
     tail = max(0, min(tail, budget - 1))
-    return ids[:budget - tail] + (ids[-tail:] if tail else [])
+    return ids[: budget - tail] + (ids[-tail:] if tail else [])
 
 
-def encode_docs(docs: list[dict], encode, max_len: int = 128, tail: int | None = None,
-                bos_id: int | None = None, eos_id: int | None = None, fallback_id: int = 0) -> list[int]:
-    """Tokenise every sentence once; stores d["ids"] (list of token-id lists) on each doc.
-    Returns the untruncated token count of every sentence (for the length report)."""
+def encode_docs(
+    docs: list[dict],
+    encode,
+    max_len: int = 128,
+    tail: int | None = None,
+    bos_id: int | None = None,
+    eos_id: int | None = None,
+    fallback_id: int = 0,
+) -> list[int]:
+    """Tokenise every sentence once; stores d["ids"] (list of token-id lists) on each doc."""
     budget = max_len - (bos_id is not None) - (eos_id is not None)
     if budget < 2:
         raise ValueError("max_len too small")
@@ -141,7 +147,7 @@ def encode_docs(docs: list[dict], encode, max_len: int = 128, tail: int | None =
                 t = [bos_id] + t
             if eos_id is not None:
                 t = t + [eos_id]
-            out.append(t if t else [fallback_id])     # an empty sentence still gets one token
+            out.append(t if t else [fallback_id])
         d["ids"] = out
     return raw_lengths
 
@@ -152,18 +158,17 @@ def length_report(raw_lengths: list[int], max_len: int) -> str:
     s = sorted(raw_lengths)
     pct = {p: s[min(len(s) - 1, int(p / 100 * len(s)))] for p in (50, 90, 95, 99)}
     cut = sum(1 for x in s if x > max_len)
-    return (f"tokens per sentence: median {pct[50]}, p90 {pct[90]}, p95 {pct[95]}, p99 {pct[99]}, "
-            f"max {s[-1]} | longer than max_len={max_len}: {cut} ({cut / len(s):.1%}), kept start + end")
+    return (
+        f"tokens per sentence: median {pct[50]}, p90 {pct[90]}, p95 {pct[95]}, p99 {pct[99]}, "
+        f"max {s[-1]} | longer than max_len={max_len}: {cut} ({cut / len(s):.1%}), kept start + end"
+    )
 
 
-# ------------------------------------------------------------------------- batching
-def length_batches(lengths: list[int], batch_size: int, shuffle: bool, seed: int = 0,
-                   pool: int = 50, exact: bool = False) -> list[list[int]]:
-    """Batches of indices with similar lengths (little padding).
-    shuffle=False: sorted by length (prediction). shuffle=True: random pools of
-    batch_size*pool items are sorted by length and cut into batches; batch order is shuffled.
-    exact=True: every batch holds sentences of exactly one length (no padding at all), for
-    models whose outputs change with padding (e.g. a bidirectional RNN encoder)."""
+# --- batching
+def length_batches(
+    lengths: list[int], batch_size: int, shuffle: bool, seed: int = 0, pool: int = 50, exact: bool = False
+) -> list[list[int]]:
+    """Batches of indices with similar lengths (little padding)."""
     idx = list(range(len(lengths)))
     if exact:
         rng = random.Random(seed)
@@ -175,25 +180,25 @@ def length_batches(lengths: list[int], batch_size: int, shuffle: bool, seed: int
             g = groups[L]
             if shuffle:
                 rng.shuffle(g)
-            batches += [g[i:i + batch_size] for i in range(0, len(g), batch_size)]
+            batches += [g[i : i + batch_size] for i in range(0, len(g), batch_size)]
         if shuffle:
             rng.shuffle(batches)
         return batches
     if not shuffle:
         idx.sort(key=lambda i: lengths[i])
-        return [idx[i:i + batch_size] for i in range(0, len(idx), batch_size)]
+        return [idx[i : i + batch_size] for i in range(0, len(idx), batch_size)]
     rng = random.Random(seed)
     rng.shuffle(idx)
     batches = []
     chunk = batch_size * pool
     for c in range(0, len(idx), chunk):
-        part = sorted(idx[c:c + chunk], key=lambda i: lengths[i])
-        batches += [part[i:i + batch_size] for i in range(0, len(part), batch_size)]
+        part = sorted(idx[c : c + chunk], key=lambda i: lengths[i])
+        batches += [part[i : i + batch_size] for i in range(0, len(part), batch_size)]
     rng.shuffle(batches)
     return batches
 
 
-# -------------------------------------------------------------------- class weights
+# --- class weights
 def class_weights(y: list[int], n_labels: int, cap: float = 10.0, power: float = 0.5):
     """w_c = min(cap, (count of most common role / count_c) ** power); 1/sqrt(frequency) by default."""
     cnt = Counter(y)
@@ -202,11 +207,9 @@ def class_weights(y: list[int], n_labels: int, cap: float = 10.0, power: float =
     return w, [cnt.get(c, 0) for c in range(n_labels)]
 
 
-# -------------------------------------------------------------------------- metrics
+# --- metrics
 def scores(gold: list[int], pred: list[int], labels: list[str]) -> dict:
-    """Per-role precision/recall/F1, confusion matrix and macro-F1.
-    macro_f1:       average over roles that occur in gold or predictions (sklearn's default)
-    macro_f1_all13: average over all roles (a role absent from both counts as 0)"""
+    """Per-role precision/recall/F1, confusion matrix and macro-F1."""
     n = len(labels)
     cm = [[0] * n for _ in range(n)]
     for g, p in zip(gold, pred):
@@ -223,9 +226,14 @@ def scores(gold: list[int], pred: list[int], labels: list[str]) -> dict:
         f_all.append(f)
         if support or predicted:
             f_present.append(f)
-    return dict(macro_f1=sum(f_present) / max(1, len(f_present)), macro_f1_all13=sum(f_all) / n,
-                accuracy=sum(cm[c][c] for c in range(n)) / max(1, len(gold)), n=len(gold),
-                per_label=per, confusion=cm)
+    return dict(
+        macro_f1=sum(f_present) / max(1, len(f_present)),
+        macro_f1_all13=sum(f_all) / n,
+        accuracy=sum(cm[c][c] for c in range(n)) / max(1, len(gold)),
+        n=len(gold),
+        per_label=per,
+        confusion=cm,
+    )
 
 
 def evaluate(docs: list[dict], preds: dict[str, list[str]], labels: list[str]) -> dict:
@@ -248,35 +256,43 @@ def evaluate(docs: list[dict], preds: dict[str, list[str]], labels: list[str]) -
 
 
 def top_confusions(cm: list[list[int]], labels: list[str], k: int = 10):
-    pairs = [(cm[g][p], labels[g], labels[p]) for g in range(len(labels)) for p in range(len(labels))
-             if g != p and cm[g][p]]
+    pairs = [
+        (cm[g][p], labels[g], labels[p]) for g in range(len(labels)) for p in range(len(labels)) if g != p and cm[g][p]
+    ]
     return sorted(pairs, reverse=True)[:k]
 
 
 def format_report(results: dict[str, dict], labels: list[str], k_mistakes: int = 8) -> str:
-    """results: {"Stage A": evaluate(...), "Stage B": evaluate(...), ...} -> text tables:
-    13-role average and macro-F1 (overall, CL, IT), accuracy, per-role F1 for each domain,
-    and the most common mistakes of the last result in each domain."""
+    """results: {"Stage A": evaluate(...), "Stage B": evaluate(...), ...} -> text tables: 13-role average and macro-F1
+    (overall, CL, IT), accuracy, per-role F1 for each domain, and the most common mistakes of the last result in
+    each domain."""
     names = list(results)
     doms = [k for k in next(iter(results.values())) if k != "all"]
     w = max(10, max(len(n) for n in names) + 2)
     lines = [f"{'':20s}" + "".join(f"{n:>{w}s}" for n in names)]
     for key in ["all"] + doms:
-        lines.append(f"{('13-role avg ' + key):20s}" +
-                     "".join(f"{results[n][key]['macro_f1_all13']:{w}.4f}" for n in names))
+        lines.append(
+            f"{('13-role avg ' + key):20s}" + "".join(f"{results[n][key]['macro_f1_all13']:{w}.4f}" for n in names)
+        )
     for key in ["all"] + doms:
         lines.append(f"{('macro-F1 ' + key):20s}" + "".join(f"{results[n][key]['macro_f1']:{w}.4f}" for n in names))
     lines.append(f"{'accuracy':20s}" + "".join(f"{results[n]['all']['accuracy']:{w}.4f}" for n in names))
     lines.append("   (13-role avg = every role counts, as on Codabench; macro-F1 = only roles present)")
     lines.append("")
     cw = max(9, max(len(n) for n in names) + 5)
-    lines.append(f"{'F1 per role':24s}" + "".join(f"{('n ' + dm):>7s}" for dm in doms) +
-                 "".join(f"{(n + ' ' + dm):>{cw}s}" for n in names for dm in doms))
+    lines.append(
+        f"{'F1 per role':24s}"
+        + "".join(f"{('n ' + dm):>7s}" for dm in doms)
+        + "".join(f"{(n + ' ' + dm):>{cw}s}" for n in names for dm in doms)
+    )
     first = results[names[0]]
     order = sorted(labels, key=lambda l: -first["all"]["per_label"][l]["support"])
     for l in order:
-        lines.append(f"{l:24s}" + "".join(f"{first[dm]['per_label'][l]['support']:7d}" for dm in doms) +
-                     "".join(f"{results[n][dm]['per_label'][l]['f1']:{cw}.3f}" for n in names for dm in doms))
+        lines.append(
+            f"{l:24s}"
+            + "".join(f"{first[dm]['per_label'][l]['support']:7d}" for dm in doms)
+            + "".join(f"{results[n][dm]['per_label'][l]['f1']:{cw}.3f}" for n in names for dm in doms)
+        )
     last = names[-1]
     for dm in doms:
         lines.append(f"\nmost common mistakes ({last}, {dm}): gold -> predicted")
@@ -292,9 +308,7 @@ def confusion_csv(cm: list[list[int]], labels: list[str], path: str) -> None:
             f.write(l + "," + ",".join(map(str, row)) + "\n")
 
 
-# ------------------------------------------------------------------- comparing runs
-# Roles that are easy to mix up: similar wording, or the same part of the judgment.
-# The first four include the most common mistakes of encdec_full (PrecRelied->Ratio, ArgResp->ArgPet).
+# --- comparing runs
 CLOSE_PAIRS = [
     ("Pet/Resp", "ArgumentPetitioner", "ArgumentRespondent"),
     ("Relied/Ratio", "PrecedentReliedUpon", "RatioOfTheDecision"),
@@ -307,9 +321,8 @@ CLOSE_PAIRS = [
 
 
 def pair_confusions(rep: dict, labels: list[str], pairs=CLOSE_PAIRS) -> dict:
-    """For each pair (a, b) and domain: of the sentences whose gold role is a or b, the share that
-    got the other role of the pair (rate; lower = the two roles are kept apart better).
-    rep: evaluate(...) output. Returns {short name: {domain: {rate, a_to_b, b_to_a, n}}}."""
+    """For each pair (a, b) and domain: of the sentences whose gold role is a or b, the share that got the other role
+    of the pair (rate; lower = the two roles are kept apart better)."""
     idx = {l: i for i, l in enumerate(labels)}
     out = {}
     for short, a, b in pairs:
@@ -330,9 +343,8 @@ def _fmt(x, spec: str, width: int) -> str:
 
 
 def format_comparison(runs: dict[str, dict | None], pairs=CLOSE_PAIRS) -> str:
-    """runs: {method name: metrics dict saved by rr_train.run (None = the run failed)} -> tables:
-    cost, dev 13-role average (all / CL / IT) of Stage A and Stage B, memorising (train vs dev
-    accuracy of Stage A), and how often closely related roles are mixed up, per domain."""
+    """runs: {method name: metrics dict saved by rr_train.run (None = the run failed)} -> tables: cost, dev 13-role
+    average (all / CL / IT) of Stage A and Stage B, memorising."""
     ok = {k: v for k, v in runs.items() if v}
     failed = [k for k, v in runs.items() if not v]
     if not ok:
@@ -344,19 +356,23 @@ def format_comparison(runs: dict[str, dict | None], pairs=CLOSE_PAIRS) -> str:
     L = []
 
     L.append("COST (Stage A)")
-    L.append(f"{'method':{w}s}{'model size':>12s}{'trainable':>12s}{'% of all':>11s}{'saved file':>13s}"
-             f"{'peak GPU':>11s}{'time':>9s}{'s/epoch':>9s}{'best epoch':>12s}{'dev pass':>10s}")
+    L.append(
+        f"{'method':{w}s}{'model size':>12s}{'trainable':>12s}{'% of all':>11s}{'saved file':>13s}"
+        f"{'peak GPU':>11s}{'time':>9s}{'s/epoch':>9s}{'best epoch':>12s}{'dev pass':>10s}"
+    )
     for k, m in ok.items():
         a = m["stage_a"]
         hist = a.get("history") or []
         per_ep = sum(h["seconds"] for h in hist) / len(hist) if hist else None
         tot = a.get("total_params")
         pct = 100 * a["trainable_params"] / tot if tot else None
-        L.append(f"{k:{w}s}{_fmt(None if tot is None else tot / 1e6, '.2f', 11)}M"
-                 f"{a['trainable_params'] / 1e6:>11.3f}M{_fmt(pct, '.2f', 10)}%"
-                 f"{_fmt(a.get('saved_mb'), '.1f', 10)} MB{_fmt(a.get('peak_gpu_gb'), '.2f', 8)} GB"
-                 f"{a['train_seconds'] / 60:>8.1f}m{_fmt(per_ep, '.0f', 8)}s{a['best_epoch']:>9d}/{len(hist):<2d}"
-                 f"{_fmt(a.get('dev_infer_seconds'), '.1f', 9)}s")
+        L.append(
+            f"{k:{w}s}{_fmt(None if tot is None else tot / 1e6, '.2f', 11)}M"
+            f"{a['trainable_params'] / 1e6:>11.3f}M{_fmt(pct, '.2f', 10)}%"
+            f"{_fmt(a.get('saved_mb'), '.1f', 10)} MB{_fmt(a.get('peak_gpu_gb'), '.2f', 8)} GB"
+            f"{a['train_seconds'] / 60:>8.1f}m{_fmt(per_ep, '.0f', 8)}s{a['best_epoch']:>9d}/{len(hist):<2d}"
+            f"{_fmt(a.get('dev_infer_seconds'), '.1f', 9)}s"
+        )
     L.append("   (model size = all weights of one model; dev pass = Stage A time to read every dev sentence once)")
 
     L.append("\nDEV 13-ROLE AVERAGE (the Codabench metric)")
@@ -364,8 +380,11 @@ def format_comparison(runs: dict[str, dict | None], pairs=CLOSE_PAIRS) -> str:
     L.append(f"{'method':{w}s}" + "".join(f"{(st + ' ' + dm):>9s}" for st, dm in cols) + f"{'B acc':>9s}")
     for k, m in ok.items():
         st_key = {"A": "stage_a", "B": "stage_b"}
-        L.append(f"{k:{w}s}" + "".join(f"{m[st_key[st]]['dev'][dm]['macro_f1_all13']:>9.4f}" for st, dm in cols)
-                 + f"{m['stage_b']['dev']['all']['accuracy']:>9.4f}")
+        L.append(
+            f"{k:{w}s}"
+            + "".join(f"{m[st_key[st]]['dev'][dm]['macro_f1_all13']:>9.4f}" for st, dm in cols)
+            + f"{m['stage_b']['dev']['all']['accuracy']:>9.4f}"
+        )
 
     L.append("\nMEMORISING (Stage A accuracy on its own training sentences vs dev; big gap = memorising)")
     L.append(f"{'method':{w}s}{'train acc':>11s}{'dev acc':>9s}{'gap':>8s}")
@@ -377,8 +396,10 @@ def format_comparison(runs: dict[str, dict | None], pairs=CLOSE_PAIRS) -> str:
     names = [p[0] for p in pairs if p[1] in labels and p[2] in labels]
     if names:
         pw = max(9, max(len(n) for n in names) + 2)
-        L.append("\nCLOSELY RELATED ROLES: % of the two roles' dev sentences given the other role of the pair "
-                 "(lower = kept apart better)")
+        L.append(
+            "\nCLOSELY RELATED ROLES: % of the two roles' dev sentences given the other role of the pair "
+            "(lower = kept apart better)"
+        )
         L += [f"  {s:14s} {a} / {b}" for s, a, b in pairs if s in names]
         for st, st_key in (("Stage A", "stage_a"), ("Stage B", "stage_b")):
             pc = {k: pair_confusions(m[st_key]["dev"], labels, pairs) for k, m in ok.items()}
@@ -386,9 +407,13 @@ def format_comparison(runs: dict[str, dict | None], pairs=CLOSE_PAIRS) -> str:
                 L.append(f"\n{st}, {dm}")
                 L.append(f"{'method':{w}s}" + "".join(f"{n:>{pw}s}" for n in names))
                 for k in ok:
-                    L.append(f"{k:{w}s}" + "".join(
-                        _fmt(None if pc[k][n][dm]["rate"] is None else 100 * pc[k][n][dm]["rate"], ".1f", pw)
-                        for n in names))
+                    L.append(
+                        f"{k:{w}s}"
+                        + "".join(
+                            _fmt(None if pc[k][n][dm]["rate"] is None else 100 * pc[k][n][dm]["rate"], ".1f", pw)
+                            for n in names
+                        )
+                    )
                 ref = next(iter(pc.values()))
                 L.append(f"{'(sentences)':{w}s}" + "".join(f"{ref[n][dm]['n']:>{pw}d}" for n in names))
     if failed:
@@ -396,9 +421,8 @@ def format_comparison(runs: dict[str, dict | None], pairs=CLOSE_PAIRS) -> str:
     return "\n".join(L)
 
 
-# ----------------------------------------------------------------------- submission
-def write_submission(test_docs: list[dict], preds: dict[str, list[str]], labels: list[str],
-                     out_dir: str) -> str:
+# --- submission
+def write_submission(test_docs: list[dict], preds: dict[str, list[str]], labels: list[str], out_dir: str) -> str:
     """Checks every judgment and sentence count, writes prediction.json and submission.zip."""
     allowed = set(labels)
     problems, sub = [], {}
@@ -422,7 +446,7 @@ def write_submission(test_docs: list[dict], preds: dict[str, list[str]], labels:
     zpath = os.path.join(out_dir, "submission.zip")
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(jpath, arcname="prediction.json")
-    with zipfile.ZipFile(zpath) as z:                      # read back what Codabench will read
+    with zipfile.ZipFile(zpath) as z:
         names = z.namelist()
         back = json.loads(z.read("prediction.json"))
     assert names == ["prediction.json"] and back == sub, "zip read-back mismatch"
@@ -433,7 +457,7 @@ def write_submission(test_docs: list[dict], preds: dict[str, list[str]], labels:
     return zpath
 
 
-# ------------------------------------------------------------------ cross-validation
+# --- cross-validation
 def make_folds(docs: list[dict], k: int = 5, seed: int = 0) -> list[list[int]]:
     """k groups of document indices with the same share of each domain (CL, IT) in every group."""
     rng = random.Random(seed)
@@ -449,8 +473,9 @@ def make_folds(docs: list[dict], k: int = 5, seed: int = 0) -> list[list[int]]:
 
 
 def macro_f1_np(gold, pred, n_labels: int, present_only: bool = False) -> float:
-    """Fast macro-F1 with numpy. Default: average over all n_labels roles (Codabench style)."""
+    """Fast macro-F1 with numpy."""
     import numpy as np
+
     gold, pred = np.asarray(gold), np.asarray(pred)
     cm = np.bincount(gold * n_labels + pred, minlength=n_labels * n_labels).reshape(n_labels, n_labels)
     tp = np.diag(cm).astype(float)
@@ -465,12 +490,10 @@ def macro_f1_np(gold, pred, n_labels: int, present_only: bool = False) -> float:
 
 
 def tune_biases(logp, gold, n_labels: int, groups=None, n_groups: int = 1, grid=None, passes: int = 3):
-    """Per-role numbers added to the log-probabilities before choosing the role, set to
-    maximise the 13-role macro-F1 (a role with a positive bias is chosen more readily).
-    groups: optional group id per sentence (e.g. 0 = CL, 1 = IT) -> one bias vector per group.
-    Coordinate ascent: for each (group, role) try every grid value, keep the best; repeat.
-    Returns (biases [n_groups, n_labels], score before, score after)."""
+    """Per-role numbers added to the log-probabilities before choosing the role, set to maximise the 13-role macro-F1
+    (a role with a positive bias is chosen more readily)."""
     import numpy as np
+
     logp = np.asarray(logp, dtype=np.float64)
     gold = np.asarray(gold)
     groups = np.zeros(len(gold), dtype=int) if groups is None else np.asarray(groups)
@@ -502,6 +525,7 @@ def tune_biases(logp, gold, n_labels: int, groups=None, n_groups: int = 1, grid=
 def biased_preds(docs: list[dict], logps, labels: list[str], bias, group_of) -> dict[str, list[str]]:
     """{doc_id: [role per sentence]} after adding bias[group_of(doc)] to each sentence's log-probs."""
     import numpy as np
+
     out = {}
     for d, lp in zip(docs, logps):
         if lp is None or len(lp) == 0:
@@ -511,11 +535,12 @@ def biased_preds(docs: list[dict], logps, labels: list[str], bias, group_of) -> 
     return out
 
 
-# ------------------------------------------------------------- role-sequence smoothing
+# --- role-sequence smoothing
 def transition_logprobs(label_seqs, labels: list[str], alpha: float = 1.0):
-    """From gold role sequences: log P(role of the next sentence | role of this sentence) [L, L] and
-    log P(role of the first sentence) [L], with add-alpha counts so unseen changes stay possible."""
+    """From gold role sequences: log P(role of the next sentence | role of this sentence) [L, L] and log P(role of the
+    first sentence) [L], with add-alpha counts so unseen changes stay possible."""
     import numpy as np
+
     idx = {l: i for i, l in enumerate(labels)}
     L = len(labels)
     trans, start = np.full((L, L), float(alpha)), np.full(L, float(alpha))
@@ -529,10 +554,10 @@ def transition_logprobs(label_seqs, labels: list[str], alpha: float = 1.0):
 
 
 def viterbi(logp, trans, start, w: float) -> list[int]:
-    """The role sequence of one judgment that maximises
-        sum_i logp[i, y_i] + w * (start[y_0] + sum_i trans[y_(i-1), y_i]).
-    logp: [S, L] model log-probabilities; w = 0 gives the model's own choice per sentence."""
+    """The role sequence of one judgment that maximises sum_i logp[i, y_i] + w * (start[y_0] + sum_i trans[y_(i-1),
+    y_i])."""
     import numpy as np
+
     logp = np.asarray(logp, dtype=np.float64)
     if len(logp) == 0:
         return []
@@ -542,7 +567,7 @@ def viterbi(logp, trans, start, w: float) -> list[int]:
     score = logp[0] + w * start
     back = np.zeros((S, L), dtype=np.int64)
     for i in range(1, S):
-        cand = score[:, None] + w * trans                  # [previous role, this role]
+        cand = score[:, None] + w * trans
         back[i] = cand.argmax(0)
         score = cand.max(0) + logp[i]
     path = [int(score.argmax())]
@@ -563,20 +588,21 @@ def smoothed_preds(docs: list[dict], logps, labels: list[str], trans_for, w: flo
     return out
 
 
-def tune_smoothing(docs: list[dict], logps, labels: list[str], trans_for, weights=(0, 0.1, 0.2, 0.3, 0.5, 0.75,
-                                                                                  1.0, 1.5, 2.0)):
-    """Tries each weight on labelled judgments (out-of-fold predictions); returns (best w, {w: evaluate(...)}).
-    Ties go to the smaller weight (less change)."""
+def tune_smoothing(
+    docs: list[dict], logps, labels: list[str], trans_for, weights=(0, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0)
+):
+    """Tries each weight on labelled judgments (out-of-fold predictions); returns (best w, {w: evaluate(...)})."""
     table = {w: evaluate(docs, smoothed_preds(docs, logps, labels, trans_for, w), labels) for w in weights}
     best = max(sorted(table), key=lambda w: (round(table[w]["all"]["macro_f1_all13"], 6), -w))
     return best, table
 
 
-def tune_smoothing_per_domain(docs: list[dict], logps, labels: list[str], trans_for,
-                              weights=(0, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0)):
-    """One smoothing weight per domain (e.g. CL and IT), chosen together on labelled judgments.
-    Returns ({domain: w}, evaluate(...) of that choice). Ties go to the smaller total weight."""
+def tune_smoothing_per_domain(
+    docs: list[dict], logps, labels: list[str], trans_for, weights=(0, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0)
+):
+    """One smoothing weight per domain (e.g. CL and IT), chosen together on labelled judgments."""
     import itertools
+
     domains = sorted({d["domain"] for d in docs})
     per_w = {w: smoothed_preds(docs, logps, labels, trans_for, w) for w in weights}
     best, best_key, best_rep = None, None, None

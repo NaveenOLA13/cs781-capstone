@@ -1,4 +1,5 @@
-"""Self-test of cj_ensemble.py (no torch needed).   python test_cj_ensemble.py  -> every line PASS"""
+"""Self-test of cj_ensemble.py (no torch needed). python test_cj_ensemble.py -> every line PASS"""
+
 import json
 import os
 import random
@@ -31,9 +32,8 @@ def test_ensemble_picks_complementary_runs():
         test_ids = [d["id"] for d in data["test"]]
         y = {d["id"]: d["label"] for d in data["dev"]}
         base = os.path.join(tmp, "runs")
-        # three runs, each wrong on a different fifth of dev: the average of the three is right everywhere
         for k, name in enumerate(("a_full", "b_lorma", "c_adapter")):
-            _run(os.path.join(base, name), dev_ids, test_ids, y, set(dev_ids[k * 12:(k + 1) * 12]), rng)
+            _run(os.path.join(base, name), dev_ids, test_ids, y, set(dev_ids[k * 12 : (k + 1) * 12]), rng)
         _run(os.path.join(base, "d_bad"), dev_ids, test_ids, y, set(dev_ids[:40]), rng)
         _run(os.path.join(base, "a_full", "hier_k8", "gru_attn"), dev_ids, test_ids, y, set(dev_ids[48:60]), rng)
         quick = os.path.join(base, "quick")
@@ -63,6 +63,7 @@ if __name__ == "__main__":
                 print(f"PASS {name}")
             except Exception as e:  # noqa: BLE001
                 import traceback
+
                 traceback.print_exc()
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}")

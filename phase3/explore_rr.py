@@ -1,8 +1,6 @@
-"""Explore the Phase 3 (rhetorical role) data: sizes, label balance, sentence lengths,
-where each role occurs in a judgment, and which role follows which.
+"""Explore the Phase 3 (rhetorical role) data: sizes, label balance, sentence lengths, where each role occurs in a
+judgment, and which role follows which."""
 
-Kaggle:  %run explore_rr.py        (charts appear inline and are saved to /kaggle/working/rr_viz)
-"""
 import collections
 import glob
 import json
@@ -16,8 +14,13 @@ OUT = os.environ.get("RR_OUT", "/kaggle/working/rr_viz")
 os.makedirs(OUT, exist_ok=True)
 if not os.path.isdir(R):
     from huggingface_hub import snapshot_download
-    snapshot_download(repo_id="Exploration-Lab/CS-781-Capstone", repo_type="dataset",
-                      local_dir=os.path.dirname(R), allow_patterns=["Phase_3_RR/*"])
+
+    snapshot_download(
+        repo_id="Exploration-Lab/CS-781-Capstone",
+        repo_type="dataset",
+        local_dir=os.path.dirname(R),
+        allow_patterns=["Phase_3_RR/*"],
+    )
 
 
 def load(p):
@@ -31,7 +34,7 @@ def records(obj):
     return obj
 
 
-# ------------------------------------------------------------------------ load
+# --- load
 docs = []
 for p in sorted(glob.glob(f"{R}/**/*.json", recursive=True)):
     name = os.path.basename(p)
@@ -61,8 +64,10 @@ print("label_vocab:", vocab, "\n")
 lab = [d for d in docs if d["labels"]]
 DOMAINS = sorted({d["domain"] for d in docs})
 
-# --------------------------------------------------------------------- overview
-print(f"{'split':6s} {'domain':6s} {'docs':>5s} {'sentences':>10s} {'sent/doc (median, max)':>24s} {'len mismatch':>13s}")
+# --- overview
+print(
+    f"{'split':6s} {'domain':6s} {'docs':>5s} {'sentences':>10s} {'sent/doc (median, max)':>24s} {'len mismatch':>13s}"
+)
 for split in ("train", "dev", "test"):
     for dom in DOMAINS:
         ds = [d for d in docs if d["split"] == split and d["domain"] == dom]
@@ -75,7 +80,7 @@ unknown = collections.Counter(l for d in lab for l in d["labels"] if l not in LA
 if unknown:
     print("labels not in label_vocab:", dict(unknown))
 
-# ------------------------------------------------------------------ label table
+# --- label table
 cnt = {dom: collections.Counter(l for d in lab if d["domain"] == dom for l in d["labels"]) for dom in DOMAINS}
 tot = collections.Counter(l for d in lab for l in d["labels"])
 order = sorted(LABELS, key=lambda l: -tot[l])
@@ -91,7 +96,7 @@ def show(fig, name):
     plt.show()
 
 
-# ----------------------------------------------------- 1. label distribution
+# --- 1. label distribution
 fig, ax = plt.subplots(figsize=(9, 0.45 * len(order) + 1.5))
 y = np.arange(len(order))
 h = 0.8 / max(1, len(DOMAINS))
@@ -106,7 +111,7 @@ ax.set_title("Rhetorical role distribution by domain")
 ax.legend()
 show(fig, "1_label_distribution")
 
-# ------------------------------------------------- 2. sentences per document
+# --- 2. sentences per document
 fig, ax = plt.subplots(figsize=(8, 3.5))
 for dom in DOMAINS:
     ax.hist([len(d["sents"]) for d in docs if d["domain"] == dom], bins=30, alpha=0.6, label=dom)
@@ -116,7 +121,7 @@ ax.set_title("Document length")
 ax.legend()
 show(fig, "2_sentences_per_doc")
 
-# ------------------------------------------------------ 3. sentence length
+# --- 3. sentence length
 words = np.array([len(s.split()) for d in docs for s in d["sents"]])
 pct = {p: int(np.percentile(words, p)) for p in (50, 90, 95, 99)}
 fig, ax = plt.subplots(figsize=(8, 3.5))
@@ -130,7 +135,7 @@ ax.set_title("Sentence length")
 show(fig, "3_sentence_length")
 print("\nwords per sentence percentiles:", pct, " max:", int(words.max()))
 
-# --------------------------------------- 4. where each role occurs in a judgment
+# --- 4. where each role occurs in a judgment
 B = 10
 pos = np.zeros((len(order), B))
 idx = {l: i for i, l in enumerate(order)}
@@ -151,7 +156,7 @@ ax.set_title("Where each role occurs (each row sums to 1)")
 fig.colorbar(im, ax=ax)
 show(fig, "4_role_position")
 
-# --------------------------------------------- 5. which role follows which
+# --- 5. which role follows which
 T = np.zeros((len(order), len(order)))
 for d in lab:
     for a, b in zip(d["labels"], d["labels"][1:]):
@@ -171,20 +176,32 @@ fig.colorbar(im, ax=ax)
 show(fig, "5_role_transitions")
 same = np.trace(T) / max(T.sum(), 1)
 print(f"\nnext sentence has the same role as the current one: {same:.1%}")
-runs = [sum(1 for a, b in zip(d['labels'], d['labels'][1:]) if a != b) + 1 for d in lab if d["labels"]]
+runs = [sum(1 for a, b in zip(d["labels"], d["labels"][1:]) if a != b) + 1 for d in lab if d["labels"]]
 print(f"role blocks per document: median {int(np.median(runs))}")
 
-# ------------------------------------------------------------- a sample document
+# --- a sample document
 d = next((d for d in lab if d["split"] == "train"), lab[0] if lab else None)
 if d:
     print(f"\nsample document {d['id']} ({d['domain']}), first 15 sentences:")
     for s, l in list(zip(d["sents"], d["labels"]))[:15]:
         print(f"  [{l:20s}] {s[:110]}")
 
-json.dump({"labels": order, "domains": DOMAINS,
-           "counts": {dom: dict(cnt[dom]) for dom in DOMAINS},
-           "docs": {f"{sp}/{dom}": [len(x["sents"]) for x in docs if x["split"] == sp and x["domain"] == dom]
-                    for sp in ("train", "dev", "test") for dom in DOMAINS},
-           "word_percentiles": pct, "position": pos.tolist(), "transitions": T.tolist(), "same_role_next": same},
-          open(f"{OUT}/rr_summary.json", "w"), indent=1)
+json.dump(
+    {
+        "labels": order,
+        "domains": DOMAINS,
+        "counts": {dom: dict(cnt[dom]) for dom in DOMAINS},
+        "docs": {
+            f"{sp}/{dom}": [len(x["sents"]) for x in docs if x["split"] == sp and x["domain"] == dom]
+            for sp in ("train", "dev", "test")
+            for dom in DOMAINS
+        },
+        "word_percentiles": pct,
+        "position": pos.tolist(),
+        "transitions": T.tolist(),
+        "same_role_next": same,
+    },
+    open(f"{OUT}/rr_summary.json", "w"),
+    indent=1,
+)
 print(f"\ncharts and rr_summary.json saved in {OUT}")

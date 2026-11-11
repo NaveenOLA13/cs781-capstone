@@ -1,4 +1,5 @@
-"""Self-test of the Phase 6 data helpers (no torch).    python test_summ_data.py  -> every line PASS"""
+"""Self-test of the Phase 6 data helpers (no torch). python test_summ_data.py -> every line PASS"""
+
 import json
 import os
 import random
@@ -9,17 +10,27 @@ import zipfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import summ_data as D  # noqa: E402
 
-FILL = ["the record shows the hearing was held", "counsel for both parties were heard at length",
-        "the documents were placed before the bench", "several earlier orders were referred to",
-        "the matter was listed again after notice", "written submissions were filed by the state"]
-KEYS = ["the appellant was convicted under section 302", "the high court reversed the acquittal",
-        "the land acquisition notice was quashed", "the appeal is allowed with costs",
-        "the tenant was evicted for default in rent", "the bail application was rejected"]
+FILL = [
+    "the record shows the hearing was held",
+    "counsel for both parties were heard at length",
+    "the documents were placed before the bench",
+    "several earlier orders were referred to",
+    "the matter was listed again after notice",
+    "written submissions were filed by the state",
+]
+KEYS = [
+    "the appellant was convicted under section 302",
+    "the high court reversed the acquittal",
+    "the land acquisition notice was quashed",
+    "the appeal is allowed with costs",
+    "the tenant was evicted for default in rent",
+    "the bail application was rejected",
+]
 
 
 def make_fake_summ(tmp, n_train=60, n_test=8, n_sent=(8, 16), seed=0, dup_test=1):
-    """train.json / test.json like the Phase 6 data: a document = filler sentences + 2 key sentences; the summary =
-    the key sentences (reworded slightly). One training document repeats a test document (must be removed)."""
+    """train.json / test.json like the Phase 6 data: a document = filler sentences + 2 key sentences; the summary = the
+    key sentences (reworded slightly)."""
     rng = random.Random(seed)
 
     def doc():
@@ -29,6 +40,7 @@ def make_fake_summ(tmp, n_train=60, n_test=8, n_sent=(8, 16), seed=0, dup_test=1
             s.insert(rng.randint(0, len(s)), k.capitalize() + ".")
         summ = " ".join(("In short " + k + ".") for k in keys)
         return " ".join(x[0].upper() + x[1:] for x in s), summ
+
     root = os.path.join(tmp, "Phase_6_Summ")
     os.makedirs(os.path.join(root, "Train"))
     os.makedirs(os.path.join(root, "Test"))
@@ -56,9 +68,12 @@ def test_windows_align_pairs():
     assert [D.window_of(p, wins) for p in (0, 3, 4, 7, 8, 9)] == [0, 0, 1, 1, 2, 2]
     doc = ["Counsel were heard.", "The appellant was convicted under section 302.", "The appeal is allowed."]
     assert D.align(doc, ["Appeal allowed with no order.", "He was convicted under 302.", "the of"]) == [2, 1, -1]
-    enc = str.split                                   # one token per word
-    d = dict(id="a", document="Alpha beta gamma delta. Epsilon zeta eta theta. Iota kappa lambda mu.",
-             summary="Iota kappa summary. Alpha beta summary.")
+    enc = str.split
+    d = dict(
+        id="a",
+        document="Alpha beta gamma delta. Epsilon zeta eta theta. Iota kappa lambda mu.",
+        summary="Iota kappa summary. Alpha beta summary.",
+    )
     pairs, info = D.make_pairs([d], enc, window=4, tgt_tokens=50, empty_frac=0.0)
     assert [p["w"] for p in pairs] == [0, 2] and pairs[0]["tgt"] == ["Alpha", "beta", "summary."], pairs
     assert pairs[1]["src"] == ["Iota", "kappa", "lambda", "mu."] and info["empty_targets"] == 0
@@ -85,8 +100,14 @@ def test_length_post_submission():
     m = D.fit_length(docs)
     assert 0.8 < m["b"] < 1.2 and D.predict_words(m, " ".join(["w"] * 1000)) > D.predict_words(m, "w w w")
     assert D.allocate([100, 100, 50], 250) == [100, 100, 50] and min(D.allocate([5, 500], 100)) == 16
-    out = D.postprocess(["The appeal is allowed with costs. The appeal is thus allowed with costs.",
-                         "The parties shall bear costs. And then the", ""], max_words=None)
+    out = D.postprocess(
+        [
+            "The appeal is allowed with costs. The appeal is thus allowed with costs.",
+            "The parties shall bear costs. And then the",
+            "",
+        ],
+        max_words=None,
+    )
     assert out == "The appeal is allowed with costs. The parties shall bear costs.", out
     assert D.postprocess(["One two three. Four five six. Seven eight nine."], max_words=5) == "One two three."
     with tempfile.TemporaryDirectory() as tmp:
@@ -106,8 +127,9 @@ def test_load_and_formats():
         assert {"id", "document", "summary"} <= set(data["train"][0]) and "summary" not in data["test"][0]
         assert "summary words" in D.explore(data, encode=str.split)
         p = os.path.join(tmp, "x.jsonl")
-        open(p, "w").write('{"doc_id": 1, "text": "A b.", "abstract": "S."}\n{"doc_id": 2, "text": "C d.", '
-                           '"abstract": "T."}\n')
+        open(p, "w").write(
+            '{"doc_id": 1, "text": "A b.", "abstract": "S."}\n{"doc_id": 2, "text": "C d.", "abstract": "T."}\n'
+        )
         recs = D.normalise(D.read_json(p), True)
         assert recs[1] == {"id": "2", "document": "C d.", "summary": "T."}
         json.dump({"data": [{"id": "q", "document": "Z.", "summary": "Y."}]}, open(p, "w"))
@@ -123,6 +145,7 @@ if __name__ == "__main__":
                 print(f"PASS {name}")
             except Exception as e:  # noqa: BLE001
                 import traceback
+
                 traceback.print_exc()
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}")

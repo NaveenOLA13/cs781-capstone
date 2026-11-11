@@ -1,23 +1,5 @@
-"""Phase 3 final submission: cross-fitted ensemble on train + dev, then role-sequence smoothing.
+"""Phase 3 final submission: cross-fitted ensemble on train + dev, then role-sequence smoothing."""
 
-1. Ensemble: our best pipeline (Phase 1 Llama + LoRA Stage A + Stage B) trained K times. The 80 training
-   and 10 dev judgments are pooled and split into K groups (CL/IT balanced); each copy trains on K-1 groups
-   and picks its epochs on the group it did not see. Test prediction = average of the K copies. Every
-   labelled judgment is also predicted by the copy that did not see it (out-of-fold): an honest score over
-   all 90 judgments (slightly optimistic, because the same group chose that copy's epochs).
-   Options passed through: context=True (Stage A reads the previous and next sentence),
-   b_variants=("gru", "gru_attn", "attn") (several Stage B versions trained on the same Stage A features).
-2. Smoothing: Viterbi decoding of each judgment with role-change log-probabilities counted from the gold
-   labels (per domain). Its weight is chosen on the out-of-fold predictions (change counts for each group
-   taken from the other groups only), once shared and once per domain (CL, IT). 0 means no change.
-
-    from rr_final import run_final
-    res = run_final(bb_llama, prefix="ctx", context=True, b_variants=("gru", "gru_attn", "attn"), batch_size=32)
-
-Outputs in out_dir: <prefix>_ensemble/ (teacher.pt, metrics.json, <ensemble>_fold<k>.pt, log.txt),
-<prefix>_subs/<version>/{plain,smoothed}/submission.zip and smoothing.json, <prefix>_summary.txt,
-<prefix>_probs.json.gz (out-of-fold and test probabilities of every version, for analysis).
-"""
 from __future__ import annotations
 
 import gzip
@@ -49,11 +31,11 @@ def _by_domain(docs, logps, labels, trans_for, w_dom):
     return preds
 
 
-def smooth_submission(teacher_path: str, data_root: str, out: str, weights=WEIGHTS, log=print,
-                      export_path: str | None = None) -> dict:
-    """For every Stage B version in teacher.pt: chooses smoothing weights on the out-of-fold predictions and
-    writes <out>/<version>/plain/submission.zip and <out>/<version>/smoothed/submission.zip. Returns a
-    summary with the best version (highest out-of-fold 13-role avg after smoothing per domain)."""
+def smooth_submission(
+    teacher_path: str, data_root: str, out: str, weights=WEIGHTS, log=print, export_path: str | None = None
+) -> dict:
+    """For every Stage B version in teacher.pt: chooses smoothing weights on the out-of-fold predictions and writes
+    <out>/<version>/plain/submission.zip and <out>/<version>/smoothed/submission.zip."""
     t = torch.load(teacher_path, map_location="cpu", weights_only=False)
     labels = list(t["labels"])
     docs = D.load_docs(data_root)
@@ -67,8 +49,11 @@ def smooth_submission(teacher_path: str, data_root: str, out: str, weights=WEIGH
     def counts(ds):
         return D.transition_logprobs([d["labels"] for d in ds], labels)
 
-    per_fold = {(k, dm): counts([d for d in pool if fold_of[d["id"]] != k and d["domain"] == dm])
-                for k in range(K) for dm in domains}
+    per_fold = {
+        (k, dm): counts([d for d in pool if fold_of[d["id"]] != k and d["domain"] == dm])
+        for k in range(K)
+        for dm in domains
+    }
     full = {dm: counts([d for d in pool if d["domain"] == dm]) for dm in domains}
 
     def trans_oof(d):
@@ -79,33 +64,46 @@ def smooth_submission(teacher_path: str, data_root: str, out: str, weights=WEIGH
 
     versions = t.get("versions") or {"main": {"train": t["train"], "test": t["test"]}}
     res: dict = {"versions": {}, "domains": domains}
-    export = {"labels": labels, "folds": t["folds"], "versions": list(versions),
-              "pool": [dict(id=d["id"], domain=d["domain"], split=d["split"], sents=d["sents"], gold=d["labels"])
-                       for d in pool],
-              "test": [dict(id=d["id"], domain=d["domain"], sents=d["sents"]) for d in test]}
+    export = {
+        "labels": labels,
+        "folds": t["folds"],
+        "versions": list(versions),
+        "pool": [
+            dict(id=d["id"], domain=d["domain"], split=d["split"], sents=d["sents"], gold=d["labels"]) for d in pool
+        ],
+        "test": [dict(id=d["id"], domain=d["domain"], sents=d["sents"]) for d in test],
+    }
     log(f"\n[smoothing] out-of-fold 13-role avg over {len(pool)} labelled judgments (0 = no smoothing)")
     for v, vt in versions.items():
         oof = [_np(vt["train"][d["id"]]) for d in pool]
         test_lp = [_np(vt["test"].get(d["id"])) for d in test]
         w_shared, table = D.tune_smoothing(pool, oof, labels, trans_oof, weights)
         w_dom, rep_dom = D.tune_smoothing_per_domain(pool, oof, labels, trans_oof, weights)
-        log(f"  {v}: plain {_row(table[0])} | one weight (w={w_shared}) {_row(table[w_shared])} | "
-            f"per domain ({', '.join(f'{k} {w}' for k, w in w_dom.items())}) {_row(rep_dom)}")
+        log(
+            f"  {v}: plain {_row(table[0])} | one weight (w={w_shared}) {_row(table[w_shared])} | "
+            f"per domain ({', '.join(f'{k} {w}' for k, w in w_dom.items())}) {_row(rep_dom)}"
+        )
         vdir = os.path.join(out, v)
-        D.write_submission(test, D.smoothed_preds(test, test_lp, labels, trans_test, 0), labels,
-                           os.path.join(vdir, "plain"))
-        D.write_submission(test, _by_domain(test, test_lp, labels, trans_test, w_dom), labels,
-                           os.path.join(vdir, "smoothed"))
+        D.write_submission(
+            test, D.smoothed_preds(test, test_lp, labels, trans_test, 0), labels, os.path.join(vdir, "plain")
+        )
+        D.write_submission(
+            test, _by_domain(test, test_lp, labels, trans_test, w_dom), labels, os.path.join(vdir, "smoothed")
+        )
         with open(os.path.join(vdir, "oof_predictions_smoothed.json"), "w", encoding="utf-8") as f:
             json.dump(_by_domain(pool, oof, labels, trans_oof, w_dom), f)
         res["versions"][v] = dict(
             plain={k: r["macro_f1_all13"] for k, r in table[0].items()},
-            one_weight={k: r["macro_f1_all13"] for k, r in table[w_shared].items()}, w_shared=w_shared,
-            per_domain={k: r["macro_f1_all13"] for k, r in rep_dom.items()}, w_domain=w_dom,
+            one_weight={k: r["macro_f1_all13"] for k, r in table[w_shared].items()},
+            w_shared=w_shared,
+            per_domain={k: r["macro_f1_all13"] for k, r in rep_dom.items()},
+            w_domain=w_dom,
             weights={str(w): {k: r["macro_f1_all13"] for k, r in rep.items()} for w, rep in table.items()},
             plain_submission=os.path.join(vdir, "plain", "submission.zip"),
             smoothed_submission=os.path.join(vdir, "smoothed", "submission.zip"),
-            oof_plain_report=table[0], oof_smoothed_report=rep_dom)
+            oof_plain_report=table[0],
+            oof_smoothed_report=rep_dom,
+        )
         for i in range(len(pool)):
             export["pool"][i].setdefault("probs", {})[v] = [] if oof[i] is None else oof[i].round(4).tolist()
         for i in range(len(test)):
@@ -114,8 +112,7 @@ def smooth_submission(teacher_path: str, data_root: str, out: str, weights=WEIGH
     res["best"] = best
     b = res["versions"][best]
     log(f"\n[smoothing] best version: {best} (per-domain weights {b['w_domain']})")
-    log(D.format_report({f"{best} plain": b["oof_plain_report"], f"{best} smoothed": b["oof_smoothed_report"]},
-                        labels))
+    log(D.format_report({f"{best} plain": b["oof_plain_report"], f"{best} smoothed": b["oof_smoothed_report"]}, labels))
     with open(os.path.join(out, "smoothing.json"), "w") as f:
         json.dump(res, f, indent=1)
     if export_path:
@@ -125,10 +122,11 @@ def smooth_submission(teacher_path: str, data_root: str, out: str, weights=WEIGH
     return res
 
 
-def run_final(bb, prefix: str = "final", folds: int = 5, method: str = "lora", weights=WEIGHTS,
-              skip_done: bool = True, **settings) -> dict:
-    """Ensemble on train + dev (K copies, out-of-fold) -> smoothing for every Stage B version -> submissions
-    and a summary. A finished ensemble (teacher.pt + metrics.json) is reused."""
+def run_final(
+    bb, prefix: str = "final", folds: int = 5, method: str = "lora", weights=WEIGHTS, skip_done: bool = True, **settings
+) -> dict:
+    """Ensemble on train + dev (K copies, out-of-fold) -> smoothing for every Stage B version -> submissions and a
+    summary."""
     for bad in ("run_name", "method", "folds", "train_on_dev", "kd_teacher"):
         if bad in settings:
             raise ValueError(f"run_final sets {bad} itself")
@@ -142,16 +140,25 @@ def run_final(bb, prefix: str = "final", folds: int = 5, method: str = "lora", w
             metrics = json.load(f)
         print(f"===== {ename}: already done, using {tpath}")
     else:
-        metrics = KD.teacher_oof(bb, run_name=ename, method=method, folds=folds, train_on_dev=True,
-                                 **settings)["metrics"]
-    sm = smooth_submission(tpath, cfg0["data_root"], os.path.join(out_dir, f"{prefix}_subs"), weights,
-                           export_path=os.path.join(out_dir, f"{prefix}_probs.json.gz"))
+        metrics = KD.teacher_oof(bb, run_name=ename, method=method, folds=folds, train_on_dev=True, **settings)[
+            "metrics"
+        ]
+    sm = smooth_submission(
+        tpath,
+        cfg0["data_root"],
+        os.path.join(out_dir, f"{prefix}_subs"),
+        weights,
+        export_path=os.path.join(out_dir, f"{prefix}_probs.json.gz"),
+    )
 
     K = metrics["copies"]
     n_fit = metrics["folds"][0]["fit_judgments"]
     cfg = metrics["config"]
-    ctx = (f"with the previous and next sentence (up to {cfg['context_tokens']} tokens each)" if cfg.get("context")
-           else "one sentence at a time")
+    ctx = (
+        f"with the previous and next sentence (up to {cfg['context_tokens']} tokens each)"
+        if cfg.get("context")
+        else "one sentence at a time"
+    )
     w = max(len(v) for v in sm["versions"]) + 2
     lines = [
         f"FINAL ENSEMBLE '{prefix}': {K} copies of Llama + {method}, each trained on {n_fit} of the "
@@ -166,15 +173,17 @@ def run_final(bb, prefix: str = "final", folds: int = 5, method: str = "lora", w
         lines.append(f"    {'':{w}s} smoothed, one weight {r['w_shared']}: {fmt(r['one_weight'])}")
         lines.append(f"    {'':{w}s} smoothed per domain {r['w_domain']}: {fmt(r['per_domain'])}")
     best = sm["best"]
-    lines += [f"best (out-of-fold, smoothed per domain): {best}",
-              f"submit: {sm['versions'][best]['smoothed_submission']}",
-              "other files: " + ", ".join(f"{v}/plain, {v}/smoothed" for v in sm["versions"])
-              + f" in {os.path.join(out_dir, prefix + '_subs')}",
-              f"probabilities for analysis: {sm.get('export')}",
-              "(the dev judgments were used for training here, so there is no separate dev score)"]
+    lines += [
+        f"best (out-of-fold, smoothed per domain): {best}",
+        f"submit: {sm['versions'][best]['smoothed_submission']}",
+        "other files: "
+        + ", ".join(f"{v}/plain, {v}/smoothed" for v in sm["versions"])
+        + f" in {os.path.join(out_dir, prefix + '_subs')}",
+        f"probabilities for analysis: {sm.get('export')}",
+        "(the dev judgments were used for training here, so there is no separate dev score)",
+    ]
     text = "\n".join(lines)
     print("\n" + "=" * 78 + "\n" + text)
     with open(os.path.join(out_dir, f"{prefix}_summary.txt"), "w", encoding="utf-8") as f:
         f.write(text + "\n")
-    return dict(metrics=metrics, smoothing=sm, best=best,
-                submission=sm["versions"][best]["smoothed_submission"])
+    return dict(metrics=metrics, smoothing=sm, best=best, submission=sm["versions"][best]["smoothed_submission"])

@@ -1,17 +1,6 @@
-"""Phase 7 (prior case retrieval): data, our own BM25 over word n-grams, year and citation-count signals,
-micro-F1@7, learning to rank (fusion of lexical and model scores), the prediction file. No torch.
+"""Phase 7 (prior case retrieval): data, our own BM25 over word n-grams, year and citation-count signals, micro-F1@7,
+learning to rank (fusion of lexical and model scores), the prediction file."""
 
-For every query case, the candidate cases of the same split's pool are ranked; the top 7 are predicted as cited.
-Word n-gram BM25 is strong on Indian prior case retrieval (IL-PCR, Joshi et al. 2023: BM25 over bigrams 28.6,
-4-grams with events 39.2 micro-F1@K, while pretrained transformers reached about 9-17), so BM25 here gives
-(1) candidates and hard negatives for training our models and (2) features that a small learned ranker combines
-with our models' similarity scores (fitted on the dev split; never on test labels, which we do not have).
-
-    import pcr_data as PD
-    data = PD.load_data()                      # {"train" | "dev" | "test": (queries, pool)}
-    L = PD.lexical(data)                       # BM25 matrices for every split (cache with save_lexical)
-    PD.lexical_submissions(L, "/kaggle/working/pcr_runs/bm25")
-"""
 from __future__ import annotations
 
 import json
@@ -31,13 +20,19 @@ SPLITS = ("train", "dev", "test")
 YEAR = re.compile(r"\b(18[5-9]\d|19\d\d|20[0-2]\d)\b")
 
 
-# ------------------------------------------------------------------------------- data
+# --- data
 def download(root: str = DEFAULT_ROOT) -> str:
     if not os.path.isdir(root) or not any(os.scandir(root)):
         from huggingface_hub import snapshot_download
+
         name = os.path.basename(root.rstrip("/"))
-        snapshot_download(repo_id=HF_REPO, repo_type="dataset", local_dir=os.path.dirname(root.rstrip("/")),
-                          allow_patterns=[f"{name}/*", f"{name}/**"], token=os.environ.get("HF_TOKEN"))
+        snapshot_download(
+            repo_id=HF_REPO,
+            repo_type="dataset",
+            local_dir=os.path.dirname(root.rstrip("/")),
+            allow_patterns=[f"{name}/*", f"{name}/**"],
+            token=os.environ.get("HF_TOKEN"),
+        )
     return root
 
 
@@ -52,7 +47,7 @@ def read_json(path: str) -> list[dict]:
         lists = [v for v in d.values() if isinstance(v, list) and v and isinstance(v[0], dict)]
         if lists:
             d = lists[0]
-        else:       # {id: {...}} or {id: text}
+        else:
             d = [dict(v, id=k) if isinstance(v, dict) else dict(id=k, text=v) for k, v in d.items()]
     return d
 
@@ -89,7 +84,7 @@ def find_file(root: str, name: str) -> str:
 
 def load_data(root: str = DEFAULT_ROOT, fetch: bool = True, log=None) -> dict:
     """{split: (queries, pool)}; a query is {"id", "text", "rel" (train / dev: relevant candidate ids)}, a pool
-    document {"id", "text"}. A query's own id is never ranked for it."""
+    document {"id", "text"}."""
     if fetch:
         download(root)
     data = {}
@@ -97,7 +92,7 @@ def load_data(root: str = DEFAULT_ROOT, fetch: bool = True, log=None) -> dict:
         q = normalise(read_json(find_file(root, f"{s}.json")))
         p = normalise(read_json(find_file(root, f"{s}_candidates.json")))
         seen, pool = set(), []
-        for d in p:                     # duplicate candidate ids would break the exactly-7-unique rule
+        for d in p:
             if d["id"] not in seen:
                 seen.add(d["id"])
                 pool.append(d)
@@ -105,17 +100,23 @@ def load_data(root: str = DEFAULT_ROOT, fetch: bool = True, log=None) -> dict:
         if log:
             rel = [x for d in q for x in d.get("rel", [])]
             inside = sum(x in seen for x in rel)
-            log(f"[data] {s}: {len(q)} queries, pool {len(pool)} candidates"
+            log(
+                f"[data] {s}: {len(q)} queries, pool {len(pool)} candidates"
                 + (f" ({len(p) - len(pool)} duplicates dropped)" if len(p) != len(pool) else "")
-                + (f", {len(rel)} relevant ({len(rel) / max(1, len(q)):.2f} per query, {inside / max(1, len(rel)):.1%} "
-                   f"in the pool)" if rel else ""))
+                + (
+                    f", {len(rel)} relevant ({len(rel) / max(1, len(q)):.2f} per query, {inside / max(1, len(rel)):.1%} "
+                    f"in the pool)"
+                    if rel
+                    else ""
+                )
+            )
     return data
 
 
-# ----------------------------------------------------------------------------- metrics
+# --- metrics
 def micro_at_k(preds: dict, gold: dict, k: int = K) -> dict:
-    """Micro precision / recall / F1 over the first k predictions of every query (the competition's metric:
-    hits summed over queries; precision over all predictions, recall over all gold candidates)."""
+    """Micro precision / recall / F1 over the first k predictions of every query (the competition's metric: hits summed
+    over queries; precision over all predictions, recall over all gold candidates)."""
     hit = n_pred = n_gold = 0
     for q, g in gold.items():
         p = list(preds.get(q, []))[:k]
@@ -132,14 +133,14 @@ def fmt(m: dict) -> str:
 
 
 def write_prediction(preds: dict, queries: list[dict], pool: list[dict], out_dir: str, k: int = K) -> str:
-    """prediction.json = {query id: [k unique candidate ids from the pool, best first]} inside submission.zip;
-    checked against the brief's rules (every query, exactly k, unique, from the pool, not the query itself)."""
+    """prediction.json = {query id: [k unique candidate ids from the pool, best first]} inside submission.zip; checked
+    against the brief's rules (every query, exactly k, unique, from the pool, not the query itself)."""
     pool_ids = [d["id"] for d in pool]
     pset = set(pool_ids)
     out = {}
     for q in queries:
         p = [c for c in dict.fromkeys(preds.get(q["id"], [])) if c in pset and c != q["id"]][:k]
-        for c in pool_ids:                        # never fewer than k (only if a ranking was incomplete)
+        for c in pool_ids:
             if len(p) == k:
                 break
             if c not in p and c != q["id"]:
@@ -154,13 +155,13 @@ def write_prediction(preds: dict, queries: list[dict], pool: list[dict], out_dir
     z = os.path.join(out_dir, "submission.zip")
     with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.write(path, "prediction.json")
-    with zipfile.ZipFile(z) as zf:                # read back
+    with zipfile.ZipFile(z) as zf:
         back = json.loads(zf.read("prediction.json"))
     assert back == out
     return z
 
 
-# ------------------------------------------------------------------------- word n-grams
+# --- word n-grams
 _WORD = re.compile(r"[a-z0-9]+")
 
 
@@ -184,18 +185,18 @@ def ngrams(ids: np.ndarray, n: int, buckets: int = 1 << 24) -> np.ndarray:
     m = len(ids) - n + 1
     h = ids[:m] % buckets
     for k in range(1, n):
-        h = (h * 1000003 + ids[k:m + k]) % buckets
+        h = (h * 1000003 + ids[k : m + k]) % buckets
     return h
 
 
 class BM25:
-    """Okapi BM25 over the word n-grams of a candidate pool, as a sparse matrix of term weights (one row per
-    document): weight(d, t) = idf(t) * tf (k1 + 1) / (tf + k1 (1 - b + b |d| / avg |d|)),
-    idf(t) = log(1 + (N - df + 0.5) / (df + 0.5)). score(query, d) = sum over the query's distinct n-grams t of
-    qw(tf of t in the query) * weight(d, t), qw = 1 + log(tf) ("log"), 1 ("binary") or tf ("raw")."""
+    """Okapi BM25 over the word n-grams of a candidate pool, as a sparse matrix of term weights (one row per document):
+    weight(d, t) = idf(t) * tf (k1 + 1) / (tf + k1 (1 - b + b |d| / avg |d|)), idf(t) = log(1 + (N - df + 0.5) / (df
+    + 0.5))."""
 
     def __init__(self, docs: list[np.ndarray], n: int = 1, k1: float = 1.2, b: float = 0.75, buckets: int = 1 << 24):
         import scipy.sparse as sp
+
         self.n, self.k1, self.b, self.buckets = n, k1, b, buckets
         rows, cols, tfs, dls = [], [], [], []
         for i, ids in enumerate(docs):
@@ -211,7 +212,7 @@ class BM25:
         dl = np.asarray(dls, dtype=np.float32)
         self.n_docs = len(docs)
         uniq, inv, df = np.unique(cols_a, return_inverse=True, return_counts=True)
-        self.terms = uniq                                   # column j of the matrix = n-gram code uniq[j]
+        self.terms = uniq
         idf = np.log(1 + (self.n_docs - df + 0.5) / (df + 0.5)).astype(np.float32)
         avg = float(dl.mean()) if len(dl) else 1.0
         w = idf[inv] * tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl[rows_a] / max(avg, 1e-9)))
@@ -231,10 +232,9 @@ class BM25:
         return np.asarray(self.W[:, pos] @ qw, dtype=np.float32).ravel()
 
 
-# ------------------------------------------------------------------------- other signals
+# --- other signals
 def max_year(text: str) -> int:
-    """The latest year mentioned in a judgment (about its decision year; 0 if none). A case decided after the query
-    cannot be cited by it."""
+    """The latest year mentioned in a judgment (about its decision year; 0 if none)."""
     ys = [int(y) for y in YEAR.findall(text)]
     return max(ys) if ys else 0
 
@@ -243,11 +243,10 @@ def citation_counts(queries: list[dict]) -> Counter:
     return Counter(c for q in queries for c in q.get("rel", []))
 
 
-# ------------------------------------------------------------------ lexical score matrices
+# --- lexical score matrices
 def lexical(data: dict, ns=(1, 2, 3, 4, 5), k1: float = 1.2, b: float = 0.75, qtf: str = "log", log=print) -> dict:
-    """BM25 of every query against its own split's pool for each n-gram order, each row divided by its maximum
-    (the query itself gets -1). Returns {"ns", "single" (each order's micro-F1@7 on train / dev), split: {"qids",
-    "pids", "gold", "bm25": {n: [Q, P]}, "sum": [Q, P], "qyear", "pyear", "self": [(i, j)]}}."""
+    """BM25 of every query against its own split's pool for each n-gram order, each row divided by its maximum (the
+    query itself gets -1)."""
     vocab = Vocab()
     out: dict = {"ns": list(ns), "single": {}, "settings": dict(k1=k1, b=b, qtf=qtf)}
     for s in SPLITS:
@@ -271,10 +270,16 @@ def lexical(data: dict, ns=(1, 2, 3, 4, 5), k1: float = 1.2, b: float = 0.75, qt
             mats[n] = sc
             del bm
         total = np.sum([mats[n] for n in ns], 0) / len(ns)
-        split = dict(qids=[d["id"] for d in q], pids=pids, gold={d["id"]: d["rel"] for d in q if "rel" in d},
-                     bm25=mats, sum=total.astype(np.float32), self=selfs,
-                     qyear=np.array([max_year(d["text"]) for d in q], dtype=np.int32),
-                     pyear=np.array([max_year(d["text"]) for d in pool], dtype=np.int32))
+        split = dict(
+            qids=[d["id"] for d in q],
+            pids=pids,
+            gold={d["id"]: d["rel"] for d in q if "rel" in d},
+            bm25=mats,
+            sum=total.astype(np.float32),
+            self=selfs,
+            qyear=np.array([max_year(d["text"]) for d in q], dtype=np.int32),
+            pyear=np.array([max_year(d["text"]) for d in pool], dtype=np.int32),
+        )
         out[s] = split
         if split["gold"]:
             for n in list(ns) + ["sum"]:
@@ -309,7 +314,7 @@ def eval_matrix(split: dict, M: np.ndarray, k: int = K) -> dict:
     return micro_at_k(rank_matrix(split, M, k), split["gold"], k)
 
 
-# ----------------------------------------------------------------------- learning to rank
+# --- learning to rank
 def _ranks(M: np.ndarray, selfs) -> np.ndarray:
     """Rank (0 = best) of every candidate in every row."""
     M = np.array(M, dtype=np.float32, copy=True)
@@ -323,8 +328,8 @@ def _ranks(M: np.ndarray, selfs) -> np.ndarray:
 
 
 def prior_counts(L: dict, split: str) -> np.ndarray:
-    """[Q, P] how often each candidate is cited by labelled queries of the other splits (train labels for dev,
-    train + dev for test; for train itself: the other training queries, leaving the query's own labels out)."""
+    """[Q, P] how often each candidate is cited by labelled queries of the other splits (train labels for dev, train +
+    dev for test; for train itself: the other training queries, leaving the query's own labels out)."""
     sp = L[split]
     if split == "train":
         cnt = Counter(c for g in sp["gold"].values() for c in g)
@@ -343,10 +348,11 @@ def prior_counts(L: dict, split: str) -> np.ndarray:
     return np.log1p(np.maximum(P, 0))
 
 
-def build(L: dict, split: str, dense: dict | None = None, top: int = 100, dense_top: int = 50,
-          use_prior: bool = True) -> dict:
-    """Candidate list of every query (BM25 top `top` by the averaged normalised n-gram scores, plus each model
-    score's top `dense_top`) and its feature rows. dense: {name: [Q, P] scores of our models}."""
+def build(
+    L: dict, split: str, dense: dict | None = None, top: int = 100, dense_top: int = 50, use_prior: bool = True
+) -> dict:
+    """Candidate list of every query (BM25 top `top` by the averaged normalised n-gram scores, plus each model score's
+    top `dense_top`) and its feature rows."""
     sp = L[split]
     dense = dense or {}
     lex_rank = _ranks(sp["sum"], sp["self"])
@@ -366,9 +372,13 @@ def build(L: dict, split: str, dense: dict | None = None, top: int = 100, dense_
         idx = np.nonzero(sel)[0]
         qy, py = sp["qyear"][i], sp["pyear"][idx]
         known = ((py > 0) & (qy > 0)).astype(np.float32)
-        cols = [sp["bm25"][n][i, idx] for n in L["ns"]] + [sp["sum"][i, idx], np.log1p(lex_rank[i, idx]),
-                                                           (known * (py > qy)).astype(np.float32),
-                                                           known * np.clip((qy - py) / 50.0, -1, 2), known]
+        cols = [sp["bm25"][n][i, idx] for n in L["ns"]] + [
+            sp["sum"][i, idx],
+            np.log1p(lex_rank[i, idx]),
+            (known * (py > qy)).astype(np.float32),
+            known * np.clip((qy - py) / 50.0, -1, 2),
+            known,
+        ]
         if use_prior:
             cols.append(prior[i, idx])
         for k in dense:
@@ -382,8 +392,17 @@ def build(L: dict, split: str, dense: dict | None = None, top: int = 100, dense_
     if sp["gold"]:
         n_g = sum(len(v) for v in sp["gold"].values())
         recall = sum(y.sum() for y in ys) / max(1, n_g)
-    return dict(split=split, names=names, cands=cands, X=standardise(feats), ys=ys or None, recall=recall,
-                qids=sp["qids"], pids=sp["pids"], gold=sp["gold"])
+    return dict(
+        split=split,
+        names=names,
+        cands=cands,
+        X=standardise(feats),
+        ys=ys or None,
+        recall=recall,
+        qids=sp["qids"],
+        pids=sp["pids"],
+        gold=sp["gold"],
+    )
 
 
 def standardise(feats: list[np.ndarray]) -> list[np.ndarray]:
@@ -396,8 +415,7 @@ def standardise(feats: list[np.ndarray]) -> list[np.ndarray]:
 
 
 def fit_logreg(X: np.ndarray, y: np.ndarray, l2: float = 1.0, iters: int = 100) -> np.ndarray:
-    """L2-regularised logistic regression by Newton steps; positives weighted up to balance the classes.
-    Returns the weights (the last one is the bias; irrelevant for ranking)."""
+    """L2-regularised logistic regression by Newton steps; positives weighted up to balance the classes."""
     Xb = np.hstack([X, np.ones((len(X), 1))])
     w = np.zeros(Xb.shape[1])
     pw = max(1.0, (len(y) - y.sum()) / max(1.0, y.sum()))
@@ -425,7 +443,7 @@ def _hits(Xs, ys, w, k=K) -> int:
 
 def fit_coord(Xs, ys, w0: np.ndarray, rounds: int = 3) -> np.ndarray:
     """Coordinate ascent on the number of correct candidates in the top 7 (= micro-F1@7 for a fixed query set),
-    starting from w0 (Metzler & Croft 2007 style). Ties keep the current weights."""
+    starting from w0 (Metzler & Croft 2007 style)."""
     w = w0.astype(np.float64).copy()
     scale = max(1e-3, float(np.abs(w).max()))
     best = _hits(Xs, ys, w)
@@ -476,25 +494,28 @@ def describe_weights(names, w) -> str:
     return ", ".join(f"{n} {v:+.2f}" for n, v in sorted(zip(names, w), key=lambda t: -abs(t[1])))
 
 
-# ------------------------------------------------------------------------------ submissions
+# --- submissions
 def _queries_pool(data_or_L, split):
     sp = data_or_L[split]
     return [dict(id=q) for q in sp["qids"]], [dict(id=c) for c in sp["pids"]]
 
 
 def lexical_submissions(L: dict, out_dir: str, top: int = 100, log=print) -> dict:
-    """Two lexical-only systems (no neural model): (a) BM25 averaged over the n-gram orders; (b) a ranker on the
-    BM25 scores + year + citation counts, fitted on the training queries (the dev split stays an honest test),
-    then refitted on train + dev for the test predictions. Writes <out_dir>/bm25_avg/ and <out_dir>/lexical_ltr/."""
+    """Two lexical-only systems (no neural model): (a) BM25 averaged over the n-gram orders; (b) a ranker on the BM25
+    scores + year + citation counts, fitted on the training queries."""
     res = {"single": L["single"]}
     m = eval_matrix(L["dev"], L["dev"]["sum"])
     q, p = _queries_pool(L, "test")
-    res["bm25_avg"] = dict(dev=m, submission=write_prediction(rank_matrix(L["test"], L["test"]["sum"]), q, p,
-                                                             os.path.join(out_dir, "bm25_avg")))
+    res["bm25_avg"] = dict(
+        dev=m,
+        submission=write_prediction(rank_matrix(L["test"], L["test"]["sum"]), q, p, os.path.join(out_dir, "bm25_avg")),
+    )
     log(f"[lexical] BM25 averaged over {L['ns']}-grams: dev {fmt(m)}")
     Btr, Bdv, Bte = (build(L, s, top=top) for s in SPLITS)
-    log(f"[lexical] candidates: top {top} by BM25 hold {Btr['recall']:.1%} (train) / {Bdv['recall']:.1%} (dev) of "
-        f"the cited cases")
+    log(
+        f"[lexical] candidates: top {top} by BM25 hold {Btr['recall']:.1%} (train) / {Bdv['recall']:.1%} (dev) of "
+        f"the cited cases"
+    )
     best = None
     for method in ("logreg", "coord"):
         w = fit(Btr["X"], Btr["ys"], method)
@@ -506,8 +527,11 @@ def lexical_submissions(L: dict, out_dir: str, top: int = 100, log=print) -> dic
         if best is None or md["f1"] > res[f"ltr_{best}"]["dev"]["f1"]:
             best = method
     w = fit(Btr["X"] + Bdv["X"], Btr["ys"] + Bdv["ys"], best)
-    res["lexical_ltr"] = dict(method=best, dev=res[f"ltr_{best}"]["dev"],
-                              submission=write_prediction(predict(Bte, w), q, p, os.path.join(out_dir, "lexical_ltr")))
+    res["lexical_ltr"] = dict(
+        method=best,
+        dev=res[f"ltr_{best}"]["dev"],
+        submission=write_prediction(predict(Bte, w), q, p, os.path.join(out_dir, "lexical_ltr")),
+    )
     log(f"[lexical] test predictions: ranker ({best}) refitted on train + dev -> {res['lexical_ltr']['submission']}")
     res["recall_top"] = dict(train=Btr["recall"], dev=Bdv["recall"], top=top)
     with open(os.path.join(out_dir, "lexical_results.json"), "w") as f:
@@ -515,12 +539,11 @@ def lexical_submissions(L: dict, out_dir: str, top: int = 100, log=print) -> dic
     return res
 
 
-def fused_submission(L: dict, dense_dev: dict, dense_test: dict, out_dir: str, top: int = 100, dense_top: int = 50,
-                     log=print) -> dict:
+def fused_submission(
+    L: dict, dense_dev: dict, dense_test: dict, out_dir: str, top: int = 100, dense_top: int = 50, log=print
+) -> dict:
     """Our model's scores ({name: [Q, P]} for dev and test, same query / pool order as L) alone and fused with the
-    lexical features by a ranker. The ranker can only be fitted on dev (the model was trained on the training
-    queries, so its scores there are too good): its quality is measured by 5-fold cross-fitting on dev; the test
-    predictions use a ranker fitted on all of dev. Writes <out_dir>/submission/ (fused) and returns the metrics."""
+    lexical features by a ranker."""
     res = {"dense_alone": {}}
     for k, M in dense_dev.items():
         res["dense_alone"][k] = eval_matrix(L["dev"], M)
@@ -534,8 +557,9 @@ def fused_submission(L: dict, dense_dev: dict, dense_test: dict, out_dir: str, t
         lex = crossfit(Bl, method)
         fus = crossfit(Bd, method)
         res[f"lexical_{method}"], res[f"fused_{method}"] = lex, fus
-        log(f"[fusion] dev, 5-fold cross-fitted ranker ({method}): lexical only {fmt(lex)} | lexical + model "
-            f"{fmt(fus)}")
+        log(
+            f"[fusion] dev, 5-fold cross-fitted ranker ({method}): lexical only {fmt(lex)} | lexical + model {fmt(fus)}"
+        )
         if best is None or fus["f1"] > res[f"fused_{best}"]["f1"]:
             best = method
     w = fit(Bd["X"], Bd["ys"], best)
@@ -546,34 +570,47 @@ def fused_submission(L: dict, dense_dev: dict, dense_test: dict, out_dir: str, t
     return res
 
 
-# ------------------------------------------------------------------------------ explore
+# --- explore
 def explore(data: dict, sample: int = 200, seed: int = 0) -> str:
     rng = random.Random(seed)
     lines = []
 
     def q(x):
         x = np.asarray(x, float)
-        return (f"median {np.median(x):.0f}, mean {x.mean():.0f}, p90 {np.percentile(x, 90):.0f}, max {x.max():.0f}"
-                if len(x) else "-")
+        return (
+            f"median {np.median(x):.0f}, mean {x.mean():.0f}, p90 {np.percentile(x, 90):.0f}, max {x.max():.0f}"
+            if len(x)
+            else "-"
+        )
+
     pools = {s: {d["id"] for d in data[s][1]} for s in SPLITS}
     queries = {s: {d["id"] for d in data[s][0]} for s in SPLITS}
     for s in SPLITS:
         qs, pool = data[s]
-        lines.append(f"{s}: {len(qs)} queries, pool {len(pool)}; query words "
-                     + q([len(d["text"].split()) for d in rng.sample(qs, min(sample, len(qs)))])
-                     + "; candidate words " + q([len(d["text"].split()) for d in rng.sample(pool, min(sample, len(pool)))]))
+        lines.append(
+            f"{s}: {len(qs)} queries, pool {len(pool)}; query words "
+            + q([len(d["text"].split()) for d in rng.sample(qs, min(sample, len(qs)))])
+            + "; candidate words "
+            + q([len(d["text"].split()) for d in rng.sample(pool, min(sample, len(pool)))])
+        )
         if qs and "rel" in qs[0]:
-            lines.append(f"  relevant per query: {q([len(d['rel']) for d in qs])}; queries that are also in their own "
-                         f"pool: {sum(d['id'] in pools[s] for d in qs)}")
-    lines.append(f"pool overlap: train-dev {len(pools['train'] & pools['dev'])}, train-test "
-                 f"{len(pools['train'] & pools['test'])}, dev-test {len(pools['dev'] & pools['test'])}; "
-                 f"test queries in the train pool {len(queries['test'] & pools['train'])}, in the dev pool "
-                 f"{len(queries['test'] & pools['dev'])}")
+            lines.append(
+                f"  relevant per query: {q([len(d['rel']) for d in qs])}; queries that are also in their own "
+                f"pool: {sum(d['id'] in pools[s] for d in qs)}"
+            )
+    lines.append(
+        f"pool overlap: train-dev {len(pools['train'] & pools['dev'])}, train-test "
+        f"{len(pools['train'] & pools['test'])}, dev-test {len(pools['dev'] & pools['test'])}; "
+        f"test queries in the train pool {len(queries['test'] & pools['train'])}, in the dev pool "
+        f"{len(queries['test'] & pools['dev'])}"
+    )
     tr = citation_counts(data["train"][0])
     dv = data["dev"][0]
     seen = sum(c in tr for d in dv for c in d.get("rel", []))
-    lines.append(f"dev relevant candidates also cited by some training query: {seen} of "
-                 f"{sum(len(d.get('rel', [])) for d in dv)}; most cited in train: {tr.most_common(3)}")
+    lines.append(
+        f"dev relevant candidates also cited by some training query: {seen} of "
+        f"{sum(len(d.get('rel', [])) for d in dv)}; most cited in train: {tr.most_common(3)}"
+    )
     later = tot = no_year = 0
     pool = {x["id"]: x for x in data["dev"][1]}
     for d in dv:
@@ -583,8 +620,10 @@ def explore(data: dict, sample: int = 200, seed: int = 0) -> str:
             if c in pool and qy:
                 tot += 1
                 later += max_year(pool[c]["text"]) > qy
-    lines.append(f"dev: queries without any year {no_year}; cited cases whose latest year is after the query's latest "
-                 f"year: {later} of {tot}")
+    lines.append(
+        f"dev: queries without any year {no_year}; cited cases whose latest year is after the query's latest "
+        f"year: {later} of {tot}"
+    )
     ex = data["dev"][0][0]["text"][:600] if data["dev"][0] else ""
     lines.append(f"start of a dev query: {ex}")
     return "\n".join(lines)

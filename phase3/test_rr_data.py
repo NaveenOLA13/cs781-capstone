@@ -1,4 +1,5 @@
-"""Self-test for rr_data.py (no torch, runs in a second).   python test_rr_data.py"""
+"""Self-test for rr_data.py (no torch, runs in a second). python test_rr_data.py"""
+
 import json
 import os
 import random
@@ -9,20 +10,41 @@ import zipfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rr_data as D  # noqa: E402
 
-LABELS = ["Fact", "Issue", "ArgumentPetitioner", "ArgumentRespondent", "Statute", "Dissent",
-          "PrecedentReliedUpon", "PrecedentNotReliedUpon", "PrecedentOverruled", "RulingByLowerCourt",
-          "RatioOfTheDecision", "RulingByPresentCourt", "None"]
+LABELS = [
+    "Fact",
+    "Issue",
+    "ArgumentPetitioner",
+    "ArgumentRespondent",
+    "Statute",
+    "Dissent",
+    "PrecedentReliedUpon",
+    "PrecedentNotReliedUpon",
+    "PrecedentOverruled",
+    "RulingByLowerCourt",
+    "RatioOfTheDecision",
+    "RulingByPresentCourt",
+    "None",
+]
 WORDS = {l: [f"{l.lower()}{k}" for k in range(5)] for l in LABELS}
 
 
 def fake_doc(rng, i, n):
     """A judgment whose roles come in blocks; each sentence uses words of its role."""
-    blocks = ["None", "Fact", "Issue", "ArgumentPetitioner", "ArgumentRespondent", "Statute",
-              "PrecedentReliedUpon", "RatioOfTheDecision", "RulingByPresentCourt"]
+    blocks = [
+        "None",
+        "Fact",
+        "Issue",
+        "ArgumentPetitioner",
+        "ArgumentRespondent",
+        "Statute",
+        "PrecedentReliedUpon",
+        "RatioOfTheDecision",
+        "RulingByPresentCourt",
+    ]
     labels = [blocks[min(len(blocks) - 1, k * len(blocks) // n)] for k in range(n)]
     sents = [" ".join(rng.choice(WORDS[l]) for _ in range(rng.randint(1, 12))) + " ." for l in labels]
     if n > 3:
-        sents[2] = "Pvt."                                   # a fragment, like the real data
+        sents[2] = "Pvt."
     return sents, labels
 
 
@@ -30,8 +52,11 @@ def make_fake_data(root, n_train=6, n_dev=2, n_test=2, vocab_format="list", seed
     rng = random.Random(seed)
     os.makedirs(os.path.join(root, "Train"), exist_ok=True)
     os.makedirs(os.path.join(root, "Test"), exist_ok=True)
-    vocab = {"list": LABELS, "label2id": {l: i for i, l in enumerate(LABELS)},
-             "id2label": {str(i): l for i, l in enumerate(LABELS)}}[vocab_format]
+    vocab = {
+        "list": LABELS,
+        "label2id": {l: i for i, l in enumerate(LABELS)},
+        "id2label": {str(i): l for i, l in enumerate(LABELS)},
+    }[vocab_format]
     json.dump(vocab, open(os.path.join(root, "Train", "label_vocab.json"), "w"))
     for dom in ("CL", "IT"):
         for split, k in (("train", n_train), ("dev", n_dev)):
@@ -55,8 +80,9 @@ def test_load_and_vocab_formats():
             make_fake_data(tmp, vocab_format=fmt)
             assert D.load_labels(tmp) == LABELS, fmt
             docs = D.load_docs(tmp)
-            assert {(d["split"], d["domain"]) for d in docs} == {(s, c) for s in ("train", "dev", "test")
-                                                                 for c in ("CL", "IT")}
+            assert {(d["split"], d["domain"]) for d in docs} == {
+                (s, c) for s in ("train", "dev", "test") for c in ("CL", "IT")
+            }
             assert all(d["labels"] is None for d in docs if d["split"] == "test")
             assert all(len(d["labels"]) == len(d["sents"]) for d in docs if d["split"] != "test")
             D.check_labels(docs, LABELS)
@@ -93,11 +119,11 @@ def test_truncate_and_encode():
     assert raw == [3, 0, 300]
     a, b, c = docs[0]["ids"]
     assert a[0] == 1 and a[-1] == 2 and len(a) == 5
-    assert b == [1, 2]                                    # empty sentence: just bos + eos
+    assert b == [1, 2]
     assert len(c) == 16 and c[0] == 1 and c[-1] == 2
     docs2 = [{"sents": [""]}]
     D.encode_docs(docs2, word_encode, max_len=16)
-    assert docs2[0]["ids"] == [[0]]                        # no specials: fallback token
+    assert docs2[0]["ids"] == [[0]]
     print("     ", D.length_report(raw, 16))
 
 
@@ -110,14 +136,17 @@ def test_batches_cover_everything_once():
         assert sorted(flat) == list(range(1001)) and max(map(len, b)) <= 32
     b = D.length_batches(lengths, 32, False)
     assert all(lengths[x[i]] <= lengths[x[i + 1]] for x in b for i in range(len(x) - 1))
-    pad = sum(max(lengths[i] for i in x) * len(x) - sum(lengths[i] for i in x) for x in D.length_batches(lengths, 32, True))
-    assert pad < 0.1 * sum(lengths), pad                  # length bucketing keeps padding small
-    for shuffle in (False, True):                         # exact: one length per batch, no padding
+    pad = sum(
+        max(lengths[i] for i in x) * len(x) - sum(lengths[i] for i in x) for x in D.length_batches(lengths, 32, True)
+    )
+    assert pad < 0.1 * sum(lengths), pad
+    for shuffle in (False, True):
         b = D.length_batches(lengths, 32, shuffle, seed=3, exact=True)
         assert sorted(i for x in b for i in x) == list(range(1001)) and max(map(len, b)) <= 32
         assert all(len({lengths[i] for i in x}) == 1 for x in b)
-    assert len(D.length_batches(lengths, 32, True, seed=1, exact=True)) == \
-        len(D.length_batches(lengths, 32, True, seed=2, exact=True))   # step count does not depend on seed
+    assert len(D.length_batches(lengths, 32, True, seed=1, exact=True)) == len(
+        D.length_batches(lengths, 32, True, seed=2, exact=True)
+    )
 
 
 def test_class_weights():
@@ -132,11 +161,10 @@ def test_scores_by_hand():
     gold = [0, 0, 0, 1, 1, 2]
     pred = [0, 0, 1, 1, 0, 1]
     s = D.scores(gold, pred, labels)
-    # A: tp2 fp1 fn1 -> p=r=2/3 ; B: tp1 fp2 fn1 -> p=1/3 r=1/2 ; C: 0
     fa, fb = 2 / 3, 2 * (1 / 3) * (1 / 2) / (1 / 3 + 1 / 2)
     assert abs(s["per_label"]["A"]["f1"] - fa) < 1e-9 and abs(s["per_label"]["B"]["f1"] - fb) < 1e-9
     assert abs(s["macro_f1"] - (fa + fb) / 3) < 1e-9 and s["confusion"][2][1] == 1
-    s2 = D.scores([0, 1], [0, 1], labels)                 # C absent from gold and pred
+    s2 = D.scores([0, 1], [0, 1], labels)
     assert s2["macro_f1"] == 1.0 and abs(s2["macro_f1_all13"] - 2 / 3) < 1e-9
 
 
@@ -160,9 +188,11 @@ def test_evaluate_report_and_submission():
             assert f.namelist() == ["prediction.json"]
             back = json.loads(f.read("prediction.json"))
         assert list(back) == [d["id"] for d in test]
-        for broken in ({**preds, test[0]["id"]: preds[test[0]["id"]][:-1]},
-                       {k: v for k, v in list(preds.items())[1:]},
-                       {**preds, test[0]["id"]: ["Facts"] * len(test[0]["sents"])}):
+        for broken in (
+            {**preds, test[0]["id"]: preds[test[0]["id"]][:-1]},
+            {k: v for k, v in list(preds.items())[1:]},
+            {**preds, test[0]["id"]: ["Facts"] * len(test[0]["sents"])},
+        ):
             try:
                 D.write_submission(test, broken, LABELS, os.path.join(tmp, "bad"))
                 assert False, "should have failed"
@@ -175,8 +205,8 @@ def test_make_folds_balanced():
     folds = D.make_folds(docs, 5, seed=1)
     assert sorted(i for f in folds for i in f) == list(range(80))
     for f in folds:
-        assert len(f) == 16 and sum(1 for i in f if i < 40) == 8   # 8 CL + 8 IT each
-    assert D.make_folds(docs, 5, seed=1) == folds                  # reproducible
+        assert len(f) == 16 and sum(1 for i in f if i < 40) == 8
+    assert D.make_folds(docs, 5, seed=1) == folds
     small = D.make_folds([{"domain": "CL"}] * 3 + [{"domain": "IT"}] * 3, 3)
     assert sorted(i for f in small for i in f) == list(range(6))
 
@@ -192,20 +222,24 @@ def test_macro_f1_np_matches_scores():
 
 def test_tune_biases_helps_rare_role_and_groups():
     import numpy as np
+
     rng = np.random.default_rng(0)
     n = 3000
     gold = rng.choice(3, size=n, p=[0.80, 0.15, 0.05])
     logp = np.log(np.full((n, 3), 1e-3))
-    for i, g in enumerate(gold):                       # the model is shy about the rare roles
-        logp[i] = np.log([0.60, 0.25, 0.15]) if g == 0 else (
-            np.log([0.45, 0.40, 0.15]) if g == 1 else np.log([0.45, 0.20, 0.35]))
+    for i, g in enumerate(gold):
+        logp[i] = (
+            np.log([0.60, 0.25, 0.15])
+            if g == 0
+            else (np.log([0.45, 0.40, 0.15]) if g == 1 else np.log([0.45, 0.20, 0.35]))
+        )
     logp += rng.normal(0, 0.3, size=logp.shape)
     b, before, after = D.tune_biases(logp, gold, 3)
     assert b.shape == (1, 3) and after > before + 0.1, (before, after)
     assert abs(D.macro_f1_np(gold, (logp + b[0]).argmax(1), 3) - after) < 1e-12
-    groups = (np.arange(n) % 2)
+    groups = np.arange(n) % 2
     bg, before_g, after_g = D.tune_biases(logp, gold, 3, groups=groups, n_groups=2)
-    assert bg.shape == (2, 3) and after_g >= after - 1e-9      # more freedom never scores lower on fit data
+    assert bg.shape == (2, 3) and after_g >= after - 1e-9
     docs = [{"id": "a", "domain": "CL"}, {"id": "b", "domain": "IT"}, {"id": "c", "domain": "CL"}]
     lps = [logp[:4], logp[4:6], None]
     out = D.biased_preds(docs, lps, ["x", "y", "z"], bg, lambda d: 0 if d["domain"] == "CL" else 1)
@@ -215,32 +249,66 @@ def test_tune_biases_helps_rare_role_and_groups():
 
 def _fake_metrics(docs, preds, name, trainable, saved_mb):
     rep = D.evaluate(docs, preds, LABELS)
-    return dict(run_name=name, best="stageB",
-                stage_a=dict(dev=rep, trainable_params=trainable, total_params=1000, peak_gpu_gb=1.5,
-                             saved_mb=saved_mb, train_seconds=90.0, best_epoch=2,
-                             history=[dict(seconds=30.0)] * 3, train_fit={"all": {"accuracy": 0.9}}),
-                stage_b=dict(dev=rep))
+    return dict(
+        run_name=name,
+        best="stageB",
+        stage_a=dict(
+            dev=rep,
+            trainable_params=trainable,
+            total_params=1000,
+            peak_gpu_gb=1.5,
+            saved_mb=saved_mb,
+            train_seconds=90.0,
+            best_epoch=2,
+            history=[dict(seconds=30.0)] * 3,
+            train_fit={"all": {"accuracy": 0.9}},
+        ),
+        stage_b=dict(dev=rep),
+    )
 
 
 def test_pair_confusions_and_comparison():
-    docs = [{"id": "a", "domain": "CL", "labels": ["ArgumentPetitioner"] * 3 + ["ArgumentRespondent"] * 2},
-            {"id": "b", "domain": "IT", "labels": ["Fact"] * 4}]
-    preds = {"a": ["ArgumentRespondent", "ArgumentPetitioner", "ArgumentPetitioner",
-                   "ArgumentPetitioner", "ArgumentRespondent"], "b": ["Fact", "Fact", "RatioOfTheDecision", "Fact"]}
+    docs = [
+        {"id": "a", "domain": "CL", "labels": ["ArgumentPetitioner"] * 3 + ["ArgumentRespondent"] * 2},
+        {"id": "b", "domain": "IT", "labels": ["Fact"] * 4},
+    ]
+    preds = {
+        "a": [
+            "ArgumentRespondent",
+            "ArgumentPetitioner",
+            "ArgumentPetitioner",
+            "ArgumentPetitioner",
+            "ArgumentRespondent",
+        ],
+        "b": ["Fact", "Fact", "RatioOfTheDecision", "Fact"],
+    }
     pc = D.pair_confusions(D.evaluate(docs, preds, LABELS), LABELS)
     assert pc["Pet/Resp"]["CL"] == dict(rate=2 / 5, a_to_b=1, b_to_a=1, n=5), pc["Pet/Resp"]["CL"]
     assert pc["Pet/Resp"]["IT"]["rate"] is None and pc["Pet/Resp"]["IT"]["n"] == 0
     assert abs(pc["Fact/Ratio"]["all"]["rate"] - 1 / 4) < 1e-12 and pc["Fact/Ratio"]["IT"]["a_to_b"] == 1
     assert "Lower/Present" in pc and len(pc) == len(D.CLOSE_PAIRS)
     perfect = {d["id"]: list(d["labels"]) for d in docs}
-    runs = {"full": _fake_metrics(docs, preds, "x_full", 1000, 330.0),
-            "lora": _fake_metrics(docs, perfect, "x_lora", 12, 0.1), "ia3": None}
+    runs = {
+        "full": _fake_metrics(docs, preds, "x_full", 1000, 330.0),
+        "lora": _fake_metrics(docs, perfect, "x_lora", 12, 0.1),
+        "ia3": None,
+    }
     text = D.format_comparison(runs)
-    for s in ("COST", "DEV 13-ROLE AVERAGE", "MEMORISING", "CLOSELY RELATED", "Stage B, CL", "Stage A, IT",
-              "failed runs: ia3", "Pet/Resp", "330.0 MB", "1.20%"):
+    for s in (
+        "COST",
+        "DEV 13-ROLE AVERAGE",
+        "MEMORISING",
+        "CLOSELY RELATED",
+        "Stage B, CL",
+        "Stage A, IT",
+        "failed runs: ia3",
+        "Pet/Resp",
+        "330.0 MB",
+        "1.20%",
+    ):
         assert s in text, (s, text)
     row = [line for line in text.splitlines() if line.startswith("lora")]
-    assert row and "0.0" in row[-1], row        # perfect predictions mix up nothing
+    assert row and "0.0" in row[-1], row
     assert D.format_comparison({"a": None}).startswith("no finished runs")
 
 
@@ -248,25 +316,31 @@ def test_viterbi_smoothing():
     import itertools
 
     import numpy as np
+
     labs = ["A", "B", "C"]
     tr, st = D.transition_logprobs([["A", "A", "A", "B", "B"], ["B", "B", "C", "C"], ["A", "A"]], labs)
     assert np.allclose(np.exp(tr).sum(1), 1) and abs(np.exp(st).sum() - 1) < 1e-9
-    assert tr[0, 0] > tr[0, 2] and st[0] > st[2]                     # A->A seen, A->C never; most start with A
+    assert tr[0, 0] > tr[0, 2] and st[0] > st[2]
     rng = np.random.default_rng(0)
-    for _ in range(20):                                               # exact: compare with trying every sequence
+    for _ in range(20):
         lp = np.log(rng.dirichlet(np.ones(3), size=4))
         w = float(rng.uniform(0, 2))
-        best = max(itertools.product(range(3), repeat=4),
-                   key=lambda y: sum(lp[i, y[i]] for i in range(4)) + w * (st[y[0]] + sum(tr[y[i - 1], y[i]]
-                                                                                       for i in range(1, 4))))
+        best = max(
+            itertools.product(range(3), repeat=4),
+            key=lambda y: (
+                sum(lp[i, y[i]] for i in range(4)) + w * (st[y[0]] + sum(tr[y[i - 1], y[i]] for i in range(1, 4)))
+            ),
+        )
         assert D.viterbi(lp, tr, st, w) == list(best)
-    lp = np.log(np.array([[.9, .05, .05], [.9, .05, .05], [.45, .5, .05], [.9, .05, .05], [.9, .05, .05]]))
-    assert D.viterbi(lp, tr, st, 0) == [0, 0, 1, 0, 0]               # w = 0: the model's own choice
-    assert D.viterbi(lp, tr, st, 1.0) == [0, 0, 0, 0, 0]             # the lone "B" is smoothed away
+    lp = np.log(
+        np.array([[0.9, 0.05, 0.05], [0.9, 0.05, 0.05], [0.45, 0.5, 0.05], [0.9, 0.05, 0.05], [0.9, 0.05, 0.05]])
+    )
+    assert D.viterbi(lp, tr, st, 0) == [0, 0, 1, 0, 0]
+    assert D.viterbi(lp, tr, st, 1.0) == [0, 0, 0, 0, 0]
     assert D.viterbi(np.zeros((0, 3)), tr, st, 1.0) == []
     docs = [{"id": f"d{k}", "domain": "CL", "labels": ["A"] * 6 + ["B"] * 6} for k in range(4)]
     noisy = []
-    for k in range(4):                                                # one wrong sentence inside each block
+    for k in range(4):
         p = np.full((12, 3), 0.05)
         p[:6, 0], p[6:, 1] = 0.9, 0.9
         p[2 + k % 3] = [0.4, 0.55, 0.05]
@@ -278,22 +352,23 @@ def test_viterbi_smoothing():
 
 def test_smoothing_per_domain():
     import numpy as np
+
     labs = ["A", "B", "C"]
     docs, logps = [], []
-    for k in range(4):                     # CL: blocks of A then B, one wrong sentence -> smoothing helps
+    for k in range(4):
         docs.append({"id": f"cl{k}", "domain": "CL", "labels": ["A"] * 6 + ["B"] * 6})
         p = np.full((12, 3), 0.05)
         p[:6, 0], p[6:, 1] = 0.9, 0.9
         p[2 + k % 3] = [0.4, 0.55, 0.05]
         logps.append(np.log(p / p.sum(1, keepdims=True)))
-    for k in range(4):                     # IT: roles change every sentence and the model is right -> smoothing hurts
+    for k in range(4):
         lab = ["A", "B"] * 5
         docs.append({"id": f"it{k}", "domain": "IT", "labels": lab})
         p = np.full((10, 3), 0.05)
         for i, l in enumerate(lab):
             p[i, labs.index(l)], p[i, 1 - labs.index(l)] = 0.55, 0.40
         logps.append(np.log(p / p.sum(1, keepdims=True)))
-    tr, st = D.transition_logprobs([d["labels"] for d in docs[:4]], labs)      # "stay in the same role"
+    tr, st = D.transition_logprobs([d["labels"] for d in docs[:4]], labs)
     w_dom, rep = D.tune_smoothing_per_domain(docs, logps, labs, lambda d: (tr, st), weights=(0, 0.5, 1.0, 2.0))
     _, table = D.tune_smoothing(docs, logps, labs, lambda d: (tr, st), weights=(0, 0.5, 1.0, 2.0))
     assert w_dom["CL"] > 0 and w_dom["IT"] == 0, w_dom

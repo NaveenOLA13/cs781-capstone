@@ -1,6 +1,5 @@
-"""Self-test for rr_head.py on tiny stand-in models (runs in seconds on CPU).
-Run:  python test_rr_head.py      -> every line should say PASS
-"""
+"""Self-test for rr_head.py on tiny stand-in models (runs in seconds on CPU)."""
+
 import os
 import sys
 import tempfile
@@ -9,8 +8,19 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rr_head import (ContextClassifier, HiddenStates, Pooler, SentenceAttention, SentenceClassifier,  # noqa: E402
-                     count_params, distance_buckets, find_lm_head, freeze_backbone, load_phase1, padding_check)
+from rr_head import (
+    ContextClassifier,
+    HiddenStates,
+    Pooler,
+    SentenceAttention,
+    SentenceClassifier,  # noqa: E402
+    count_params,
+    distance_buckets,
+    find_lm_head,
+    freeze_backbone,
+    load_phase1,
+    padding_check,
+)
 
 torch.manual_seed(0)
 V, D, NL = 50, 16, 13
@@ -63,8 +73,8 @@ def batch(seqs, pad=0):
     ids = torch.full((len(seqs), T), pad)
     mask = torch.zeros(len(seqs), T, dtype=torch.long)
     for i, s in enumerate(seqs):
-        ids[i, :len(s)] = torch.tensor(s)
-        mask[i, :len(s)] = 1
+        ids[i, : len(s)] = torch.tensor(s)
+        mask[i, : len(s)] = 1
     return ids, mask
 
 
@@ -77,13 +87,13 @@ def test_finds_tied_lm_head_and_skips_it():
     ids, mask = batch([[3, 4, 5, 6]])
     h = hs(ids, mask)
     assert h.shape == (1, 4, D)
-    assert torch.allclose(h, m.last_x)          # exactly the final normed hidden states
-    assert not calls                            # LM head never executed
+    assert torch.allclose(h, m.last_x)
+    assert not calls
 
 
 def test_untied_head_not_confused_with_feed_forward():
     m = ToyGPT()
-    m.lm_head = nn.Linear(D, V, bias=False)      # untied; position table (64) == feed-forward width (64)
+    m.lm_head = nn.Linear(D, V, bias=False)
     assert find_lm_head(m) == "lm_head", find_lm_head(m)
 
 
@@ -118,7 +128,7 @@ def test_gradients_full_and_frozen():
     ids, mask = batch([[1, 2, 3], [4, 5, 6, 7]])
     loss = nn.functional.cross_entropy(clf(ids, mask), torch.tensor([0, 5]))
     loss.backward()
-    assert clf.encoder.model.tok.weight.grad is not None      # full fine-tuning reaches backbone
+    assert clf.encoder.model.tok.weight.grad is not None
     assert clf.head.weight.grad is not None
     n_all = count_params(clf)
     freeze_backbone(clf)
@@ -136,7 +146,7 @@ def test_nanogpt_style_last_only_fails_loudly():
 
 def test_hidden_states_method_is_preferred():
     m = ToyGPT(last_only=True)
-    m.hidden_states = lambda idx: (m(idx), m.last_x)[1]   # what you'd add to your model class
+    m.hidden_states = lambda idx: (m(idx), m.last_x)[1]
     clf = SentenceClassifier(m, NL, pooling="mean").eval()
     ids, mask = batch([[1, 2, 3, 4]])
     assert clf(ids, mask).shape == (1, NL)
@@ -144,7 +154,7 @@ def test_hidden_states_method_is_preferred():
 
 def test_encdec_encoder_output():
     clf = SentenceClassifier(ToyEncDec(), NL, pooling="mean", module_name="encoder", mode="module_out").eval()
-    assert clf.d_model == D                     # BiGRU: 2 x D/2
+    assert clf.d_model == D
     ids, mask = batch([[1, 2, 3], [4, 5, 6, 7, 8]])
     assert clf(ids, mask).shape == (2, NL)
     diff = padding_check(clf, [3, 4, 5], [6, 7, 8, 9, 10, 11, 12])
@@ -175,6 +185,7 @@ def test_distance_buckets():
         a = abs(d)
         b = a if a <= 2 else 3 if a <= 4 else 4 if a <= 8 else 5 if a <= 16 else 6 if a <= 32 else 7
         return 0 if d == 0 else (b if d > 0 else b + 7)
+
     S = 70
     got = distance_buckets(S)
     assert got.shape == (S, S) and int(got.max()) == 14 and int(got.min()) == 0
@@ -190,21 +201,21 @@ def test_attention_starts_switched_off_and_knows_order():
     gru = ContextClassifier(F_, NL, d_ctx=16, arch="gru").eval()
     torch.manual_seed(1)
     gru_attn = ContextClassifier(F_, NL, d_ctx=16, arch="gru_attn").eval()
-    assert torch.allclose(gru(x), gru_attn(x), atol=1e-6)          # same start: attention output is 0
+    assert torch.allclose(gru(x), gru_attn(x), atol=1e-6)
     attn = ContextClassifier(F_, NL, d_ctx=16, arch="attn").eval()
     assert attn(x).shape == (9, NL) and attn(x.unsqueeze(0)).shape == (1, 9, NL)
     att = SentenceAttention(16, heads=4).eval()
-    assert att(torch.randn(1, 5, 16)).abs().max() == 0                # switched off at the start
+    assert att(torch.randn(1, 5, 16)).abs().max() == 0
     nn.init.normal_(att.o.weight)
     nn.init.normal_(att.dist.weight)
     h = torch.randn(1, 6, 16)
     perm = torch.tensor([5, 3, 0, 1, 4, 2])
     out, out_p = att(h), att(h[:, perm])
-    assert not torch.allclose(out[:, perm], out_p, atol=1e-5)       # order matters through the distances
+    assert not torch.allclose(out[:, perm], out_p, atol=1e-5)
     assert att.last_weights.shape == (1, 4, 6, 6)
     m = ContextClassifier(F_, NL, d_ctx=16, arch="gru_attn")
     m(x).sum().backward()
-    assert m.attn.o.weight.grad is not None and m.attn.o.weight.grad.abs().sum() > 0    # it can learn to turn on
+    assert m.attn.o.weight.grad is not None and m.attn.o.weight.grad.abs().sum() > 0
     try:
         ContextClassifier(F_, NL, arch="lstm")
         raise AssertionError("unknown version should fail")

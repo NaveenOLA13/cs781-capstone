@@ -1,11 +1,5 @@
-"""Self-test of knowledge distillation (cj_kd.py + the KD parts of cj_train.py) on tiny stand-in models.
-Needs torch. About 1-2 minutes.     python test_cj_kd.py  -> every line PASS
+"""Self-test of knowledge distillation (cj_kd.py + the KD parts of cj_train.py) on tiny stand-in models."""
 
-Checks: the teacher term is zero when the student already matches the teacher and pulls the student towards it;
-cutting blocks makes a smaller model that still runs and leaves the original untouched; the whole chain teacher SFT
--> whole-case teacher (train_probs.json) -> students with and without the teacher; the student run can be rebuilt
-(for whole-case reading) and the comparison table is written.
-"""
 import json
 import os
 import sys
@@ -26,15 +20,15 @@ torch.manual_seed(0)
 def test_kd_loss():
     p = torch.tensor([0.9, 0.2, 0.5])
     z = torch.log(p) - torch.log1p(-p)
-    match = torch.stack([torch.zeros(3), z], -1)                 # student score difference = teacher's
+    match = torch.stack([torch.zeros(3), z], -1)
     assert abs(R.kd_loss(match, p, 2.0).item()) < 1e-5
     assert abs(R.kd_loss(match, p, 1.0).item()) < 1e-5
     logits = torch.zeros(3, 2, requires_grad=True)
     loss = R.kd_loss(logits, p, 2.0)
     assert loss.item() > 0
     loss.backward()
-    g = logits.grad[:, 1] - logits.grad[:, 0]                    # gradient on the score difference
-    assert g[0] < 0 and g[1] > 0 and abs(g[2]) < 1e-6, g         # pushed up for p = 0.9, down for p = 0.2
+    g = logits.grad[:, 1] - logits.grad[:, 0]
+    assert g[0] < 0 and g[1] > 0 and abs(g[2]) < 1e-6, g
 
 
 def test_cut_blocks():
@@ -44,7 +38,7 @@ def test_cut_blocks():
         model, info = R.make_model(bb, dict(student_layers=0.5), log=lambda *a: None)
         assert (info["layers_full"], info["layers_student"]) == (3, 2), info
         assert info["params_student"] < info["params_full"] == n_before
-        assert sum(p.numel() for p in bb.model.parameters()) == n_before    # the original is untouched
+        assert sum(p.numel() for p in bb.model.parameters()) == n_before
         clf = bb.classifier(2, model=model).to(DEV).float().eval()
         ids, mask = R.collate([[5, 6, 7, 8], [9, 10]], bb.pad_id, DEV)
         with torch.no_grad():
@@ -63,18 +57,37 @@ def test_cut_blocks():
 def test_teacher_to_students():
     with tempfile.TemporaryDirectory() as tmp:
         root = make_fake_data(tmp, n_train=40, n_dev=12, n_test=10, n_words=(40, 160))
-        common = dict(FAST, data_root=root, out_dir=os.path.join(tmp, "runs"), cache_dir=os.path.join(tmp, "cache"),
-                      max_len=24, chunk_stride=16, train_chunks=3)
+        common = dict(
+            FAST,
+            data_root=root,
+            out_dir=os.path.join(tmp, "runs"),
+            cache_dir=os.path.join(tmp, "cache"),
+            max_len=24,
+            chunk_stride=16,
+            train_chunks=3,
+        )
         teacher_run = R.run(_bb("llama"), name="llama", technique="full", **common)["out_dir"]
-        H.run_hier(teacher_run, versions=("mean",), bb=_bb("llama"), k=3, epochs=2, hidden=32, batch=8,
-                   log=lambda *a: None)
+        H.run_hier(
+            teacher_run, versions=("mean",), bb=_bb("llama"), k=3, epochs=2, hidden=32, batch=8, log=lambda *a: None
+        )
         hier_dir = os.path.join(teacher_run, "hier_k3")
-        p = K.plan(hier_dir, out_dir=os.path.join(tmp, "kd"), ckpt="toy", tok_workers=1, log_every=0,
-                   eval_batch_size=16, fit_sample=20, lr_head=3e-3, batch_size=8)
-        f1 = {v: json.load(open(os.path.join(hier_dir, v, "metrics.json")))["dev_tuned"]["macro_f1"]
-              for v in ("last", "vote", "mean")}
+        p = K.plan(
+            hier_dir,
+            out_dir=os.path.join(tmp, "kd"),
+            ckpt="toy",
+            tok_workers=1,
+            log_every=0,
+            eval_batch_size=16,
+            fit_sample=20,
+            lr_head=3e-3,
+            batch_size=8,
+        )
+        f1 = {
+            v: json.load(open(os.path.join(hier_dir, v, "metrics.json")))["dev_tuned"]["macro_f1"]
+            for v in ("last", "vote", "mean")
+        }
         chosen = os.path.basename(os.path.dirname(p["teacher_file"]))
-        assert f1[chosen] == max(f1.values()), (chosen, f1)       # the best on dev (ties: any of them)
+        assert f1[chosen] == max(f1.values()), (chosen, f1)
         assert p["sft_dir"] == teacher_run and p["model"] == "llama"
         assert [j["run_name"] for j in p["jobs"]] == ["llama_student_kd", "llama_student"]
         s_kd = p["jobs"][0]["settings"]
@@ -92,7 +105,6 @@ def test_teacher_to_students():
             else:
                 assert m["kd"] is None and "[kd]" not in log
             assert os.path.exists(os.path.join(res["out_dir"], "submission_tuned", "submission.zip"))
-        # a student run can be rebuilt for whole-case reading: 'last' reproduces its own dev predictions
         st = os.path.join(tmp, "kd", "llama_student_kd")
         H.run_hier(st, versions=(), bb=_bb("llama"), k=3, log=lambda *a: None)
         run_dev = json.load(open(os.path.join(st, "dev_probs.json")))
@@ -112,6 +124,7 @@ if __name__ == "__main__":
                 print(f"PASS {name}")
             except Exception as e:  # noqa: BLE001
                 import traceback
+
                 traceback.print_exc()
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}")

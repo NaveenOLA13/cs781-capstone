@@ -1,16 +1,5 @@
-"""Load one of our Phase 1 models and our bpe12k tokenizer, and connect them to the Phase 4 code.
+"""Load one of our Phase 1 models and our bpe12k tokenizer, and connect them to the Phase 4 code."""
 
-    from cj_models import load_backbone
-    bb, info = load_backbone("llama")        # "decoder", "encdec", "llama", "moe", or a path to best.pt
-
-Where each checkpoint comes from (Kaggle):
-  decoder  output of notebook enteredinyourbrain/cs781-train, version 1 (try1)  runs/decoder_80m_v1/best.pt
-  encdec   same notebook, version 2 (arch2)                                      runs/encdec_86m_v1/best.pt
-  llama    same notebook, version 4 (llama1, the latest)                         runs/llama_85m_v1/best.pt
-  moe      on a friend's Kaggle account (set SOURCES["moe"] or pass the path)
-A notebook output already attached as input is used if it holds the model; otherwise kagglehub attaches the
-right version. Only one version of cs781-train can be attached per Kaggle session, so load one model per session.
-"""
 from __future__ import annotations
 
 import glob
@@ -24,7 +13,8 @@ import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.environ.get("CS781_REPO") or os.path.dirname(HERE)
-for p in (os.path.join(REPO, "phase3"), REPO):
+PHASE1 = os.path.join(REPO, "phase1")
+for p in (os.path.join(REPO, "phase3"), PHASE1):
     if p not in sys.path:
         sys.path.insert(0, p)
 
@@ -39,8 +29,16 @@ SOURCES = {
 }
 RUN_PREFIX = {"decoder": "decoder_80m", "encdec": "encdec_86m", "llama": "llama_85m", "moe": "moe_214m"}
 MODELS = tuple(SOURCES)
-MAX_POS_KEYS = ("max_seq_len", "block_size", "max_len", "context_length", "max_position_embeddings",
-                "n_positions", "src_len", "seq_len")
+MAX_POS_KEYS = (
+    "max_seq_len",
+    "block_size",
+    "max_len",
+    "context_length",
+    "max_position_embeddings",
+    "n_positions",
+    "src_len",
+    "seq_len",
+)
 
 
 def _find_in(root: str, prefix: str) -> list[str]:
@@ -63,13 +61,16 @@ def find_checkpoint(name: str, log=print) -> str:
     if handle is None:
         raise ValueError(f"no source known for {name!r}: pass the path to its best.pt instead")
     import kagglehub
+
     log(f"[model] {name}: attaching {handle} with kagglehub ...")
     root = kagglehub.notebook_output_download(handle)
     hits = _find_in(root, prefix)
     if not hits:
         found = [os.path.relpath(p, root) for p in glob.glob(os.path.join(root, "**", "best.pt"), recursive=True)]
-        raise RuntimeError(f"{handle} has no runs/{prefix}*/best.pt (found: {found}). If this Kaggle session already "
-                           "attached another version of cs781-train, restart the session and load this model first.")
+        raise RuntimeError(
+            f"{handle} has no runs/{prefix}*/best.pt (found: {found}). If this Kaggle session already "
+            "attached another version of cs781-train, restart the session and load this model first."
+        )
     log(f"[model] {name}: {hits[0]}")
     return hits[0]
 
@@ -81,7 +82,6 @@ def _load_ckpt(path: str) -> dict:
         if not pkl:
             raise ValueError(f"{path} is a folder without data.pkl: not an unpacked checkpoint")
         base = os.path.dirname(pkl[0])
-        # one file per process: two grid workers may rebuild the same checkpoint at the same time
         tmp = os.path.join(tempfile.gettempdir(), f"ckpt_{os.getpid()}_" + re.sub(r"\W", "_", path)[-60:] + ".pt")
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
             for root, _, files in os.walk(base):
@@ -110,13 +110,15 @@ def _load_weights(model, ck: dict, min_loaded: float = 0.95) -> float:
 
 
 def tokenizer_candidates(repo: str = REPO) -> list[str]:
-    """Paths to try with BPETokenizer.load: tok/bpe12k, every file under tok/, and those files without extension."""
-    files = sorted(p for p in glob.glob(os.path.join(repo, "tok", "**", "*"), recursive=True) if os.path.isfile(p))
+    """Paths to try with BPETokenizer.load: phase1/tok/bpe12k, every file under phase1/tok/, and those without extension."""
+    files = sorted(
+        p for p in glob.glob(os.path.join(repo, "phase1", "tok", "**", "*"), recursive=True) if os.path.isfile(p)
+    )
     first = [p for p in files if "bpe12k" in p]
     rest = [p for p in files if "bpe12k" not in p]
     stems = sorted({os.path.splitext(p)[0] for p in files} - set(files))
     out = []
-    for c in [os.path.join(repo, "tok", "bpe12k")] + first + rest + stems:
+    for c in [os.path.join(repo, "phase1", "tok", "bpe12k")] + first + rest + stems:
         if c not in out:
             out.append(c)
     return out
@@ -124,6 +126,7 @@ def tokenizer_candidates(repo: str = REPO) -> list[str]:
 
 def load_tokenizer(log=print):
     from bpe import BPETokenizer
+
     errors = []
     for c in tokenizer_candidates():
         try:
@@ -145,6 +148,7 @@ def model_max_len(cfg_model: dict) -> int | None:
 def load_model(name: str, path: str | None = None, log=print):
     """(model in float32 on the CPU, checkpoint dict, path, info) for a Phase 1 model (or a mid-trained one)."""
     from models import build_model
+
     path = path or find_checkpoint(name, log)
     ck = _load_ckpt(path)
     cfg = ck.get("config") or {}
@@ -156,10 +160,17 @@ def load_model(name: str, path: str | None = None, log=print):
     model = build_model(arch, cfg_model, vocab)
     frac = _load_weights(model, ck)
     model.eval()
-    info = dict(name=name, path=path, arch=arch, vocab=vocab, params=count_params(model, False), loaded=frac,
-                model_limit=model_max_len(cfg_model),
-                config={k: v for k, v in cfg_model.items() if isinstance(v, (int, float, str, bool))},
-                mid_training=ck.get("mid_training"))
+    info = dict(
+        name=name,
+        path=path,
+        arch=arch,
+        vocab=vocab,
+        params=count_params(model, False),
+        loaded=frac,
+        model_limit=model_max_len(cfg_model),
+        config={k: v for k, v in cfg_model.items() if isinstance(v, (int, float, str, bool))},
+        mid_training=ck.get("mid_training"),
+    )
     return model, ck, path, info
 
 
@@ -174,6 +185,8 @@ def load_backbone(name: str, max_len: int = 512, path: str | None = None, log=pr
     bb = make_backbone(model, tok, max_len=max_len, verbose=True)
     info.update(max_len=max_len, route=bb.route, kind=bb.kind, pooling=bb.pooling)
     mid = " (mid-trained on CJPE text)" if info.get("mid_training") else ""
-    log(f"[model] {name}{mid}: {info['arch']}, {info['params'] / 1e6:.1f}M weights ({info['loaded']:.0%} loaded), "
-        f"input up to {max_len} tokens, {bb.kind} -> pooling '{bb.pooling}'")
+    log(
+        f"[model] {name}{mid}: {info['arch']}, {info['params'] / 1e6:.1f}M weights ({info['loaded']:.0%} loaded), "
+        f"input up to {max_len} tokens, {bb.kind} -> pooling '{bb.pooling}'"
+    )
     return bb, info

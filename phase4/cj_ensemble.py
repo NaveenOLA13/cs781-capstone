@@ -1,16 +1,6 @@
 """Ensemble of finished runs: average the dev / test probabilities of several runs (any model, technique, mid-trained
-or not, whole-case versions) and tune one threshold on dev. No torch needed: works on the saved dev_probs.json /
-test_probs.json files, e.g. after downloading the results zips.
+or not, whole-case versions) and tune one threshold on dev."""
 
-    from cj_ensemble import find_runs, ensemble
-    runs = find_runs(["/kaggle/working/cj_runs", "/kaggle/working/cj_runs_mid"])
-    ensemble(runs, out_dir="/kaggle/working/cj_ensemble")
-
-Members are chosen greedily on dev: start with the best run, then repeatedly add the run that raises the dev
-macro-F1 of the average the most, while it rises by at least min_gain (at most max_members runs). The dev score of
-the result is a little optimistic (members and threshold are chosen on the same 994 cases); the list of members and
-the gain of each step are printed so the choice can be judged.
-"""
 from __future__ import annotations
 
 import json
@@ -45,8 +35,15 @@ def _avg(probs: list[dict], ids):
     return [sum(p[i] for p in probs) / len(probs) for i in ids]
 
 
-def ensemble(runs: dict[str, str], out_dir: str, data_root: str = D.DEFAULT_ROOT, max_members: int = 5,
-             min_gain: float = 0.001, fetch: bool = True, log=print) -> dict:
+def ensemble(
+    runs: dict[str, str],
+    out_dir: str,
+    data_root: str = D.DEFAULT_ROOT,
+    max_members: int = 5,
+    min_gain: float = 0.001,
+    fetch: bool = True,
+    log=print,
+) -> dict:
     data = D.load_data(data_root, fetch=fetch)
     y = {d["id"]: d["label"] for d in data["dev"]}
     dev_ids = [d["id"] for d in data["dev"]]
@@ -92,14 +89,24 @@ def ensemble(runs: dict[str, str], out_dir: str, data_root: str = D.DEFAULT_ROOT
         json.dump(dict(zip(dev_ids, p_dev)), f)
     with open(os.path.join(out_dir, "test_probs.json"), "w") as f:
         json.dump(dict(zip(test_ids, p_test)), f)
-    sub = D.write_submission(data["test"], {i: int(p >= t) for i, p in zip(test_ids, p_test)},
-                             os.path.join(out_dir, "submission_tuned"))
-    res = dict(members=members, steps=steps, threshold=t, dev_050=r50, dev_tuned=rt, single_best=ranked[0],
-               single_best_dev_f1=scores[ranked[0]], submission=sub)
+    sub = D.write_submission(
+        data["test"], {i: int(p >= t) for i, p in zip(test_ids, p_test)}, os.path.join(out_dir, "submission_tuned")
+    )
+    res = dict(
+        members=members,
+        steps=steps,
+        threshold=t,
+        dev_050=r50,
+        dev_tuned=rt,
+        single_best=ranked[0],
+        single_best_dev_f1=scores[ranked[0]],
+        submission=sub,
+    )
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         json.dump(res, f, indent=1)
     log("[ensemble] members: " + " + ".join(f"{s['added']} ({s['dev_f1']:.4f})" for s in steps))
     log(D.format_report(rt, f"[ensemble] dev, {len(members)} runs averaged: "))
-    log(f"[ensemble] best single run {ranked[0]} {scores[ranked[0]]:.4f} -> ensemble {rt['macro_f1']:.4f}; "
-        f"submit {sub}")
+    log(
+        f"[ensemble] best single run {ranked[0]} {scores[ranked[0]]:.4f} -> ensemble {rt['macro_f1']:.4f}; submit {sub}"
+    )
     return res

@@ -1,4 +1,5 @@
-"""Self-test of lsi_data.py and the ensemble in lsi_grid.py (no torch needed).   python test_lsi_data.py -> PASS"""
+"""Self-test of lsi_data.py and the ensemble in lsi_grid.py (no torch needed). python test_lsi_data.py -> PASS"""
+
 import json
 import os
 import random
@@ -11,19 +12,18 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lsi_data as L  # noqa: E402
 
-KEYWORDS = {3: "murder", 7: "theft", 11: "fraud", 20: "dowry", 31: "bail"}   # token ids distinct from the filler
+KEYWORDS = {3: "murder", 7: "theft", 11: "fraud", 20: "dowry", 31: "bail"}
 
 
-def make_fake_lsi(tmp, n_train=60, n_dev=24, n_test=12, n_words=(30, 120), seed=0, extra_test_in_dev=2,
-                  at_end=False):
-    """Phase_5_LSI-like folders; a document's statutes are the ids whose keyword appears in its text (at random
-    places, or at the end of the document with at_end=True: easier for the tiny test models)."""
+def make_fake_lsi(tmp, n_train=60, n_dev=24, n_test=12, n_words=(30, 120), seed=0, extra_test_in_dev=2, at_end=False):
+    """Phase_5_LSI-like folders; a document's statutes are the ids whose keyword appears in its text (at random places,
+    or at the end of the document with at_end=True: easier for the tiny test models)."""
     rng = random.Random(seed)
     filler = [f"w{i}" for i in range(50)]
 
     def doc(i, split):
         labs = rng.sample(sorted(KEYWORDS), rng.choice([1, 1, 2]))
-        if 20 in labs and rng.random() < 0.6:          # statute 20 is rare
+        if 20 in labs and rng.random() < 0.6:
             labs = [x for x in labs if x != 20] or [3]
         words = [rng.choice(filler) for _ in range(rng.randint(*n_words))]
         for x in labs:
@@ -36,7 +36,7 @@ def make_fake_lsi(tmp, n_train=60, n_dev=24, n_test=12, n_words=(30, 120), seed=
     train = [doc(i, "train") for i in range(n_train)]
     dev = [doc(i, "dev") for i in range(n_dev)]
     test = [doc(i, "test") for i in range(n_test)]
-    dev += [dict(t) for t in test[:extra_test_in_dev]]      # leak: test documents inside dev (must be removed)
+    dev += [dict(t) for t in test[:extra_test_in_dev]]
     json.dump(train, open(os.path.join(root, "Train", "train.json"), "w"))
     json.dump(dev, open(os.path.join(root, "Train", "dev.json"), "w"))
     json.dump([{"id": t["id"], "text": t["text"]} for t in test], open(os.path.join(root, "Test", "test.json"), "w"))
@@ -74,7 +74,6 @@ def test_scores():
     Y = np.array([[1, 0, 0], [1, 1, 0], [0, 1, 0]], bool)
     P = np.array([[1, 0, 1], [0, 1, 0], [0, 1, 0]], bool)
     s = L.scores(Y, P)
-    # statute 0: tp 1 fn 1 -> F1 2/3; statute 1: tp 2 -> 1; statute 2 has no gold -> not in macro
     assert abs(s["macro_f1"] - (2 / 3 + 1) / 2) < 1e-9 and s["statutes_scored"] == 2
     assert abs(s["micro_f1"] - 2 * 3 / (2 * 3 + 1 + 1)) < 1e-9
     assert abs(s["subset_acc"] - 1 / 3) < 1e-9
@@ -84,8 +83,7 @@ def test_thresholds():
     rng = np.random.RandomState(0)
     n, k = 400, 4
     Y = rng.rand(n, k) < [0.5, 0.3, 0.2, 0.1]
-    Y[~Y.any(1), 0] = True                     # every document has at least one statute (as in the data)
-    # statute j is separable at a different cut-off: positives score above c_j, negatives below
+    Y[~Y.any(1), 0] = True
     cuts = np.array([0.2, 0.4, 0.6, 0.8])
     P = np.where(Y, cuts + rng.rand(n, k) * (1 - cuts) * 0.9 + 0.01, rng.rand(n, k) * cuts * 0.95)
     tg, mg = L.tune_global(Y, P)
@@ -93,10 +91,8 @@ def test_thresholds():
     assert L.scores(Y, L.apply(P, tl))["macro_f1"] > 0.99 > mg
     ch = L.choose_thresholds(Y, P)
     assert ch["kind"] == "per_label" and ch["cv_per_label"] > ch["cv_global"], ch
-    # min_one: a document with nothing above threshold still gets its top statute
     pred = L.apply(np.array([[0.1, 0.3], [0.9, 0.2]]), 0.5)
     assert pred.tolist() == [[False, True], [True, False]]
-    # rare statutes keep the global threshold
     Yr = np.zeros((50, 2), bool)
     Yr[:2, 1] = True
     Yr[:, 0] = rng.rand(50) < 0.5
@@ -104,11 +100,8 @@ def test_thresholds():
 
 
 def test_plan_steps():
-    # plenty of time: every planned step
     assert L.plan_steps(20, 1000, 1.0, seconds_left=5000, predict_seconds=600) == 1000
-    # 400 s left after the predictions at 2 s per step: 200 more steps
     assert L.plan_steps(20, 1000, 2.0, seconds_left=1000, predict_seconds=600) == 220
-    # deadline already passed: stop at the steps done (at least min_steps)
     assert L.plan_steps(50, 1000, 1.0, seconds_left=-10, predict_seconds=600) == 50
     assert L.plan_steps(5, 1000, 1.0, seconds_left=-10, predict_seconds=600, min_steps=20) == 20
     assert L.plan_steps(5, 12, 1.0, seconds_left=-10, predict_seconds=600, min_steps=20) == 12
@@ -130,6 +123,7 @@ def test_submission():
 
 def test_probs_and_ensemble():
     import lsi_grid as G
+
     with tempfile.TemporaryDirectory() as tmp:
         root = make_fake_lsi(tmp, n_dev=80)
         data = L.load_data(root, fetch=False)
@@ -138,7 +132,6 @@ def test_probs_and_ensemble():
         rng = np.random.RandomState(1)
         ids_dev, ids_test = [d["id"] for d in data["dev"]], [d["id"] for d in data["test"]]
         base = os.path.join(tmp, "runs")
-        # three runs, each wrong (scores flipped) on a different statute: the average is right everywhere
         for r, name in enumerate(("m_full", "m_lorma", "m_adapter")):
             d = os.path.join(base, name)
             os.makedirs(d)
@@ -171,6 +164,7 @@ if __name__ == "__main__":
                 print(f"PASS {name}")
             except Exception as e:  # noqa: BLE001
                 import traceback
+
                 traceback.print_exc()
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}")

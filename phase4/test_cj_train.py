@@ -1,12 +1,5 @@
-"""Self-test of the Phase 4 techniques and training on tiny stand-in models (GPT-style with biases and a tied LM
-head, Llama-style without biases, encoder-decoder with a bidirectional GRU encoder) and fake cases whose last words
-give the outcome. Needs torch (no peft). About 3-5 minutes.     python test_cj_train.py  -> every line PASS
+"""Self-test of the Phase 4 techniques and training on tiny stand-in models."""
 
-Checks: which weights each technique trains; LoRMA, AdaLoRA, adapters and added BitFit biases leave the model's
-output unchanged at the start and do change it once trained (also through the GRU); the unfreezing schedule;
-AdaLoRA ends with the target rank budget; full runs write complete submissions, probabilities and metrics, and a
-full fine-tune learns the fake task; the grid helpers.
-"""
 import json
 import math
 import os
@@ -32,7 +25,7 @@ V, D_ = 600, 32
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ------------------------------------------------------------------------ toy tokenizer
+# --- toy tokenizer
 class WordTok:
     special = {"<pad>": 0, "<s>": 1, "</s>": 2}
 
@@ -43,7 +36,7 @@ class WordTok:
         return self.special.get(t)
 
 
-# --------------------------------------------------------------------------- toy models
+# --- toy models
 class Block(nn.Module):
     def __init__(self, d):
         super().__init__()
@@ -126,8 +119,17 @@ class ToyEncDec(nn.Module):
 
 
 TOYS = {"gpt": ToyGPT, "llama": ToyLlama, "encdec": ToyEncDec}
-FAST = dict(epochs=2, batch_size=8, eval_batch_size=16, max_len=32, log_every=0, fit_sample=20, tok_workers=1,
-            lr_head=3e-3, fetch_data=False)
+FAST = dict(
+    epochs=2,
+    batch_size=8,
+    eval_batch_size=16,
+    max_len=32,
+    log_every=0,
+    fit_sample=20,
+    tok_workers=1,
+    lr_head=3e-3,
+    fetch_data=False,
+)
 
 
 def _bb(kind):
@@ -158,27 +160,30 @@ def _trained_names(clf):
     return {n for n, p in clf.encoder.model.named_parameters() if p.requires_grad}
 
 
-# --------------------------------------------------------------------------------- tests
+# --- tests
 def test_structure():
     with tempfile.TemporaryDirectory() as tmp:
-        for kind, (n_layers, layer_kind) in {"gpt": (3, "blocks"), "llama": (3, "blocks"),
-                                              "encdec": (2, "RNN layers")}.items():
+        for kind, (n_layers, layer_kind) in {
+            "gpt": (3, "blocks"),
+            "llama": (3, "blocks"),
+            "encdec": (2, "RNN layers"),
+        }.items():
             bb, clf, used, *_ = _setup(kind, os.path.join(tmp, kind))
             model = clf.encoder.model
             bottom, layers, top, k = T.layer_groups(model, used)
             assert (len(layers), k) == (n_layers, layer_kind), (kind, len(layers), k)
             if kind == "encdec":
                 assert bb.kind == "encoder" and bb.pad_effect > 1e-4
-                assert not any(n.startswith(("decoder.", "lm_head.")) for n in used)       # decoder never used
+                assert not any(n.startswith(("decoder.", "lm_head.")) for n in used)
                 assert bottom == ["emb.weight"] and top == []
                 assert all(n.startswith("encoder.") and n.endswith(("_l0", "_l0_reverse")) for n in layers[0])
-                assert len(T.targets(model, used)) == 8                                     # ih, hh x 2 layers x 2 dirs
+                assert len(T.targets(model, used)) == 8
             else:
                 assert bb.kind == "decoder"
                 assert all(b[0].startswith(("h.0.", "layers.0.")) for b in layers[:1])
                 assert top and all(n.startswith(("ln_f", "norm")) for n in top)
             if kind == "gpt":
-                assert "lm_head.weight" not in [f"{m}.{p}" for m, _, p in T.targets(model, used)]   # tied: skipped
+                assert "lm_head.weight" not in [f"{m}.{p}" for m, _, p in T.targets(model, used)]
 
 
 def test_trainable_sets():
@@ -190,20 +195,21 @@ def test_trainable_sets():
                 before = _logits(clf, seqs["train"], bb.pad_id)
                 h = T.apply(clf, tech, used, cfg, total_steps=30, log=lambda *a: None)
                 after = _logits(clf, seqs["train"], bb.pad_id)
-                if tech == "qlora":                  # 4-bit copy of the fixed weights: close, not equal
+                if tech == "qlora":
                     assert (before - after).abs().max() < 0.5 * before.abs().max() + 1e-3, (kind, tech)
                 else:
                     assert torch.allclose(before, after, atol=1e-4), (kind, tech, (before - after).abs().max())
                 model = clf.encoder.model
                 names = _trained_names(clf)
-                bottom, layers, top, _ = T.layer_groups(model, used) if tech not in T.LOW_RANK else (
-                    None, None, None, None)
+                bottom, layers, top, _ = (
+                    T.layer_groups(model, used) if tech not in T.LOW_RANK else (None, None, None, None)
+                )
                 if tech in ("frozen", "unfreeze"):
-                    assert names == set(), (kind, tech, names)                  # unfreeze starts with the head only
+                    assert names == set(), (kind, tech, names)
                 elif tech == "full":
                     assert names == used
                 elif tech == "partial":
-                    assert names == set(layers[-1]) | set(top), (kind, names)  # ceil(L / 3) = 1 layer for L = 2, 3
+                    assert names == set(layers[-1]) | set(top), (kind, names)
                 elif tech == "bitfit":
                     assert names and all(n.split(".")[-1].startswith("bias") for n in names), names
                     if kind == "llama":
@@ -215,7 +221,7 @@ def test_trainable_sets():
                 elif tech == "adapter":
                     assert names == set() and len(h.body_params) > 0
                     assert all(p.requires_grad for p in h.body_params)
-                if tech != "unfreeze":                     # unfreezing starts with everything frozen on purpose
+                if tech != "unfreeze":
                     assert all(p.requires_grad for p in h.body_params), (kind, tech)
 
 
@@ -229,7 +235,7 @@ def test_updates_change_the_model():
                 before = _logits(clf, seqs["train"], bb.pad_id)
                 opt = torch.optim.Adam(h.body_params, lr=1e-2)
                 clf.train()
-                for _ in range(2):          # AdaLoRA / LoRMA: the first step moves lambda / B, the second the rest
+                for _ in range(2):
                     ids, mask = R.collate(seqs["train"][:4], bb.pad_id, DEV)
                     loss = F.cross_entropy(clf(ids, mask).float(), torch.tensor([0, 1, 0, 1], device=DEV))
                     extra = h.extra_loss()
@@ -246,18 +252,17 @@ def test_updates_change_the_model():
 def test_unfreeze_schedule():
     with tempfile.TemporaryDirectory() as tmp:
         bb, clf, used, *_ = _setup("llama", tmp)
-        h = T.apply(clf, "unfreeze", used, dict(T.TECH_DEFAULTS, unfreeze_stages=4), total_steps=8,
-                    log=lambda *a: None)
+        h = T.apply(clf, "unfreeze", used, dict(T.TECH_DEFAULTS, unfreeze_stages=4), total_steps=8, log=lambda *a: None)
         model = clf.encoder.model
         bottom, layers, top, _ = T.layer_groups(model, used)
         seen = []
         for step in range(8):
             h.on_step_start(step)
             seen.append(_trained_names(clf))
-        assert seen[0] == set() and seen[1] == set()                              # stage 0: steps 0-1
-        assert seen[2] == set(layers[2]) | set(top)                                # stage 1: top layer
-        assert seen[4] == set(layers[1]) | set(layers[2]) | set(top)               # stage 2: two layers
-        assert seen[6] == used and seen[7] == used                                 # stage 3: all + embeddings
+        assert seen[0] == set() and seen[1] == set()
+        assert seen[2] == set(layers[2]) | set(top)
+        assert seen[4] == set(layers[1]) | set(layers[2]) | set(top)
+        assert seen[6] == used and seen[7] == used
         assert [s["stage"] for s in h.info["schedule"]] == [0, 1, 2, 3]
 
 
@@ -272,7 +277,7 @@ def test_adalora_budget():
         budgets = []
         clf.train()
         for step in range(1, total + 1):
-            ids, mask = R.collate(seqs["train"][(step % 6) * 4:(step % 6) * 4 + 4], bb.pad_id, DEV)
+            ids, mask = R.collate(seqs["train"][(step % 6) * 4 : (step % 6) * 4 + 4], bb.pad_id, DEV)
             y = torch.tensor([0, 1, 0, 1], device=DEV)
             loss = F.cross_entropy(clf(ids, mask).float(), y) + h.extra_loss()
             opt.zero_grad()
@@ -282,7 +287,7 @@ def test_adalora_budget():
             budgets.append(h.budget)
         kept = sum(int(m.mask.sum()) for _, m in h.mods)
         assert budgets[0] == 6 * n and budgets[-1] == 2 * n and kept == 2 * n, (budgets[0], budgets[-1], kept)
-        assert all(a >= b for a, b in zip(budgets, budgets[1:]))                 # the budget only shrinks
+        assert all(a >= b for a, b in zip(budgets, budgets[1:]))
         s = h.summary()
         assert s["ranks_kept"] == 2 * n and s["final_rank_mean_by_layer_type"]
 
@@ -303,8 +308,17 @@ def _check_run(res, root, tech):
     assert any(k.startswith("head.") for k in saved)
     if tech in ("lorma", "adalora", "adapter", "bitfit", "frozen", "lora", "qlora"):
         assert not any("original" in k for k in saved) and m["trainable_share"] < 0.6, (tech, m["trainable_share"])
-    for k in ("dev_050", "dev_tuned", "threshold", "train_fit", "trainable_params", "train_seconds",
-              "dev_infer_seconds", "history", "technique_info"):
+    for k in (
+        "dev_050",
+        "dev_tuned",
+        "threshold",
+        "train_fit",
+        "trainable_params",
+        "train_seconds",
+        "dev_infer_seconds",
+        "history",
+        "technique_info",
+    ):
         assert k in m, k
     assert 0.0 <= m["dev_tuned"]["macro_f1"] <= 1.0 and m["dev_tuned"]["macro_f1"] >= m["dev_050"]["macro_f1"] - 1e-9
 
@@ -319,7 +333,6 @@ def test_runs_end_to_end():
             for tech in techs:
                 res = R.run(bb, name=kind, technique=tech, **common)
                 _check_run(res, root, tech)
-        # a full fine-tune learns the fake task (the outcome is in the last words)
         res = R.run(_bb("llama"), name="learn", technique="full", **dict(common, epochs=8, lr_body=3e-3))
         f = res["metrics"]["dev_tuned"]["macro_f1"]
         print(f"      toy Llama, full fine-tuning: dev macro-F1 {f:.3f}")
@@ -353,6 +366,7 @@ if __name__ == "__main__":
                 print(f"PASS {name}")
             except Exception as e:  # noqa: BLE001
                 import traceback
+
                 traceback.print_exc()
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}")

@@ -1,0 +1,9 @@
+torch>=2.0
+numpy
+scipy
+pyyaml
+huggingface_hub
+ijson
+peft            # Phase 3 only (allowed there)
+matplotlib      # Phase 3 data plots
+kagglehub       # optional: download checkpoints inside Kaggle

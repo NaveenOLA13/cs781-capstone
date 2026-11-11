@@ -1,10 +1,5 @@
-"""End-to-end self-test of the Phase 3 code on tiny stand-in models and fake data.
-Runs in about a minute (GPU or CPU).      python test_rr_pipeline.py   -> every line PASS
+"""End-to-end self-test of the Phase 3 code on tiny stand-in models and fake data."""
 
-Checks: tokenizer adapters, automatic hidden-state detection for decoder / encoder-decoder /
-nanoGPT / hidden_states-method / one-way-RNN models, clear failures, and a full run
-(Stage A + Stage B + both submissions) that leaves the original model untouched.
-"""
 import json
 import math
 import os
@@ -26,13 +21,14 @@ torch.manual_seed(0)
 V, D_ = 600, 32
 
 
-# ------------------------------------------------------------------- toy tokenizers
+# --- toy tokenizers
 def word_ids(text):
     return [3 + sum(map(ord, w)) % (V - 3) for w in text.split()]
 
 
 class WordTok:
     """encode(text) -> list[int]; <pad>=0, <s>=1, </s>=2 via token_to_id."""
+
     special = {"<pad>": 0, "<s>": 1, "</s>": 2}
 
     def encode(self, text):
@@ -65,7 +61,7 @@ class SPLikeTok:
         return -1
 
 
-# ----------------------------------------------------------------------- toy models
+# --- toy models
 class Block(nn.Module):
     def __init__(self, d, causal):
         super().__init__()
@@ -186,7 +182,7 @@ class Weird(nn.Module):
         return self.w(a)
 
 
-# ---------------------------------------------------------------------------- tests
+# --- tests
 def test_tokenizer_adapters():
     s = "The appellant filed an appeal"
     ref = WordTok().encode(s)
@@ -194,7 +190,7 @@ def test_tokenizer_adapters():
         assert make_encode(tok)(s) == ref, type(tok)
     assert special_ids(WordTok()) == {"pad": 0, "bos": 1, "eos": 2}
     sp = special_ids(SPLikeTok())
-    assert sp["pad"] is None and sp["eos"] == 2 and sp["bos"] is None, sp   # unk (1) is not taken as bos
+    assert sp["pad"] is None and sp["eos"] == 2 and sp["bos"] is None, sp
 
 
 def _bb(model, **kw):
@@ -212,8 +208,11 @@ def test_routes_detected():
     ]
     for model, route, kind, pooling in cases:
         bb = _bb(model)
-        assert route in bb.route and bb.kind == kind and bb.pooling == pooling, (type(model).__name__, bb.route,
-                                                                                bb.kind)
+        assert route in bb.route and bb.kind == kind and bb.pooling == pooling, (
+            type(model).__name__,
+            bb.route,
+            bb.kind,
+        )
         clf = bb.classifier(13, pos_buckets=10)
         ids = torch.tensor([[5, 6, 7, 0], [8, 9, 10, 11]])
         mask = torch.tensor([[1, 1, 1, 0], [1, 1, 1, 1]])
@@ -257,10 +256,17 @@ def _check_run(res, data_dir, model, before):
     assert set(m["stage_a"]["dev"]) == {"all", "CL", "IT"}
     h = m["stage_a"]["history"]
     assert h[-1]["loss"] < h[0]["loss"], [x["loss"] for x in h]
-    for k, v in model.state_dict().items():                       # the original model is untouched
+    for k, v in model.state_dict().items():
         assert torch.equal(v.cpu(), before[k]), f"original weights changed: {k}"
-    for f in ("log.txt", "config.json", "features.pt", "stageA_model.pt", "stageB_model.pt",
-              "stageA/dev_confusion.csv", "stageB/dev_predictions.json"):
+    for f in (
+        "log.txt",
+        "config.json",
+        "features.pt",
+        "stageA_model.pt",
+        "stageB_model.pt",
+        "stageA/dev_confusion.csv",
+        "stageB/dev_predictions.json",
+    ):
         assert os.path.exists(os.path.join(out, f)), f
     return m
 
@@ -271,12 +277,25 @@ def test_full_run_decoder():
         model = ToyGPT()
         before = {k: v.clone() for k, v in model.state_dict().items()}
         bb = _bb(model)
-        res = run(bb, data_root=data, out_dir=os.path.join(tmp, "runs"), run_name="gpt", epochs=4,
-                  b_epochs=4, batch_size=16, max_len=32, lr_backbone=3e-3, lr_head=3e-3, log_every=0)
+        res = run(
+            bb,
+            data_root=data,
+            out_dir=os.path.join(tmp, "runs"),
+            run_name="gpt",
+            epochs=4,
+            b_epochs=4,
+            batch_size=16,
+            max_len=32,
+            lr_backbone=3e-3,
+            lr_head=3e-3,
+            log_every=0,
+        )
         m = _check_run(res, data, model, before)
-        assert m["config"]["exact_batches"] is False            # causal decoder: padding has no effect
-        print(f"      dev macro-F1: stage A {m['stage_a']['best_dev_score']:.3f}, "
-              f"stage B {m['stage_b']['best_dev_score']:.3f} (fake data)")
+        assert m["config"]["exact_batches"] is False
+        print(
+            f"      dev macro-F1: stage A {m['stage_a']['best_dev_score']:.3f}, "
+            f"stage B {m['stage_b']['best_dev_score']:.3f} (fake data)"
+        )
 
 
 def test_full_and_frozen_run_encdec():
@@ -285,18 +304,38 @@ def test_full_and_frozen_run_encdec():
         model = ToyEncDec()
         before = {k: v.clone() for k, v in model.state_dict().items()}
         bb = _bb(model)
-        res = run(bb, data_root=data, out_dir=os.path.join(tmp, "runs"), run_name="ed", epochs=2, b_epochs=2,
-                  batch_size=16, max_len=32, lr_backbone=3e-3, log_every=0)
+        res = run(
+            bb,
+            data_root=data,
+            out_dir=os.path.join(tmp, "runs"),
+            run_name="ed",
+            epochs=2,
+            b_epochs=2,
+            batch_size=16,
+            max_len=32,
+            lr_backbone=3e-3,
+            log_every=0,
+        )
         m = _check_run(res, data, model, before)
-        assert m["config"]["exact_batches"] is True             # BiGRU: padding changes outputs
+        assert m["config"]["exact_batches"] is True
         used = count_params(model.emb) + count_params(model.encoder)
         head = (D_ + 32) * 13 + 13 + 10 * 32
         assert m["stage_a"]["trainable_params"] == used + head, (m["stage_a"]["trainable_params"], used + head)
         trained = res["stage_a"].encoder.model
-        assert torch.equal(trained.decoder.weight_hh_l0.cpu(), before["decoder.weight_hh_l0"])  # unused: unchanged
+        assert torch.equal(trained.decoder.weight_hh_l0.cpu(), before["decoder.weight_hh_l0"])
         assert not torch.equal(trained.encoder.weight_hh_l0.cpu(), before["encoder.weight_hh_l0"])
-        res = run(bb, data_root=data, out_dir=os.path.join(tmp, "runs"), run_name="ed_frozen", method="frozen",
-                  epochs=1, b_epochs=1, batch_size=16, max_len=32, log_every=0)
+        res = run(
+            bb,
+            data_root=data,
+            out_dir=os.path.join(tmp, "runs"),
+            run_name="ed_frozen",
+            method="frozen",
+            epochs=1,
+            b_epochs=1,
+            batch_size=16,
+            max_len=32,
+            log_every=0,
+        )
         m = _check_run_frozen(res, head)
         assert torch.equal(res["stage_a"].encoder.model.encoder.weight_hh_l0.cpu(), before["encoder.weight_hh_l0"])
 
@@ -311,8 +350,18 @@ def test_limit_and_bad_setting():
     with tempfile.TemporaryDirectory() as tmp:
         data = make_fake_data(os.path.join(tmp, "data"), n_train=6)
         bb = _bb(ToyGPT())
-        res = run(bb, data_root=data, out_dir=os.path.join(tmp, "runs"), run_name="q", limit_train_docs=2,
-                  epochs=1, b_epochs=1, max_len=32, log_every=0, save_model=False)
+        res = run(
+            bb,
+            data_root=data,
+            out_dir=os.path.join(tmp, "runs"),
+            run_name="q",
+            limit_train_docs=2,
+            epochs=1,
+            b_epochs=1,
+            max_len=32,
+            log_every=0,
+            save_model=False,
+        )
         assert res["metrics"]["data"]["train"]["docs"] == 4
         try:
             run(bb, data_root=data, epoch=3)
@@ -328,8 +377,20 @@ def test_out_of_fold_run():
             model = model_cls()
             before = {k: v.clone() for k, v in model.state_dict().items()}
             bb = _bb(model)
-            res = run_cv(bb, data_root=data, out_dir=os.path.join(tmp, "runs"), run_name=name, folds=3, epochs=2,
-                         b_epochs=4, batch_size=16, max_len=32, lr_backbone=3e-3, lr_head=3e-3, log_every=0)
+            res = run_cv(
+                bb,
+                data_root=data,
+                out_dir=os.path.join(tmp, "runs"),
+                run_name=name,
+                folds=3,
+                epochs=2,
+                b_epochs=4,
+                batch_size=16,
+                max_len=32,
+                lr_backbone=3e-3,
+                lr_head=3e-3,
+                log_every=0,
+            )
             out, m = res["out_dir"], res["metrics"]
             assert res["chosen"] in VARIANTS and m["chosen"] == res["chosen"]
             test = {}
@@ -340,8 +401,10 @@ def test_out_of_fold_run():
                     pred = json.loads(z.read("prediction.json"))
                 assert set(pred) == set(test) and all(len(pred[k]) == len(test[k]) for k in test), v
                 assert set(m["dev"][v]) == {"all", "CL", "IT"} and set(m["oof_train"][v]) == {"all", "CL", "IT"}
-            assert len(m["folds"]) == 3 and sorted(sum(m["folds"], [])) == sorted(m["folds"][0] + m["folds"][1] + m["folds"][2])
-            assert len({d for f in m["folds"] for d in f}) == 12                       # every judgment held out once
+            assert len(m["folds"]) == 3 and sorted(sum(m["folds"], [])) == sorted(
+                m["folds"][0] + m["folds"][1] + m["folds"][2]
+            )
+            assert len({d for f in m["folds"] for d in f}) == 12
             assert m["bias"]["oof_13avg"]["per_domain"] >= m["bias"]["oof_13avg"]["none"] - 1e-9
             for f in ("oof.pt", "metrics.json", "log.txt", "stageA_fold1.pt", "stageA_fold3.pt", "stageB_fold2.pt"):
                 assert os.path.exists(os.path.join(out, f)), f
@@ -349,17 +412,20 @@ def test_out_of_fold_run():
             assert not any("decoder" in k or "lm_head" in k for k in saved["trained_weights"]) or name == "gpt"
             for k, v in model.state_dict().items():
                 assert torch.equal(v.cpu(), before[k]), f"original weights changed: {k}"
-            print(f"      {name}: chosen {res['chosen']}, dev 13-role avg "
-                  + ", ".join(f"{v} {m['dev'][v]['all']['macro_f1_all13']:.3f}" for v in VARIANTS))
+            print(
+                f"      {name}: chosen {res['chosen']}, dev 13-role avg "
+                + ", ".join(f"{v} {m['dev'][v]['all']['macro_f1_all13']:.3f}" for v in VARIANTS)
+            )
 
 
 def test_context_inputs():
     from rr_train import _batch, item_seq
+
     docs = [{"ids": [[11, 12], [13, 14, 15], [16]]}]
     cfg = {"context": True, "context_tokens": 2, "context_sep_id": 9}
-    assert item_seq(docs, (0, 0, 0), cfg) == ([9, 13, 14, 9, 11, 12], 4)          # no previous sentence
+    assert item_seq(docs, (0, 0, 0), cfg) == ([9, 13, 14, 9, 11, 12], 4)
     assert item_seq(docs, (0, 1, 0), cfg) == ([11, 12, 9, 16, 9, 13, 14, 15], 5)
-    assert item_seq(docs, (0, 2, 0), cfg) == ([14, 15, 9, 9, 16], 4)              # end of previous, no next
+    assert item_seq(docs, (0, 2, 0), cfg) == ([14, 15, 9, 9, 16], 4)
     assert item_seq(docs, (0, 1, 0), {"context": False}) == ([13, 14, 15], 0)
     ids, mask, pool, pos = _batch(docs, [(0, 0, 0), (0, 1, 5), (0, 2, 9)], [0, 1, 2], 0, "cpu", cfg)
     assert ids.shape == (3, 8) and pos.tolist() == [0, 5, 9]
@@ -369,24 +435,38 @@ def test_context_inputs():
 
 def test_context_run_and_neighbours_matter():
     from rr_train import run_sentences
+
     with tempfile.TemporaryDirectory() as tmp:
         data = make_fake_data(os.path.join(tmp, "data"), n_train=4)
         model = ToyGPT()
         before = {k: v.clone() for k, v in model.state_dict().items()}
         bb = _bb(model)
-        res = run(bb, data_root=data, out_dir=os.path.join(tmp, "runs"), run_name="ctx", context=True,
-                  context_tokens=8, b_arch="gru_attn", epochs=3, b_epochs=2, batch_size=16, max_len=32,
-                  lr_backbone=3e-3, lr_head=3e-3, log_every=0)
+        res = run(
+            bb,
+            data_root=data,
+            out_dir=os.path.join(tmp, "runs"),
+            run_name="ctx",
+            context=True,
+            context_tokens=8,
+            b_arch="gru_attn",
+            epochs=3,
+            b_epochs=2,
+            batch_size=16,
+            max_len=32,
+            lr_backbone=3e-3,
+            lr_head=3e-3,
+            log_every=0,
+        )
         m = _check_run(res, data, model, before)
-        assert m["config"]["context"] is True and m["config"]["context_sep_id"] == 2      # WordTok's </s>
+        assert m["config"]["context"] is True and m["config"]["context_sep_id"] == 2
         assert m["config"]["b_arch"] == "gru_attn"
         clf, cfg, cpu = res["stage_a"], dict(m["config"]), torch.device("cpu")
         d1 = {"ids": [[5, 6, 7], [8, 9, 10]]}
-        d2 = {"ids": [[5, 6, 7], [20, 21, 22]]}                 # same first sentence, different next sentence
+        d2 = {"ids": [[5, 6, 7], [20, 21, 22]]}
         on = run_sentences(clf, [d1, d2], cfg, cpu, bb.pad_id, what="features")
         off = run_sentences(clf, [d1, d2], {**cfg, "context": False}, cpu, bb.pad_id, what="features")
-        assert not torch.allclose(on[0][0], on[1][0])            # with context the next sentence is read
-        assert torch.allclose(off[0][0], off[1][0])              # without context it is not
+        assert not torch.allclose(on[0][0], on[1][0])
+        assert torch.allclose(off[0][0], off[1][0])
 
 
 def test_context_too_long_fails_early():
@@ -394,8 +474,18 @@ def test_context_too_long_fails_early():
         data = make_fake_data(os.path.join(tmp, "data"), n_train=2)
         bb = make_backbone(ToyGPT(max_pos=20), WordTok(), max_len=16, verbose=False)
         try:
-            run(bb, data_root=data, out_dir=os.path.join(tmp, "runs"), run_name="long", context=True,
-                context_tokens=16, max_len=16, epochs=1, b_epochs=1, log_every=0)
+            run(
+                bb,
+                data_root=data,
+                out_dir=os.path.join(tmp, "runs"),
+                run_name="long",
+                context=True,
+                context_tokens=16,
+                max_len=16,
+                epochs=1,
+                b_epochs=1,
+                log_every=0,
+            )
             raise AssertionError("inputs longer than the model allows should fail before training")
         except RuntimeError as e:
             assert "cannot take" in str(e), e
@@ -410,6 +500,7 @@ if __name__ == "__main__":
                 print(f"PASS {name}")
             except Exception as e:  # noqa: BLE001
                 import traceback
+
                 traceback.print_exc()
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}")

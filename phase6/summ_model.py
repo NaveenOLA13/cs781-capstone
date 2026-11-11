@@ -1,11 +1,6 @@
-"""Phase 6: a Phase 1 model as a conditional generator, fine-tuning techniques on it, KD students and teachers,
-the training loss and batched beam search.
+"""Phase 6: a Phase 1 model as a conditional generator, fine-tuning techniques on it, KD students and teachers, the
+training loss and batched beam search."""
 
-Decoder-only models (decoder-only, Llama, MoE): one stream  [eos] window " Summary:" target [eos]; the loss is on the
-target tokens only. Encoder-decoder: the encoder reads the window, the decoder writes [bos] target [eos].
-Generation: beam search over many windows at once (all windows of a document have exactly the same number of tokens,
-so no padding is needed), repeated n-grams banned, length-normalised scores (GNMT).
-"""
 from __future__ import annotations
 
 import copy
@@ -24,7 +19,7 @@ from rr_head import find_lm_head, first_tensor  # noqa: E402
 PROMPT = " Summary:"
 
 
-# ------------------------------------------------------------------------ the model
+# --- the model
 class _Enc(nn.Module):
     def __init__(self, model, encdec):
         super().__init__()
@@ -37,11 +32,7 @@ class _Enc(nn.Module):
 
 class CopyHead(nn.Module):
     """Pointer-generator (See, Liu & Manning 2017) added to our encoder-decoder: an attention of every decoder state
-    s_t (the input of the LM head) over the encoder states h_i gives a_t and the context c_t = sum_i a_ti h_i;
-    p_gen = sigmoid(w . [s_t ; c_t] + b) mixes the model's own word distribution with copying source tokens:
-    P(w) = p_gen P_vocab(w) + (1 - p_gen) sum_{i: src_i = w} a_ti. Rare words of the document (names, section
-    numbers, dates) can then be copied exactly. Starts with p_gen about 0.88 (close to the model alone).
-    Scaled dot-product attention (an additive one would need a [B, T, S, d] tensor)."""
+    s_t (the input of the LM head) over the encoder states h_i gives a_t and the context c_t = sum_i a_ti h_i."""
 
     def __init__(self, d_dec: int, d_enc: int, d_att: int = 256):
         super().__init__()
@@ -65,7 +56,7 @@ class CopyHead(nn.Module):
 
 class Wrap(nn.Module):
     """Holds the Phase 1 model as .encoder.model (the layout cj_tech.apply expects); adapters are added as .adapters,
-    the encoder-decoder's pointer-generator as .copy. Its state_dict therefore contains everything that is trained."""
+    the encoder-decoder's pointer-generator as .copy."""
 
     def __init__(self, model):
         super().__init__()
@@ -83,7 +74,7 @@ class Wrap(nn.Module):
 
     def enable_copy(self, probe, ids, device, log=print) -> bool:
         """Adds the pointer-generator to an encoder-decoder (needs model.encode(src) and an LM head whose input is the
-        decoder state). Returns False (and changes nothing) if the model does not offer them."""
+        decoder state)."""
         m = self.model
         name = find_lm_head(m)
         if not self.encdec or not hasattr(m, "encode") or name is None:
@@ -98,23 +89,33 @@ class Wrap(nn.Module):
                 lg = ed_logits(m, src, seq)
                 enc = first_tensor(m.encode(src))
                 h = hold.get("h")
-            if (h is None or h.dim() != 3 or tuple(h.shape[:2]) != tuple(lg.shape[:2]) or enc is None or enc.dim() != 3
-                    or tuple(enc.shape[:2]) != tuple(src.shape)):
-                raise RuntimeError(f"unexpected shapes: decoder states {None if h is None else tuple(h.shape)}, "
-                                   f"encoder states {None if enc is None else tuple(enc.shape)}")
+            if (
+                h is None
+                or h.dim() != 3
+                or tuple(h.shape[:2]) != tuple(lg.shape[:2])
+                or enc is None
+                or enc.dim() != 3
+                or tuple(enc.shape[:2]) != tuple(src.shape)
+            ):
+                raise RuntimeError(
+                    f"unexpected shapes: decoder states {None if h is None else tuple(h.shape)}, "
+                    f"encoder states {None if enc is None else tuple(enc.shape)}"
+                )
         except Exception as e:  # noqa: BLE001
             handle.remove()
             log(f"[copy] no pointer-generator: {type(e).__name__}: {e}")
             return False
         self.copy = CopyHead(h.size(-1), enc.size(-1)).to(device)
         self._handle = handle
-        log(f"[copy] pointer-generator on '{name}' (decoder state {h.size(-1)}, encoder state {enc.size(-1)}): "
-            f"{sum(p.numel() for p in self.copy.parameters()) / 1e6:.2f}M weights, trained with the technique")
+        log(
+            f"[copy] pointer-generator on '{name}' (decoder state {h.size(-1)}, encoder state {enc.size(-1)}): "
+            f"{sum(p.numel() for p in self.copy.parameters()) / 1e6:.2f}M weights, trained with the technique"
+        )
         return True
 
     def copy_logp(self, src, vocab_logits, enc=None):
         """log P of the pointer-generator for the positions of the last forward (decoder states from the hook)."""
-        h = self._hold["h"][:, -vocab_logits.size(1):]
+        h = self._hold["h"][:, -vocab_logits.size(1) :]
         if enc is None:
             enc = first_tensor(self.model.encode(src))
         return self.copy(h, enc, src, vocab_logits)[0]
@@ -137,8 +138,7 @@ def full_logits(model, x):
 
 
 def ed_logits(model, src, seq):
-    """Encoder-decoder scores aligned with seq[:, 1:] (seq starts with bos). Handles models that shift the target
-    themselves (their output is one shorter than their input)."""
+    """Encoder-decoder scores aligned with seq[:, 1:] (seq starts with bos)."""
     shift = getattr(model, "_p6_shift", None)
     if shift is None:
         lg = first_tensor(model(src, seq[:, :-1]))
@@ -152,10 +152,10 @@ def ed_logits(model, src, seq):
     return lg
 
 
-# -------------------------------------------------------------------------- batches
+# --- batches
 def dec_batch(pairs, prompt, eos_id, pad_id, device):
-    """(x, y): x = [eos] window prompt target [eos] (right-padded), y = the same with -100 outside the target;
-    scores of x[:, :-1] are compared with y[:, 1:]."""
+    """(x, y): x = [eos] window prompt target [eos] (right-padded), y = the same with -100 outside the target; scores
+    of x[:, :-1] are compared with y[:, 1:]."""
     seqs, labs = [], []
     for p in pairs:
         ctx = [eos_id] + list(p["src"]) + list(prompt)
@@ -166,28 +166,28 @@ def dec_batch(pairs, prompt, eos_id, pad_id, device):
     x = torch.full((len(seqs), n), pad_id, dtype=torch.long)
     y = torch.full((len(seqs), n), -100, dtype=torch.long)
     for i, (s, lab) in enumerate(zip(seqs, labs)):
-        x[i, :len(s)] = torch.tensor(s)
-        y[i, :len(lab)] = torch.tensor(lab)
+        x[i, : len(s)] = torch.tensor(s)
+        y[i, : len(lab)] = torch.tensor(lab)
     return x.to(device), y.to(device)
 
 
 def ed_batch(pairs, bos_id, eos_id, pad_id, device):
-    """(src, seq, y): all windows of the batch have the same length (exact batches: a bidirectional RNN changes
-    with padding); seq = [bos] target [eos] right-padded; y = seq[:, 1:] with -100 on padding."""
+    """(src, seq, y): all windows of the batch have the same length (exact batches: a bidirectional RNN changes with
+    padding); seq = [bos] target [eos] right-padded; y = seq[:, 1:] with -100 on padding."""
     src = torch.tensor([list(p["src"]) for p in pairs], dtype=torch.long)
     seqs = [[bos_id] + list(p["tgt"]) + [eos_id] for p in pairs]
     n = max(map(len, seqs))
     seq = torch.full((len(seqs), n), pad_id, dtype=torch.long)
     y = torch.full((len(seqs), n - 1), -100, dtype=torch.long)
     for i, s in enumerate(seqs):
-        seq[i, :len(s)] = torch.tensor(s)
-        y[i, :len(s) - 1] = torch.tensor(s[1:])
+        seq[i, : len(s)] = torch.tensor(s)
+        y[i, : len(s) - 1] = torch.tensor(s[1:])
     return src.to(device), seq.to(device), y.to(device)
 
 
 def batches(pairs, batch_size, exact, rng):
-    """Index batches: exact=True -> only windows of the same length together; otherwise similar total lengths
-    together (less padding). The batch order is shuffled."""
+    """Index batches: exact=True -> only windows of the same length together; otherwise similar total lengths together
+    (less padding)."""
     if exact:
         groups: dict[int, list[int]] = {}
         for i, p in enumerate(pairs):
@@ -195,15 +195,15 @@ def batches(pairs, batch_size, exact, rng):
         out = []
         for g in groups.values():
             rng.shuffle(g)
-            out += [g[k:k + batch_size] for k in range(0, len(g), batch_size)]
+            out += [g[k : k + batch_size] for k in range(0, len(g), batch_size)]
     else:
         idx = list(range(len(pairs)))
         rng.shuffle(idx)
         out = []
         span = batch_size * 50
         for k in range(0, len(idx), span):
-            part = sorted(idx[k:k + span], key=lambda i: len(pairs[i]["src"]) + len(pairs[i]["tgt"]))
-            out += [part[j:j + batch_size] for j in range(0, len(part), batch_size)]
+            part = sorted(idx[k : k + span], key=lambda i: len(pairs[i]["src"]) + len(pairs[i]["tgt"]))
+            out += [part[j : j + batch_size] for j in range(0, len(part), batch_size)]
     rng.shuffle(out)
     return out
 
@@ -214,7 +214,7 @@ def logits_and_targets(wrap, batch, ids, device):
     if wrap.encdec:
         src, seq, y = ed_batch(batch, ids["bos"], ids["eos"], ids["pad"], device)
         lg = ed_logits(m, src, seq)
-        if wrap.copy is not None:            # log-probabilities; cross-entropy of log-probabilities is unchanged
+        if wrap.copy is not None:
             lg = wrap.copy_logp(src, lg)
     else:
         x, y = dec_batch(batch, ids["prompt"], ids["eos"], ids["pad"], device)
@@ -225,20 +225,21 @@ def logits_and_targets(wrap, batch, ids, device):
 
 
 def seq_loss(wrap, batch, ids, device, label_smoothing=0.1, teacher=None, kd_alpha=0.5, kd_T=2.0):
-    """(loss, gold term, teacher term or None). Teacher term = T^2 x KL(teacher || student) on the target tokens
-    (word-level knowledge distillation; all our models share the bpe12k vocabulary)."""
+    """(loss, gold term, teacher term or None)."""
     lg, y = logits_and_targets(wrap, batch, ids, device)
     gold = F.cross_entropy(lg.float(), y, label_smoothing=label_smoothing)
     if teacher is None:
         return gold, gold, None
     with torch.no_grad():
         tl, _ = logits_and_targets(teacher, batch, ids, device)
-    kd = F.kl_div(F.log_softmax(lg.float() / kd_T, -1), F.softmax(tl.float() / kd_T, -1),
-                  reduction="batchmean") * kd_T ** 2
+    kd = (
+        F.kl_div(F.log_softmax(lg.float() / kd_T, -1), F.softmax(tl.float() / kd_T, -1), reduction="batchmean")
+        * kd_T**2
+    )
     return (1 - kd_alpha) * gold + kd_alpha * kd, gold, kd
 
 
-# ------------------------------------------------------------------- techniques, KD
+# --- techniques, KD
 def rnn_param_names(model) -> set[str]:
     out = set()
     for n, m in model.named_modules():
@@ -252,7 +253,7 @@ def used_params(wrap, probe, ids, device) -> set[str]:
     m = wrap.model
     flags = {n: p.requires_grad for n, p in m.named_parameters()}
     was = wrap.training
-    wrap.train()                    # cuDNN RNNs refuse a backward pass in eval mode (checkpoints load in eval mode)
+    wrap.train()
     for p in m.parameters():
         p.requires_grad_(True)
     m.zero_grad(set_to_none=True)
@@ -267,8 +268,7 @@ def used_params(wrap, probe, ids, device) -> set[str]:
 
 
 def apply_technique(wrap, technique, cfg, total_steps, probe, ids, device, log=print):
-    """cj_tech technique on the wrapped model. Encoder-decoder: low-rank techniques only on its linear layers
-    (they failed on its RNN weights in Phase 5)."""
+    """cj_tech technique on the wrapped model."""
     used = used_params(wrap, probe, ids, device)
     if wrap.encdec and technique in T.LOW_RANK and not cfg.get("lowrank_rnn"):
         rnn = rnn_param_names(wrap.model)
@@ -281,8 +281,10 @@ def make_student(model, share, log=print) -> dict:
     """KD student: evenly spaced blocks of the (mid-trained) model, first and last included (shrink and fine-tune,
     Shleifer & Rush 2020)."""
     info = R.cut_blocks(model, share, pick="spread")
-    log(f"[student] blocks {info['kept']} of {info['layers_full']} ('{info['blocks']}'): "
-        f"{info['params_student'] / 1e6:.1f}M of {info['params_full'] / 1e6:.1f}M weights")
+    log(
+        f"[student] blocks {info['kept']} of {info['layers_full']} ('{info['blocks']}'): "
+        f"{info['params_student'] / 1e6:.1f}M of {info['params_full'] / 1e6:.1f}M weights"
+    )
     return info
 
 
@@ -303,7 +305,7 @@ def load_trained(bb_model, run_cfg: dict, state: dict, probe, ids, device, log=p
     return w
 
 
-# ------------------------------------------------------------------------ generation
+# --- generation
 class EncoderCache:
     """While generating, the encoder of an encoder-decoder runs once per batch of windows instead of once per new
     token: its output is kept while it is called with the same input tensor."""
@@ -319,7 +321,7 @@ class EncoderCache:
 
     def __enter__(self):
         if self.mod is not None:
-            self.had = "forward" in self.mod.__dict__        # already patched (e.g. an RNN without cuDNN)
+            self.had = "forward" in self.mod.__dict__
             self.orig = self.mod.forward
 
             def fwd(*a, **k):
@@ -330,6 +332,7 @@ class EncoderCache:
                 out = self.orig(*a, **k)
                 self.key, self.val = key, out
                 return out
+
             self.mod.forward = fwd
         return self
 
@@ -348,16 +351,14 @@ def _banned(rows: list[list[int]], n: int) -> list[list[int]]:
         if n <= 0 or len(toks) < n - 1:
             out.append([])
             continue
-        key = tuple(toks[len(toks) - n + 1:])
-        out.append([toks[i + n - 1] for i in range(len(toks) - n + 1) if tuple(toks[i:i + n - 1]) == key])
+        key = tuple(toks[len(toks) - n + 1 :])
+        out.append([toks[i + n - 1] for i in range(len(toks) - n + 1) if tuple(toks[i : i + n - 1]) == key])
     return out
 
 
 @torch.no_grad()
 def beam_search(step, n_prob, eos_id, beams=4, max_new=128, min_new=0, no_repeat=3, len_pen=1.0, device="cpu"):
-    """Beam search for n_prob independent problems at once. step(rows [n_prob*beams, t]) -> log-probabilities
-    [n_prob*beams, V] of the next token (row p*beams + b belongs to problem p). max_new / min_new: at most / at least
-    this many tokens before the end (an int or one per problem). Returns one token list per problem (without eos)."""
+    """Beam search for n_prob independent problems at once."""
     k = beams
     mx = max_new if isinstance(max_new, list) else [max_new] * n_prob
     mn = min_new if isinstance(min_new, list) else [min_new] * n_prob
@@ -371,11 +372,11 @@ def beam_search(step, n_prob, eos_id, beams=4, max_new=128, min_new=0, no_repeat
         V = lp.size(-1)
         for p in range(n_prob):
             if t < mn[p]:
-                lp[p * k:(p + 1) * k, eos_id] = float("-inf")
-            if t >= mx[p]:                       # max_new tokens written: only the end is allowed
-                keep = lp[p * k:(p + 1) * k, eos_id].clone()
-                lp[p * k:(p + 1) * k] = float("-inf")
-                lp[p * k:(p + 1) * k, eos_id] = keep
+                lp[p * k : (p + 1) * k, eos_id] = float("-inf")
+            if t >= mx[p]:
+                keep = lp[p * k : (p + 1) * k, eos_id].clone()
+                lp[p * k : (p + 1) * k] = float("-inf")
+                lp[p * k : (p + 1) * k, eos_id] = keep
         if no_repeat and t >= no_repeat - 1:
             for r, ban in enumerate(_banned(rows.tolist(), no_repeat)):
                 if ban:
@@ -401,7 +402,7 @@ def beam_search(step, n_prob, eos_id, beams=4, max_new=128, min_new=0, no_repeat
                         break
                 if len(done[p]) >= k or not alive:
                     active[p] = False
-            if not alive:                         # finished problem: keep shapes, nothing to extend
+            if not alive:
                 alive = [(float("-inf"), p * k, eos_id)]
             while len(alive) < k:
                 alive.append((float("-inf"), alive[0][1], alive[0][2]))
@@ -411,12 +412,11 @@ def beam_search(step, n_prob, eos_id, beams=4, max_new=128, min_new=0, no_repeat
                 new_scores.append(sc)
         if not any(active):
             break
-        rows = torch.cat([rows[torch.tensor(parents, device=device)],
-                          torch.tensor(toks, device=device).view(-1, 1)], 1)
+        rows = torch.cat([rows[torch.tensor(parents, device=device)], torch.tensor(toks, device=device).view(-1, 1)], 1)
         scores = torch.tensor(new_scores, device=device).view(n_prob, k)
     out = []
     for p in range(n_prob):
-        if not done[p]:                           # nothing finished: best unfinished row
+        if not done[p]:
             sc = scores[p].tolist()
             b = max(range(k), key=lambda i: sc[i])
             toks = rows[p * k + b].tolist()
@@ -426,12 +426,12 @@ def beam_search(step, n_prob, eos_id, beams=4, max_new=128, min_new=0, no_repeat
 
 
 @torch.no_grad()
-def sample_search(step, n_prob, eos_id, max_new=128, min_new=0, no_repeat=3, top_p=0.9, top_k=0, temperature=0.7,
-                  seed=0, device="cpu"):
+def sample_search(
+    step, n_prob, eos_id, max_new=128, min_new=0, no_repeat=3, top_p=0.9, top_k=0, temperature=0.7, seed=0, device="cpu"
+):
     """Top-p (nucleus) sampling, Holtzman et al. 2020, for n_prob problems at once (one row each): the next token is
     drawn from the smallest set of most likely tokens whose probabilities sum to top_p, after dividing the scores by
-    temperature (and keeping only the top_k tokens if top_k > 0). Repeated n-grams are banned; the random generator
-    is seeded, so the output is reproducible. Returns one token list per problem (without eos)."""
+    temperature."""
     mx = max_new if isinstance(max_new, list) else [max_new] * n_prob
     mn = min_new if isinstance(min_new, list) else [min_new] * n_prob
     gen = torch.Generator(device=device)
@@ -451,7 +451,7 @@ def sample_search(step, n_prob, eos_id, max_new=128, min_new=0, no_repeat=3, top
                 if ban and not bool(ended[r]):
                     lp[r, ban] = float("-inf")
         z = lp / max(temperature, 1e-5)
-        dead = torch.isinf(z).all(-1)                       # everything banned: end here
+        dead = torch.isinf(z).all(-1)
         if bool(dead.any()):
             z[dead, eos_id] = 0.0
         if top_k and top_k < z.size(-1):
@@ -459,7 +459,7 @@ def sample_search(step, n_prob, eos_id, max_new=128, min_new=0, no_repeat=3, top
             z = z.masked_fill(z < kth, float("-inf"))
         probs = F.softmax(z, -1)
         sp, si = torch.sort(probs, descending=True, dim=-1)
-        drop = sp.cumsum(-1) - sp > top_p                  # keep the smallest set reaching top_p (at least one)
+        drop = sp.cumsum(-1) - sp > top_p
         sp = sp.masked_fill(drop, 0.0)
         sp = sp / sp.sum(-1, keepdim=True).clamp(min=1e-12)
         pick = torch.multinomial(sp, 1, generator=gen)
@@ -471,13 +471,12 @@ def sample_search(step, n_prob, eos_id, max_new=128, min_new=0, no_repeat=3, top
             break
     out = []
     for r in rows.tolist():
-        out.append(r[:r.index(eos_id)] if eos_id in r else r)
+        out.append(r[: r.index(eos_id)] if eos_id in r else r)
     return out
 
 
 class Generator:
-    """Summaries of many windows: windows with the same context length are generated together. decoding="beam"
-    (beam search) or "top_p" (nucleus sampling, one sample per window)."""
+    """Summaries of many windows: windows with the same context length are generated together."""
 
     def __init__(self, wrap, ids, device, amp=True, max_len=None):
         self.w, self.ids, self.device, self.amp, self.max_len = wrap, ids, device, amp, max_len
@@ -496,27 +495,42 @@ class Generator:
                 with R._autocast(self.device, self.amp):
                     lg = first_tensor(m(src, seq))
                     if self.w.copy is not None:
-                        if "enc" not in enc_once:                # encoder states once per batch of windows
+                        if "enc" not in enc_once:
                             enc_once["enc"] = first_tensor(m.encode(src))
                         return self.w.copy_logp(src, lg[:, -1:], enc_once["enc"])[:, -1].float()
                 return F.log_softmax(lg[:, -1].float(), -1)
+
             return step
 
         def step(rows):
             x = torch.cat([ctx, rows], 1)
             with R._autocast(self.device, self.amp):
-                lg = first_tensor(m(x))              # nanoGPT-style models return the last position only
+                lg = first_tensor(m(x))
             return F.log_softmax(lg[:, -1].float(), -1)
+
         return step
 
     @torch.no_grad()
-    def run(self, items, beams=4, no_repeat=3, len_pen=1.0, batch=8, min_frac=0.0, log=None, decoding="beam",
-            top_p=0.9, top_k=0, temperature=0.7, seed=0):
+    def run(
+        self,
+        items,
+        beams=4,
+        no_repeat=3,
+        len_pen=1.0,
+        batch=8,
+        min_frac=0.0,
+        log=None,
+        decoding="beam",
+        top_p=0.9,
+        top_k=0,
+        temperature=0.7,
+        seed=0,
+    ):
         """items: [{"src": token ids, "max_new": int}] -> generated token lists (same order)."""
         if decoding not in ("beam", "top_p"):
             raise ValueError("decoding must be 'beam' or 'top_p'")
         if decoding == "top_p":
-            beams, batch = 1, batch * 2                     # one row per window: twice as many windows at once
+            beams, batch = 1, batch * 2
         was = self.w.training
         self.w.eval()
         ids = self.ids
@@ -527,25 +541,38 @@ class Generator:
         n_done = 0
         for _, idx in sorted(groups.items()):
             for s in range(0, len(idx), batch):
-                part = idx[s:s + batch]
+                part = idx[s : s + batch]
                 mx = [int(items[i]["max_new"]) for i in part]
                 if self.w.encdec:
                     ctx = torch.tensor([items[i]["src"] for i in part], device=self.device)
                     ctx = ctx.repeat_interleave(beams, 0)
                 else:
                     pre = [ids["eos"]]
-                    ctx = torch.tensor([pre + list(items[i]["src"]) + list(ids["prompt"]) for i in part],
-                                       device=self.device).repeat_interleave(beams, 0)
+                    ctx = torch.tensor(
+                        [pre + list(items[i]["src"]) + list(ids["prompt"]) for i in part], device=self.device
+                    ).repeat_interleave(beams, 0)
                     if self.max_len:
                         mx = [min(x, self.max_len - ctx.size(1)) for x in mx]
                 mn = [int(min_frac * x) for x in mx]
                 with EncoderCache(self.w.model) if self.w.encdec else _null():
                     if decoding == "beam":
-                        res = beam_search(self._step_fn(ctx), len(part), ids["eos"], beams, mx, mn, no_repeat,
-                                          len_pen, self.device)
+                        res = beam_search(
+                            self._step_fn(ctx), len(part), ids["eos"], beams, mx, mn, no_repeat, len_pen, self.device
+                        )
                     else:
-                        res = sample_search(self._step_fn(ctx), len(part), ids["eos"], mx, mn, no_repeat, top_p,
-                                            top_k, temperature, seed + s, self.device)
+                        res = sample_search(
+                            self._step_fn(ctx),
+                            len(part),
+                            ids["eos"],
+                            mx,
+                            mn,
+                            no_repeat,
+                            top_p,
+                            top_k,
+                            temperature,
+                            seed + s,
+                            self.device,
+                        )
                 for i, r in zip(part, res):
                     out[i] = r
                 n_done += len(part)
@@ -563,13 +590,6 @@ class _null:
         return False
 
 
-def decode_fn(tokenizer):
-    """ids -> text with the bpe12k tokenizer (or any object with .decode)."""
-    if hasattr(tokenizer, "decode"):
-        return lambda ids: tokenizer.decode(list(ids))
-    raise TypeError("tokenizer has no decode()")
-
-
 def window_budget(encdec: bool, max_len: int, prompt_len: int, tgt_tokens: int, enc_window: int = 512) -> int:
     if encdec:
         return enc_window
@@ -585,8 +605,5 @@ def lr_factor_fn(plan, warmup_frac):
         if s < plan["warm"]:
             return (s + 1) / max(1, plan["warm"])
         return max(0.0, (plan["total"] - s) / max(1, plan["total"] - plan["warm"]))
+
     return f
-
-
-def math_ok(x) -> bool:
-    return x is not None and math.isfinite(float(x))

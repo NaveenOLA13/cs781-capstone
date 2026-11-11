@@ -1,22 +1,12 @@
-"""Post-processing on top of the token tag probabilities (no retraining needed).
+"""Post-processing on top of the token tag probabilities (no retraining needed)."""
 
-1. viterbi_spans     : constrained BIO decoding (CRF-style): I-X may only follow B-X / I-X, so the
-                       argmax can never produce a broken entity (strict F1 punishes those twice).
-2. propagate         : document-level consistency. A string predicted as e.g. APP somewhere in a
-                       document is also tagged at its other (unlabelled) mentions in that document.
-3. Gazetteer         : strings that the TRAIN gold labels consistently (e.g. "Indian Penal Code" ->
-                       STAT in >= min_prec of its occurrences) are tagged wherever they appear.
-4. choose_per_label  : every option is kept only for the labels where it improves DEV strict F1
-                       (the metric is per label, so labels can use different variants).
-Pure numpy / python.
-"""
 import re
 from collections import Counter, defaultdict
 
 import numpy as np
 
 
-# ------------------------------------------------------------------ 1. constrained decoding
+# --- 1. constrained decoding
 def _allowed(tags):
     """allowed[i, j] = transition tag i -> tag j is valid BIO; start[j] = may start a sequence."""
     T = len(tags)
@@ -44,7 +34,7 @@ def viterbi_tags(probs, spans, tags):
     score = lp[0] + np.where(start, 0.0, -1e9)
     back = np.zeros((n, T), dtype=np.int32)
     for t in range(1, n):
-        cand = score[:, None] + trans                      # [from, to]
+        cand = score[:, None] + trans
         back[t] = cand.argmax(0)
         score = cand.max(0) + lp[t]
     best = np.empty(n, dtype=np.int64)
@@ -55,7 +45,7 @@ def viterbi_tags(probs, spans, tags):
     return out
 
 
-# ------------------------------------------------------------------ helpers
+# --- helpers
 def _occurrences(text, s):
     """All word-bounded occurrences of string s in text."""
     out, i = [], text.find(s)
@@ -74,18 +64,20 @@ def _add_nonoverlapping(spans, extra):
     occ = sorted((s, e) for s, e, _ in spans)
     starts = [s for s, _ in occ]
     import bisect
+
     res = list(spans)
-    for s, e, l in sorted(set(extra), key=lambda x: -(x[1] - x[0])):   # longest first
+    for s, e, l in sorted(set(extra), key=lambda x: -(x[1] - x[0])):
         k = bisect.bisect_left(starts, e)
-        if any(not (e2 <= s or e <= s2) for s2, e2 in occ[max(0, k - 50):k]):
+        if any(not (e2 <= s or e <= s2) for s2, e2 in occ[max(0, k - 50) : k]):
             continue
         k2 = bisect.bisect_left(occ, (s, e))
-        occ.insert(k2, (s, e)); starts.insert(k2, s)
+        occ.insert(k2, (s, e))
+        starts.insert(k2, s)
         res.append((s, e, l))
     return res
 
 
-# ------------------------------------------------------------------ 2. propagation
+# --- 2. propagation
 def propagate(spans, text, labels=None, min_len=3):
     votes = defaultdict(Counter)
     for s, e, l in spans:
@@ -101,7 +93,7 @@ def propagate(spans, text, labels=None, min_len=3):
     return _add_nonoverlapping(spans, extra)
 
 
-# ------------------------------------------------------------------ 3. gazetteer from train gold
+# --- 3. gazetteer from train gold
 def learn_gazetteer(texts, gold, doc_ids, min_count=2, min_prec=0.7, min_len=4):
     """-> {string: label} for strings labelled consistently in the training documents."""
     lab_count = defaultdict(Counter)
@@ -131,20 +123,25 @@ def apply_gazetteer(spans, text, gaz, labels=None):
     return _add_nonoverlapping(spans, extra)
 
 
-# ------------------------------------------------------------------ 3b. party roles (header + doc-level)
-HDR_RE = re.compile(r"(?:PETITIONER|APPELLANT)S?\s*:\s*(?P<APP>.+?)\s*(?:\bV(?:s|S|ersus|ERSUS)?\.?\s+)?"
-                    r"RESPONDENTS?\s*:\s*(?P<RESP>.+?)\s*(?:DATE OF JUDGMENT|BENCH|$)", re.S)
-SUFFIX_RE = re.compile(r"\s*,?\s*(?:and|AND|&)\s+(?:Ors|ORS|Others|OTHERS|Anr|ANR|Another|ANOTHER|"
-                       r"Etc|ETC|Others?\s+Etc)\.?\s*$")
+# --- 3b. party roles (header + doc-level)
+HDR_RE = re.compile(
+    r"(?:PETITIONER|APPELLANT)S?\s*:\s*(?P<APP>.+?)\s*(?:\bV(?:s|S|ersus|ERSUS)?\.?\s+)?"
+    r"RESPONDENTS?\s*:\s*(?P<RESP>.+?)\s*(?:DATE OF JUDGMENT|BENCH|$)",
+    re.S,
+)
+SUFFIX_RE = re.compile(
+    r"\s*,?\s*(?:and|AND|&)\s+(?:Ors|ORS|Others|OTHERS|Anr|ANR|Another|ANOTHER|"
+    r"Etc|ETC|Others?\s+Etc)\.?\s*$"
+)
 
 
 def _hdr_variants(text, s, e):
-    """Candidate entity spans for a header party field (s, e): raw, suffix-stripped,
-    suffix-stripped without trailing dot."""
+    """Candidate entity spans for a header party field (s, e): raw, suffix-stripped, suffix-stripped without trailing
+    dot."""
     raw = (s, e)
     m = SUFFIX_RE.search(text[s:e])
     strip = (s, s + m.start()) if m else raw
-    nodot = (strip[0], strip[1] - 1) if text[strip[0]:strip[1]].endswith(".") else strip
+    nodot = (strip[0], strip[1] - 1) if text[strip[0] : strip[1]].endswith(".") else strip
     return {"raw": raw, "strip": strip, "nodot": nodot}
 
 
@@ -167,8 +164,7 @@ def header_parties(text, policy=None, head=4000):
 
 
 def learn_header_policy(texts, gold, doc_ids):
-    """For APP / RESP pick the header-span variant that most often equals a gold span (train docs).
-    A role gets no header rule if its best variant hits in < 30% of headers."""
+    """For APP / RESP pick the header-span variant that most often equals a gold span (train docs)."""
     hits = {lab: Counter() for lab in ("APP", "RESP")}
     n = 0
     for k in doc_ids:
@@ -189,8 +185,8 @@ def learn_header_policy(texts, gold, doc_ids):
 
 
 def roles(spans, text, policy, min_len=3):
-    """Party-role consistency: header spans first; every string's label = label of its first mention
-    (header counts as first); all other mentions get that label (exact-span relabel + add missing)."""
+    """Party-role consistency: header spans first; every string's label = label of its first mention (header counts as
+    first); all other mentions get that label (exact-span relabel + add missing)."""
     hdr = header_parties(text, policy)
     base = [x for x in spans if not any(x[0] < e and s < x[1] for s, e, _ in hdr)] + hdr
     role = {}
@@ -198,14 +194,14 @@ def roles(spans, text, policy, min_len=3):
         st = text[s:e]
         if len(st.strip()) >= min_len and st not in role:
             role[st] = l
-    for s, e, l in hdr:                          # header always wins
+    for s, e, l in hdr:
         role[text[s:e]] = l
     relab = [(s, e, role.get(text[s:e], l)) for s, e, l in base]
     extra = [(a, b, lab) for st, lab in role.items() for a, b in _occurrences(text, st)]
     return _add_nonoverlapping(relab, extra)
 
 
-# ------------------------------------------------------------------ 4. per-label selection on dev
+# --- 4. per-label selection on dev
 VARIANTS = ["base", "prop", "gaz", "prop+gaz", "roles", "roles+gaz"]
 
 
@@ -226,7 +222,6 @@ def run_variant(name, base_spans, texts, ctx):
 
 def choose_per_label(dev_base, dev_texts, dev_gold, ctx, labels, scorer):
     """-> ({label: variant}, combined dev score dict)."""
-    per = {}
     preds = {v: run_variant(v, dev_base, dev_texts, ctx) for v in VARIANTS}
     scores = {v: scorer(preds[v], dev_gold, labels) for v in VARIANTS}
     choice = {}

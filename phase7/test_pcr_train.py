@@ -1,14 +1,6 @@
 """Self-test of Phase 7 training on tiny stand-in models (decoder-only with a tied head, Llama-style, encoder-decoder
-with a bidirectional GRU encoder) and fake case data. Needs torch. About 3-6 minutes.
-python test_pcr_train.py  -> every line PASS
+with a bidirectional GRU encoder) and fake case data."""
 
-Checks: chunking; the case similarities against slow direct formulas; the ranking and KD losses; (IA)^3 (no change at
-the start, gradients reach every vector, a change once trained) on all three toys; LoRMA on GRU weights with cuDNN
-kept equals cuDNN switched off (GPU only); half-size students (blocks / RNN layers); full, LoRMA, QLoRA, (IA)^3,
-partial runs and loss / negative / pooling variants write scores, a valid fused submission and metrics; a KD
-student learns from a finished teacher's case vectors (listwise and Margin-MSE); finish_by cuts training and still
-writes everything; zero-shot (no training); ensemble, best_run, report; mid-training texts.
-"""
 import copy
 import json
 import math
@@ -36,9 +28,28 @@ from test_cj_train import TOYS, WordTok  # noqa: E402
 from test_pcr_data import make_fake_pcr  # noqa: E402
 
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-FAST = dict(max_len=64, chunk_len=64, dim=16, batch_queries=4, epochs=2, q_chunks=2, d_chunks=2, max_chunks=6,
-            val_chunks=3, val_every=1, enc_batch=8, eval_batch=16, log_every=5, fetch_data=False, tok_workers=1,
-            hard_negs=2, neg_top=10, top=30, dense_top=10, lr_head=3e-3)
+FAST = dict(
+    max_len=64,
+    chunk_len=64,
+    dim=16,
+    batch_queries=4,
+    epochs=2,
+    q_chunks=2,
+    d_chunks=2,
+    max_chunks=6,
+    val_chunks=3,
+    val_every=1,
+    enc_batch=8,
+    eval_batch=16,
+    log_every=5,
+    fetch_data=False,
+    tok_workers=1,
+    hard_negs=2,
+    neg_top=10,
+    top=30,
+    dense_top=10,
+    lr_head=3e-3,
+)
 QUIET = dict(log=lambda *a, **k: None)
 
 
@@ -53,17 +64,17 @@ def bb_of(kind):
     torch.manual_seed(1)
     model = ToyEncDecE() if kind == "encdec_e" else TOYS[kind]()
     bb = make_backbone(model, WordTok(), max_len=64, verbose=False)
-    bb.model.eval()                 # as cj_models.load_model returns the real checkpoints
+    bb.model.eval()
     return bb
 
 
 def test_chunks():
     assert PM.chunk_starts(50, 64, 8) == [0]
     s = PM.chunk_starts(300, 64, 8)
-    assert len(s) == 5 and s[0] == 0 and s[-1] == 300 - 64                  # covers the case, ends at its end
+    assert len(s) == 5 and s[0] == 0 and s[-1] == 300 - 64
     assert all(b - a <= 64 for a, b in zip(s, s[1:]))
     s = PM.chunk_starts(10_000, 64, 8)
-    assert len(s) == 8 and s[0] == 0 and s[-1] == 10_000 - 64                # spread over a long case
+    assert len(s) == 8 and s[0] == 0 and s[-1] == 10_000 - 64
     cs = PM.doc_chunks(np.arange(300), 64, 8)
     assert all(len(c) == 64 for c in cs) and cs[-1][-1] == 299
     g = PM._groups([5, 3, 5, 5, 3], 2, exact=True)
@@ -82,12 +93,15 @@ def test_aggregate():
     out = PM.aggregate(Q.half(), Qn, P.half(), Pn, PM.AGGS, torch.device("cpu"), block=2)
     for i in range(3):
         for j in range(5):
-            q, p = Q[i, :Qn[i]].half().float(), P[j, :Pn[j]].half().float()
+            q, p = Q[i, : Qn[i]].half().float(), P[j, : Pn[j]].half().float()
             Sm = q @ p.T
-            exp = dict(mean=float(F.normalize(q.sum(0), dim=0) @ F.normalize(p.sum(0), dim=0)),
-                       maxsim=float(Sm.max(1).values.mean()),
-                       maxsim_sym=float((Sm.max(1).values.mean() + Sm.max(0).values.mean()) / 2),
-                       max=float(Sm.max()), first=float(q[0] @ p[0]))
+            exp = dict(
+                mean=float(F.normalize(q.sum(0), dim=0) @ F.normalize(p.sum(0), dim=0)),
+                maxsim=float(Sm.max(1).values.mean()),
+                maxsim_sym=float((Sm.max(1).values.mean() + Sm.max(0).values.mean()) / 2),
+                max=float(Sm.max()),
+                first=float(q[0] @ p[0]),
+            )
             for a, v in exp.items():
                 assert abs(out[a][i, j] - v) < 1e-4, (a, i, j, out[a][i, j], v)
     mv = PM.mean_vectors(Q.half(), Qn)
@@ -125,7 +139,7 @@ def test_ia3():
         assert len(clf.ia3) == n_vec, (kind, len(clf.ia3))
         clf.eval()
         with torch.no_grad():
-            assert torch.allclose(clf(ids, mask), before, atol=1e-5), kind           # starts as no change
+            assert torch.allclose(clf(ids, mask), before, atol=1e-5), kind
         clf.train()
         clf(ids, mask).pow(2).sum().backward()
         assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in hooks.body_params), kind
@@ -203,49 +217,79 @@ def test_runs_kd_deadline_report():
         root, _ = make_fake_pcr(tmp)
         out = os.path.join(tmp, "runs")
         common = dict(FAST, data_root=root, out_dir=out, cache_dir=os.path.join(tmp, "cache"), ckpt_path="toy")
-        r = S.run(bb_of("llama"), name="llama", technique="full", save_train=True, lr_body=3e-3,
-                  **dict(common, epochs=4))
+        r = S.run(
+            bb_of("llama"), name="llama", technique="full", save_train=True, lr_body=3e-3, **dict(common, epochs=4)
+        )
         _check(r, "full")
         m = r["metrics"]
         assert os.path.exists(os.path.join(r["out_dir"], "teacher_vectors.pt")) and m["train_dense"] is not None
         h = m["history"]
         assert min(x["loss"] for x in h[2:]) < h[0]["loss"], h
-        print(f"    toy llama full: dev alone {m['dev_dense']['mean']['f1']:.3f} (start "
-              f"{m['val_history'][0]['f1']:.3f}), fused {m['dev_fused']['f1']:.3f}, lexical {m['dev_lexical']['f1']:.3f}")
-        for kind, tech, extra in (("gpt", "lorma", {}), ("llama", "qlora", {}), ("gpt", "ia3", {}),
-                                  ("encdec", "ia3", {}), ("encdec_e", "lorma", {}), ("llama", "partial", {}),
-                                  ("gpt", "lorma", dict(run_name="gpt_lorma_listwise", loss="listwise")),
-                                  ("gpt", "lorma", dict(run_name="gpt_lorma_pairwise", loss="pairwise",
-                                                        neg_source="random", pooling="last"))):
+        print(
+            f"    toy llama full: dev alone {m['dev_dense']['mean']['f1']:.3f} (start "
+            f"{m['val_history'][0]['f1']:.3f}), fused {m['dev_fused']['f1']:.3f}, lexical {m['dev_lexical']['f1']:.3f}"
+        )
+        for kind, tech, extra in (
+            ("gpt", "lorma", {}),
+            ("llama", "qlora", {}),
+            ("gpt", "ia3", {}),
+            ("encdec", "ia3", {}),
+            ("encdec_e", "lorma", {}),
+            ("llama", "partial", {}),
+            ("gpt", "lorma", dict(run_name="gpt_lorma_listwise", loss="listwise")),
+            ("gpt", "lorma", dict(run_name="gpt_lorma_pairwise", loss="pairwise", neg_source="random", pooling="last")),
+        ):
             rr = S.run(bb_of(kind), name=kind, technique=tech, **dict(common, **extra))
             _check(rr, tech)
             if kind == "encdec_e":
                 text = open(os.path.join(rr["out_dir"], "log.txt")).read()
                 assert "cuDNN kept" in text and "RNN)" in text, text[-500:]
-        # knowledge distillation: half-size student with the llama_full teacher (listwise, then Margin-MSE)
-        st = S.run(bb_of("llama"), name="llama", technique="full", run_name="llama_student_kd", student_layers=0.5,
-                   kd_teacher=r["out_dir"], **common)
+        st = S.run(
+            bb_of("llama"),
+            name="llama",
+            technique="full",
+            run_name="llama_student_kd",
+            student_layers=0.5,
+            kd_teacher=r["out_dir"],
+            **common,
+        )
         ms = st["metrics"]
         assert ms["student"]["kept"] == [0, 2] and ms["total_params"] < m["total_params"], ms["student"]
         assert ms["kd"]["teacher_technique"] == "full" and all(x["kd"] is not None for x in ms["history"])
         _check(st, "full")
-        mm = S.run(bb_of("llama"), name="llama", technique="full", run_name="llama_student_mm", student_layers=0.5,
-                   kd_teacher=r["out_dir"], kd_loss="margin_mse", **common)
+        mm = S.run(
+            bb_of("llama"),
+            name="llama",
+            technique="full",
+            run_name="llama_student_mm",
+            student_layers=0.5,
+            kd_teacher=r["out_dir"],
+            kd_loss="margin_mse",
+            **common,
+        )
         assert mm["metrics"]["kd"]["loss"] == "margin_mse"
-        # finish_by: no time left -> only the first steps, fewer chunks per case, everything still written
-        fb = S.run(bb_of("gpt"), name="gpt", technique="lorma", run_name="gpt_cut", finish_by=time.time() + 1,
-                   **dict(common, epochs=8))
+        fb = S.run(
+            bb_of("gpt"),
+            name="gpt",
+            technique="lorma",
+            run_name="gpt_cut",
+            finish_by=time.time() + 1,
+            **dict(common, epochs=8),
+        )
         b = fb["metrics"]["budget"]
         assert b["cut"] and fb["metrics"]["steps"] <= 20 and b["max_chunks"] == 4, b
         _check(fb, "lorma")
-        # zero-shot: no training at all (Phase 1 representations + an untrained projection)
-        zs = S.run(bb_of("llama"), name="llama", technique="frozen", run_name="llama_zeroshot", **dict(common, epochs=0))
+        zs = S.run(
+            bb_of("llama"), name="llama", technique="frozen", run_name="llama_zeroshot", **dict(common, epochs=0)
+        )
         assert zs["metrics"]["steps"] == 0 and len(zs["metrics"]["val_history"]) == 1
-        # grid helpers
         assert G.best_run(out, ["llama_full", "gpt_lorma"]) == os.path.join(out, "llama_full")
-        ens = G.ensemble([os.path.join(out, "llama_full"), os.path.join(out, "gpt_lorma")],
-                         os.path.join(out, "ensemble_toy"), lexical_path=os.path.join(tmp, "cache", "lexical.pkl"),
-                         **QUIET)
+        ens = G.ensemble(
+            [os.path.join(out, "llama_full"), os.path.join(out, "gpt_lorma")],
+            os.path.join(out, "ensemble_toy"),
+            lexical_path=os.path.join(tmp, "cache", "lexical.pkl"),
+            **QUIET,
+        )
         assert ens is not None and os.path.exists(ens["submission"])
         L = PD.load_lexical(os.path.join(tmp, "cache", "lexical.pkl"))
         PD.lexical_submissions(L, os.path.join(out, "lexical"), top=30, **QUIET)
@@ -256,6 +300,7 @@ def test_runs_kd_deadline_report():
 
 def test_mid_texts():
     import pcr_mid
+
     with tempfile.TemporaryDirectory() as tmp:
         root, _ = make_fake_pcr(tmp)
         data = PD.load_data(root, fetch=False)
@@ -275,6 +320,7 @@ if __name__ == "__main__":
                 print(f"PASS {name} ({time.time() - t0:.0f} s)", flush=True)
             except Exception as e:  # noqa: BLE001
                 import traceback
+
                 traceback.print_exc()
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}", flush=True)

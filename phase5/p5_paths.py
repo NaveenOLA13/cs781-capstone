@@ -1,7 +1,5 @@
-"""Makes the Phase 4 building blocks importable from phase5/: the fine-tuning techniques (cj_tech), model loading
-(cj_models, which itself adds phase3/ and the repository root), data and tokenising helpers (cj_data), training
-helpers (cj_train) and mid-training (cj_mid). phase5/ comes first on the path, so Phase 5 files always win.
-"""
+"""Makes the Phase 4 and Phase 3 code (and, through cj_models, phase1/) importable from phase5/."""
+
 import os
 import sys
 

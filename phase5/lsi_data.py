@@ -1,15 +1,5 @@
-"""Phase 5 (Legal Statute Identification, multi-label) data: loading, label space, metrics, thresholds, submission.
-No torch needed.
+"""Phase 5 (Legal Statute Identification, multi-label) data: loading, label space, metrics, thresholds, submission."""
 
-Data: Phase_5_LSI/Train/train.json, Train/dev.json, Test/test.json from the course's Hugging Face dataset; records
-{"id", "text", "labels": [statute ids]}; test has no labels (and any label field there is never read).
-Metric (brief 11.4): macro-F1 over statute ids (primary), micro-F1, subset accuracy. Here macro-F1 averages the F1 of
-the statutes that occur in the gold labels of the evaluated split (the evaluator derives the label dimension from
-the reference data); predicted statutes that never occur in the gold count only in micro-F1.
-Thresholds: one global threshold, or one per statute (statutes with fewer than min_pos dev positives keep the global
-one); which of the two is used is decided by 2-fold cross-fitting on dev (tune on one half, score on the other), so
-the choice is not judged on the same cases it was tuned on. Every document gets at least its top statute.
-"""
 from __future__ import annotations
 
 import json
@@ -28,7 +18,7 @@ LABEL_KEYS = ("labels", "label", "statutes", "statute_ids", "statute", "y", "tar
 GRID = np.round(np.arange(0.02, 0.981, 0.01), 2)
 
 
-# ------------------------------------------------------------------------------ loading
+# --- loading
 def to_labels(v) -> list[int]:
     """Sorted unique statute ids from a list (or a single id) of ints / integer strings / integer floats."""
     if v is None:
@@ -80,13 +70,13 @@ def load_split(path: str, need_labels: bool, read_labels: bool = True) -> list[d
 
 
 def load_data(root: str = DEFAULT_ROOT, fetch: bool = True, clean: bool = True, log=None) -> dict[str, list[dict]]:
-    """{"train", "dev", "test"} lists of {"id", "text", "labels"}; test labels are never read. clean=True removes
-    test documents (same id or text) from train / dev, dev documents also in train, and repeated texts."""
+    """{"train", "dev", "test"} lists of {"id", "text", "labels"}; test labels are never read."""
     if fetch:
         C.download(root)
     files = C.find_files(root)
-    data = {s: load_split(files[s], need_labels=(s != "test"), read_labels=(s != "test"))
-            for s in ("train", "dev", "test")}
+    data = {
+        s: load_split(files[s], need_labels=(s != "test"), read_labels=(s != "test")) for s in ("train", "dev", "test")
+    }
     dup = [k for k, c in Counter(d["id"] for d in data["test"]).items() if c > 1]
     if dup:
         raise ValueError(f"test.json has repeated ids, e.g. {dup[:3]}")
@@ -94,9 +84,12 @@ def load_data(root: str = DEFAULT_ROOT, fetch: bool = True, clean: bool = True, 
         rep = C.clean_splits(data)
         if log is not None:
             for s, r in rep.items():
-                log(f"[data] {s}: {r['before']} -> {r['after']} documents (removed {r['test_cases_removed']} test "
+                log(
+                    f"[data] {s}: {r['before']} -> {r['after']} documents (removed {r['test_cases_removed']} test "
                     f"documents, {r['repeats_removed']} repeats"
-                    + (f", {r['train_cases_removed']} also in train" if s == "dev" else "") + ")")
+                    + (f", {r['train_cases_removed']} also in train" if s == "dev" else "")
+                    + ")"
+                )
     return data
 
 
@@ -117,54 +110,71 @@ def multi_hot(docs: list[dict], labels: list[int]) -> np.ndarray:
 
 def summary(data: dict) -> str:
     labels = label_space(data)
-    lines = [f"{'split':6s} {'docs':>7s} {'statutes':>9s} {'per doc':>8s} {'words: median':>14s} {'p90':>7s} "
-             f"{'max':>8s}"]
+    lines = [
+        f"{'split':6s} {'docs':>7s} {'statutes':>9s} {'per doc':>8s} {'words: median':>14s} {'p90':>7s} {'max':>8s}"
+    ]
     for s, ds in data.items():
         w = sorted(len(d["text"].split()) for d in ds) or [0]
         per = np.mean([len(d["labels"]) for d in ds]) if s != "test" else float("nan")
         n_lab = len({x for d in ds for x in (d["labels"] or [])})
-        lines.append(f"{s:6s} {len(ds):7d} {n_lab:9d} {per:8.2f} {w[len(w) // 2]:14d} {w[int(len(w) * .9)]:7d} "
-                     f"{w[-1]:8d}")
+        lines.append(
+            f"{s:6s} {len(ds):7d} {n_lab:9d} {per:8.2f} {w[len(w) // 2]:14d} {w[int(len(w) * 0.9)]:7d} {w[-1]:8d}"
+        )
     cnt = Counter(x for d in data["train"] for x in d["labels"])
     dev_only = sorted({x for d in data["dev"] for x in d["labels"]} - set(cnt))
     freq = sorted(cnt.values())
-    lines.append(f"statute ids (train + dev): {len(labels)}; training documents per statute: min {freq[0]}, median "
-                 f"{freq[len(freq) // 2]}, max {freq[-1]}; statutes with < 10 training documents: "
-                 f"{sum(c < 10 for c in freq)}; only in dev: {len(dev_only)} {dev_only[:10]}")
+    lines.append(
+        f"statute ids (train + dev): {len(labels)}; training documents per statute: min {freq[0]}, median "
+        f"{freq[len(freq) // 2]}, max {freq[-1]}; statutes with < 10 training documents: "
+        f"{sum(c < 10 for c in freq)}; only in dev: {len(dev_only)} {dev_only[:10]}"
+    )
     lines.append("most frequent: " + ", ".join(f"{x} ({c})" for x, c in cnt.most_common(8)))
     return "\n".join(lines)
 
 
 def explore(data: dict, top: int = 12) -> str:
     """What the documents look like, for choosing the method and for the report: lengths, statutes per document,
-    whether statute numbers are still written in the text (or masked), the most frequent bracketed placeholders,
-    and the statutes that most often occur together."""
+    whether statute numbers are still written in the text."""
     import re
+
     lines = []
     tr = data["train"]
     n = len(tr)
     k = Counter(len(d["labels"]) for d in tr)
     lines.append("statutes per training document: " + ", ".join(f"{c}: {k[c] / n:.1%}" for c in sorted(k)[:8]))
-    pats = {"'section <number>'": r"\bsection\s+\d+", "'s. <number>'": r"\bs\.\s*\d+", "'u/s'": r"\bu/s\b",
-            "'IPC' / 'Penal Code'": r"\bi\.?\s?p\.?\s?c\b|penal code", "'Act'": r"\bact\b"}
+    pats = {
+        "'section <number>'": r"\bsection\s+\d+",
+        "'s. <number>'": r"\bs\.\s*\d+",
+        "'u/s'": r"\bu/s\b",
+        "'IPC' / 'Penal Code'": r"\bi\.?\s?p\.?\s?c\b|penal code",
+        "'Act'": r"\bact\b",
+    }
     sample = tr[:3000]
     for name, p in pats.items():
         rx = re.compile(p, re.I)
-        lines.append(f"documents mentioning {name}: {sum(bool(rx.search(d['text'])) for d in sample) / len(sample):.1%}"
-                     f" (first {len(sample)} training documents)")
+        lines.append(
+            f"documents mentioning {name}: {sum(bool(rx.search(d['text'])) for d in sample) / len(sample):.1%}"
+            f" (first {len(sample)} training documents)"
+        )
     ph = Counter(m for d in sample for m in re.findall(r"\[[A-Za-z_ ]{2,30}\d*\]", d["text"]))
-    lines.append("bracketed placeholders (masked names / statutes): "
-                 + (", ".join(f"{t} ({c})" for t, c in ph.most_common(top)) or "none"))
-    pairs = Counter((a, b) for d in tr for i, a in enumerate(d["labels"]) for b in d["labels"][i + 1:])
-    lines.append("statutes that most often occur together: "
-                 + ", ".join(f"{a}+{b} ({c})" for (a, b), c in pairs.most_common(top)))
+    lines.append(
+        "bracketed placeholders (masked names / statutes): "
+        + (", ".join(f"{t} ({c})" for t, c in ph.most_common(top)) or "none")
+    )
+    pairs = Counter((a, b) for d in tr for i, a in enumerate(d["labels"]) for b in d["labels"][i + 1 :])
+    lines.append(
+        "statutes that most often occur together: "
+        + ", ".join(f"{a}+{b} ({c})" for (a, b), c in pairs.most_common(top))
+    )
     single = Counter(d["labels"][0] for d in tr if len(d["labels"]) == 1)
-    lines.append("most frequent statutes when a document has only one: "
-                 + ", ".join(f"{x} ({c})" for x, c in single.most_common(8)))
+    lines.append(
+        "most frequent statutes when a document has only one: "
+        + ", ".join(f"{x} ({c})" for x, c in single.most_common(8))
+    )
     return "\n".join(lines)
 
 
-# ------------------------------------------------------------------------------ metrics
+# --- metrics
 def scores(Y: np.ndarray, pred: np.ndarray) -> dict:
     """Macro-F1 over statutes present in the gold labels, micro-F1, subset accuracy (+ per-statute F1)."""
     Y, pred = Y.astype(bool), pred.astype(bool)
@@ -179,11 +189,18 @@ def scores(Y: np.ndarray, pred: np.ndarray) -> dict:
     micro = float(2 * tp.sum() / max(1, 2 * tp.sum() + fp.sum() + fn.sum()))
     p_micro = float(tp.sum() / max(1, tp.sum() + fp.sum()))
     r_micro = float(tp.sum() / max(1, tp.sum() + fn.sum()))
-    return dict(macro_f1=macro, micro_f1=micro, subset_acc=float((Y == pred).all(1).mean()) if len(Y) else 0.0,
-                micro_precision=p_micro, micro_recall=r_micro, statutes_scored=int(present.sum()),
-                mean_pred_per_doc=float(pred.sum(1).mean()) if len(Y) else 0.0,
-                mean_gold_per_doc=float(Y.sum(1).mean()) if len(Y) else 0.0,
-                per_label_f1=f1.tolist(), support=support.tolist())
+    return dict(
+        macro_f1=macro,
+        micro_f1=micro,
+        subset_acc=float((Y == pred).all(1).mean()) if len(Y) else 0.0,
+        micro_precision=p_micro,
+        micro_recall=r_micro,
+        statutes_scored=int(present.sum()),
+        mean_pred_per_doc=float(pred.sum(1).mean()) if len(Y) else 0.0,
+        mean_gold_per_doc=float(Y.sum(1).mean()) if len(Y) else 0.0,
+        per_label_f1=f1.tolist(),
+        support=support.tolist(),
+    )
 
 
 def short(s: dict) -> dict:
@@ -191,15 +208,17 @@ def short(s: dict) -> dict:
 
 
 def fmt(s: dict, title: str = "") -> str:
-    return (f"{title}macro-F1 {s['macro_f1']:.4f} | micro-F1 {s['micro_f1']:.4f} (P {s['micro_precision']:.3f} "
-            f"R {s['micro_recall']:.3f}) | subset acc {s['subset_acc']:.4f} | statutes per doc: predicted "
-            f"{s['mean_pred_per_doc']:.2f}, gold {s['mean_gold_per_doc']:.2f}")
+    return (
+        f"{title}macro-F1 {s['macro_f1']:.4f} | micro-F1 {s['micro_f1']:.4f} (P {s['micro_precision']:.3f} "
+        f"R {s['micro_recall']:.3f}) | subset acc {s['subset_acc']:.4f} | statutes per doc: predicted "
+        f"{s['mean_pred_per_doc']:.2f}, gold {s['mean_gold_per_doc']:.2f}"
+    )
 
 
-# ------------------------------------------------------------------------------ thresholds
+# --- thresholds
 def apply(P: np.ndarray, t, min_one: bool = True) -> np.ndarray:
-    """Predicted statutes (bool matrix) from probabilities P and a threshold (scalar or one per statute); with
-    min_one, a document with nothing above its thresholds gets its highest-scoring statute."""
+    """Predicted statutes (bool matrix) from probabilities P and a threshold (scalar or one per statute); with min_one,
+    a document with nothing above its thresholds gets its highest-scoring statute."""
     pred = P >= np.asarray(t)
     if min_one and len(P):
         empty = ~pred.any(1)
@@ -213,14 +232,14 @@ def tune_global(Y: np.ndarray, P: np.ndarray, min_one: bool = True) -> tuple[flo
     best = None
     for t in GRID:
         m = scores(Y, apply(P, t, min_one))["macro_f1"]
-        if best is None or m > best[1] + 1e-12 or (abs(m - best[1]) <= 1e-12 and abs(t - .5) < abs(best[0] - .5)):
+        if best is None or m > best[1] + 1e-12 or (abs(m - best[1]) <= 1e-12 and abs(t - 0.5) < abs(best[0] - 0.5)):
             best = (float(t), m)
     return best
 
 
 def tune_per_label(Y: np.ndarray, P: np.ndarray, t_global: float, min_pos: int = 3) -> np.ndarray:
-    """One threshold per statute (best F1 of that statute on GRID; ties nearest t_global); statutes with fewer
-    than min_pos positives keep t_global."""
+    """One threshold per statute (best F1 of that statute on GRID; ties nearest t_global); statutes with fewer than
+    min_pos positives keep t_global."""
     Y = Y.astype(bool)
     t = np.full(P.shape[1], float(t_global))
     for j in range(P.shape[1]):
@@ -242,7 +261,7 @@ def choose_thresholds(Y: np.ndarray, P: np.ndarray, min_pos: int = 3, seed: int 
     n = len(Y)
     idx = list(range(n))
     random.Random(seed).shuffle(idx)
-    halves = [np.array(sorted(idx[: n // 2])), np.array(sorted(idx[n // 2:]))]
+    halves = [np.array(sorted(idx[: n // 2])), np.array(sorted(idx[n // 2 :]))]
     cv = {"global": [], "per_label": []}
     for a, b in ((0, 1), (1, 0)):
         fa, ev = halves[a], halves[b]
@@ -255,23 +274,30 @@ def choose_thresholds(Y: np.ndarray, P: np.ndarray, min_pos: int = 3, seed: int 
     tl = tune_per_label(Y, P, tg, min_pos)
     kind = "per_label" if cvm["per_label"] > cvm["global"] + 0.002 else "global"
     thr = tl if kind == "per_label" else np.full(P.shape[1], tg)
-    return dict(kind=kind, thresholds=thr, t_global=tg, cv_global=cvm["global"], cv_per_label=cvm["per_label"],
-                dev_global=scores(Y, apply(P, tg, min_one)), dev_chosen=scores(Y, apply(P, thr, min_one)))
+    return dict(
+        kind=kind,
+        thresholds=thr,
+        t_global=tg,
+        cv_global=cvm["global"],
+        cv_per_label=cvm["per_label"],
+        dev_global=scores(Y, apply(P, tg, min_one)),
+        dev_chosen=scores(Y, apply(P, thr, min_one)),
+    )
 
 
-# ---------------------------------------------------------------------------- deadline
-def plan_steps(step: int, planned: int, sec_per_step: float, seconds_left: float, predict_seconds: float,
-               min_steps: int = 20) -> int:
+# --- deadline
+def plan_steps(
+    step: int, planned: int, sec_per_step: float, seconds_left: float, predict_seconds: float, min_steps: int = 20
+) -> int:
     """Training steps that fit before a deadline: the steps already done + those that fit in the time left after the
-    predictions still to come. Never more than planned; never fewer than min(planned, max(step, min_steps)), so a
-    run always trains a little and always writes its results."""
+    predictions still to come."""
     spare = seconds_left - predict_seconds
     more = int(spare / sec_per_step) if sec_per_step > 0 and spare > 0 else 0
     floor = min(planned, max(step, min_steps))
     return max(floor, min(planned, step + more))
 
 
-# ------------------------------------------------------------------------------ files
+# --- files
 def save_probs(path: str, ids: list[str], P: np.ndarray) -> None:
     with open(path, "w") as f:
         json.dump({i: [round(float(x), 5) for x in row] for i, row in zip(ids, P)}, f)
@@ -286,15 +312,18 @@ def load_probs(path: str, ids: list[str]) -> np.ndarray:
     return np.array([d[i] for i in ids], dtype=np.float32)
 
 
-def write_submission(test_docs: list[dict], labels: list[int], P: np.ndarray, thresholds, out_dir: str,
-                     min_one: bool = True) -> str:
-    """prediction.json = [{"id": ..., "pred": [statute ids]}, ...] in test.json order (integer, unique, sorted
-    ids; at least one per document with min_one) and submission.zip holding it; the zip is read back and checked."""
+def write_submission(
+    test_docs: list[dict], labels: list[int], P: np.ndarray, thresholds, out_dir: str, min_one: bool = True
+) -> str:
+    """prediction.json = [{"id": ..., "pred": [statute ids]}, ...] in test.json order (integer, unique, sorted ids; at
+    least one per document with min_one) and submission.zip holding it; the zip is read back and checked."""
     if len(P) != len(test_docs) or P.shape[1] != len(labels):
         raise ValueError(f"probabilities {P.shape} do not match {len(test_docs)} documents x {len(labels)} statutes")
     pred = apply(P, thresholds, min_one)
-    rows = [{"id": d["id"], "pred": sorted(int(labels[j]) for j in np.flatnonzero(pred[i]))}
-            for i, d in enumerate(test_docs)]
+    rows = [
+        {"id": d["id"], "pred": sorted(int(labels[j]) for j in np.flatnonzero(pred[i]))}
+        for i, d in enumerate(test_docs)
+    ]
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "prediction.json")
     with open(path, "w", encoding="utf-8") as f:
@@ -305,9 +334,16 @@ def write_submission(test_docs: list[dict], labels: list[int], P: np.ndarray, th
     with zipfile.ZipFile(zpath) as z:
         back = json.loads(z.read("prediction.json"))
     valid = set(int(x) for x in labels)
-    ok = (len(back) == len(test_docs) and [r["id"] for r in back] == [d["id"] for d in test_docs]
-          and all(isinstance(r["pred"], list) and all(type(x) is int and x in valid for x in r["pred"])
-                  and len(set(r["pred"])) == len(r["pred"]) for r in back))
+    ok = (
+        len(back) == len(test_docs)
+        and [r["id"] for r in back] == [d["id"] for d in test_docs]
+        and all(
+            isinstance(r["pred"], list)
+            and all(type(x) is int and x in valid for x in r["pred"])
+            and len(set(r["pred"])) == len(r["pred"])
+            for r in back
+        )
+    )
     if not ok:
         raise RuntimeError("submission.zip check failed")
     return zpath

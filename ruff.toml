@@ -1,0 +1,13 @@
+line-length = 120
+target-version = "py310"
+
+[lint]
+select = ["E", "F", "W", "B", "UP"]
+ignore = ["B011", "E402", "E501", "E731", "E741", "B007", "B008", "B023", "B904", "B905", "UP007", "UP045", "UP035"]
+
+
+[format]
+quote-style = "double"
+
+[lint.per-file-ignores]
+"*.ipynb" = ["E401", "F401"]

@@ -1,16 +1,5 @@
-"""Token-classification model = Phase 1 backbone (+ optional PEFT) + tagging head.
+"""Token-classification model = Phase 1 backbone (+ optional PEFT) + tagging head."""
 
-Backbone features (the LM output head is NOT used):
-  decoder : tok_emb + sinusoidal PE -> blocks -> ln_f           (d_model)
-  llama/moe: tok_emb -> blocks -> norm_f                         (d_model)
-  encdec  : bidirectional GRU encoder outputs                    (2 * hidden_size)
-
-Decoder-only backbones are causal (token t sees only <= t). Two optional fixes:
-  * head="bigru": a small BiGRU over the features gives right context to every token
-  * echo=True   : feed [window ; window] and read features from the 2nd copy, so each token of
-                  the 2nd copy has already "seen" the whole window (Springer et al. 2024, echo
-                  embeddings). Costs 2x sequence length.
-"""
 import os
 import sys
 
@@ -18,9 +7,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from models import build_model, init_weights                      # noqa: E402
-from phase2.peft import apply_peft, DEFAULT_TARGETS               # noqa: E402
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path[:0] = [ROOT, os.path.join(ROOT, "phase1")]
+from models import build_model, init_weights  # noqa: E402
+from phase2.peft import apply_peft, DEFAULT_TARGETS  # noqa: E402
 
 
 def feat_dim(arch, mcfg):
@@ -49,6 +39,7 @@ def backbone_features(lm, arch, idx):
 def _gqa_forward_bidir(self, x):
     """Same as models/layers.py::GQAttention.forward but WITHOUT the causal mask."""
     from models.layers import apply_rope
+
     B, T, _ = x.shape
     q = self.q_proj(x).view(B, T, self.h, self.dh).transpose(1, 2)
     k = self.k_proj(x).view(B, T, self.kv, self.dh).transpose(1, 2)
@@ -57,17 +48,15 @@ def _gqa_forward_bidir(self, x):
     q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
     rep = self.h // self.kv
     k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
-    y = F.scaled_dot_product_attention(q, k, v, is_causal=False,
-                                       dropout_p=self.dropout if self.training else 0.0)
+    y = F.scaled_dot_product_attention(q, k, v, is_causal=False, dropout_p=self.dropout if self.training else 0.0)
     return self.out_proj(y.transpose(1, 2).reshape(B, T, self.h * self.dh))
 
 
 def make_bidirectional(lm, arch):
-    """LLM2Vec-style (BehnamGhader et al. 2024): drop the causal mask so every token attends to
-    the whole window; fine-tuning then teaches the left-to-right pretrained weights to use right
-    context. Phase 1 files are untouched: decoder -> all-True mask buffer, llama/moe -> patched
-    attention forward. Returns number of attention layers changed."""
+    """LLM2Vec-style (BehnamGhader et al. 2024): drop the causal mask so every token attends to the whole window;
+    fine-tuning then teaches the left-to-right pretrained weights to use right context."""
     import types
+
     n = 0
     for b in lm.blocks:
         if arch == "decoder":
@@ -99,8 +88,7 @@ class TagHead(nn.Module):
 
 
 class NERModel(nn.Module):
-    def __init__(self, lm, arch, mcfg, n_tags, head="linear", echo=False, rnn_hidden=256,
-                 dropout=0.1):
+    def __init__(self, lm, arch, mcfg, n_tags, head="linear", echo=False, rnn_hidden=256, dropout=0.1):
         super().__init__()
         self.lm, self.arch, self.echo = lm, arch, echo
         self.head = TagHead(feat_dim(arch, mcfg), n_tags, head, rnn_hidden, dropout)
@@ -115,9 +103,7 @@ class NERModel(nn.Module):
 
 
 def build_ner_model(args, phase1, n_tags, load_weights=True):
-    """phase1: path to a Phase 1 best.pt, or a dict {"config", "vocab_size"(, "model")}.
-    args: dict with keys method, head, echo, keep_layers, r, alpha, lora_dropout, targets,
-    scratch, rnn_hidden, dropout. Returns (model, phase1_config, vocab_size)."""
+    """phase1: path to a Phase 1 best.pt, or a dict {"config", "vocab_size"(, "model")}."""
     ck = torch.load(phase1, map_location="cpu", weights_only=False) if isinstance(phase1, str) else phase1
     cfg, V = ck["config"], ck["vocab_size"]
     arch, mcfg = cfg["arch"], dict(cfg["model"])
@@ -125,25 +111,24 @@ def build_ner_model(args, phase1, n_tags, load_weights=True):
     if load_weights and not args.get("scratch"):
         lm.load_state_dict(ck["model"])
     elif args.get("scratch"):
-        init_weights(lm, 0.02)                                 # "no pretraining" ablation
+        init_weights(lm, 0.02)
     del ck
     k = args.get("keep_layers") or 0
-    if k and hasattr(lm, "blocks"):                            # smaller student for distillation
+    if k and hasattr(lm, "blocks"):
         lm.blocks = lm.blocks[:k]
     if args.get("bidir"):
         print(f"[model] bidirectional attention in {make_bidirectional(lm, arch)} layers")
     method = args.get("method", "full")
     if method in ("lora", "lorma_plus", "lorma_pi"):
         targets = args.get("targets") or DEFAULT_TARGETS[arch]
-        n = apply_peft(lm, method, targets, args.get("r", 8), args.get("alpha", 16),
-                       args.get("lora_dropout", 0.0))
+        n = apply_peft(lm, method, targets, args.get("r", 8), args.get("alpha", 16), args.get("lora_dropout", 0.0))
         assert n > 0, f"{method}: no nn.Linear matched {targets} in arch={arch} (use --method full/head)"
         print(f"[model] {method}: wrapped {n} Linear layers ({targets})")
-    elif method == "top":                                      # partial FT: only the top k layers
+    elif method == "top":
         k = args.get("top_k", 1)
         for p in lm.parameters():
             p.requires_grad = False
-        if arch == "encdec":                                   # nn.GRU params: weight_ih_l{i}[_reverse]
+        if arch == "encdec":
             L = mcfg["enc_layers"]
             keep = [f"_l{i}" for i in range(L - k, L)]
             for n, p in lm.encoder.rnn.named_parameters():
@@ -156,13 +141,21 @@ def build_ner_model(args, phase1, n_tags, load_weights=True):
             for p in (lm.ln_f if arch == "decoder" else lm.norm_f).parameters():
                 p.requires_grad = True
         print(f"[model] partial fine-tuning: top {k} layer(s) trainable")
-    elif method == "head":                                     # frozen backbone (linear probe)
+    elif method == "head":
         for p in lm.parameters():
             p.requires_grad = False
     elif method != "full":
         raise ValueError(method)
-    model = NERModel(lm, arch, mcfg, n_tags, args.get("head", "linear"), args.get("echo", False),
-                     args.get("rnn_hidden", 256), args.get("dropout", 0.1))
+    model = NERModel(
+        lm,
+        arch,
+        mcfg,
+        n_tags,
+        args.get("head", "linear"),
+        args.get("echo", False),
+        args.get("rnn_hidden", 256),
+        args.get("dropout", 0.1),
+    )
     return model, cfg, V
 
 

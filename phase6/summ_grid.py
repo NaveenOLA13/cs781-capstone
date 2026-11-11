@@ -1,15 +1,6 @@
 """Phase 6 runs on Kaggle: fine-tuning techniques of one Phase 1 model (one process per GPU), the knowledge
-distillation pair (half-size student with / without the teacher) and the results table.
+distillation pair (half-size student with / without the teacher) and the results table."""
 
-    from summ_grid import run_grid, run_kd, report, best_run
-    run_grid("llama", techniques=("lora", "lorma"), ckpt=START, finish_by=...)     # 2 GPUs: one run each
-    run_kd("/kaggle/working/summ_runs/llama_lora", student_layers=0.5, finish_by=...)
-    report(["/kaggle/working/summ_runs"])
-
-Each GPU gets its own process (python -u summ_grid.py --worker job.json) that loads the model once and runs its jobs;
-progress lines are printed here every minute, full logs are in <out_dir>/<run>/log.txt. Finished runs (metrics.json
-present) are skipped. Windows and training pairs are prepared once here (cached) before the workers start.
-"""
 from __future__ import annotations
 
 import argparse
@@ -25,8 +16,18 @@ if HERE not in sys.path:
 import p6_paths  # noqa: E402,F401
 
 OUT_DIR = "/kaggle/working/summ_runs"
-COST = {"frozen": 1.0, "full": 3.0, "partial": 2.0, "unfreeze": 2.4, "bitfit": 2.0, "lorma": 2.3, "adalora": 2.4,
-        "adapter": 2.0, "lora": 2.3, "qlora": 2.6}
+COST = {
+    "frozen": 1.0,
+    "full": 3.0,
+    "partial": 2.0,
+    "unfreeze": 2.4,
+    "bitfit": 2.0,
+    "lorma": 2.3,
+    "adalora": 2.4,
+    "adapter": 2.0,
+    "lora": 2.3,
+    "qlora": 2.6,
+}
 
 
 def _tail(path, n=1):
@@ -47,7 +48,10 @@ def _prepare(model, ckpt, settings):
     import summ_train
     from cj_mid import is_encoder_decoder
     from cj_models import load_backbone
-    cfg = summ_train.resolve_cfg({k: v for k, v in settings.items() if k not in ("technique", "run_name", "kd_teacher")})
+
+    cfg = summ_train.resolve_cfg(
+        {k: v for k, v in settings.items() if k not in ("technique", "run_name", "kd_teacher")}
+    )
     bb, info = load_backbone(model, max_len=cfg["max_len"], path=ckpt, log=lambda *a: None)
     cfg["max_len"] = info["max_len"]
     summ_train.prepare(bb.encode, cfg, is_encoder_decoder(bb.model), log=print)
@@ -56,6 +60,7 @@ def _prepare(model, ckpt, settings):
 
 def run_jobs(model: str, jobs: list[dict], ckpt: str, out_dir: str, gpus: int | None = None, poll: int = 60) -> None:
     import torch
+
     n_gpu = torch.cuda.device_count() if gpus is None else gpus
     n = max(1, n_gpu)
     loads, per = [0.0] * n, [[] for _ in range(n)]
@@ -76,18 +81,34 @@ def run_jobs(model: str, jobs: list[dict], ckpt: str, out_dir: str, gpus: int | 
         if n_gpu > 0:
             env["CUDA_VISIBLE_DEVICES"] = str(i)
         fh = open(log, "w")
-        procs.append((subprocess.Popen([sys.executable, "-u", os.path.join(HERE, "summ_grid.py"), "--worker", spec],
-                                       stdout=fh, stderr=subprocess.STDOUT, env=env, cwd=HERE), fh, log))
-        print(f"[summ] worker {i} ({'GPU ' + str(i) if n_gpu else 'CPU'}): {', '.join(j['run_name'] for j in js)}  "
-              f"(log: {log})", flush=True)
+        procs.append(
+            (
+                subprocess.Popen(
+                    [sys.executable, "-u", os.path.join(HERE, "summ_grid.py"), "--worker", spec],
+                    stdout=fh,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    cwd=HERE,
+                ),
+                fh,
+                log,
+            )
+        )
+        print(
+            f"[summ] worker {i} ({'GPU ' + str(i) if n_gpu else 'CPU'}): {', '.join(j['run_name'] for j in js)}  "
+            f"(log: {log})",
+            flush=True,
+        )
     t0 = time.time()
     while any(p.poll() is None for p, *_ in procs):
         time.sleep(poll)
         for i, (p, _, log) in enumerate(procs):
             state = "running" if p.poll() is None else f"finished (exit {p.returncode})"
             last = _tail(log)
-            print(f"[summ {(time.time() - t0) / 60:5.1f} min] worker {i} {state}: {last[0][:160] if last else ''}",
-                  flush=True)
+            print(
+                f"[summ {(time.time() - t0) / 60:5.1f} min] worker {i} {state}: {last[0][:160] if last else ''}",
+                flush=True,
+            )
     for i, (p, fh, log) in enumerate(procs):
         fh.close()
         if p.returncode != 0:
@@ -97,6 +118,7 @@ def run_jobs(model: str, jobs: list[dict], ckpt: str, out_dir: str, gpus: int | 
 
 def _table(out_dir, names, title):
     import summ_train
+
     rows = [m for n in names if (m := summ_train.load_metrics(out_dir, n)) is not None]
     missing = [n for n in names if summ_train.load_metrics(out_dir, n) is None]
     text = summ_train.comparison(rows) if rows else "no finished runs"
@@ -107,10 +129,19 @@ def _table(out_dir, names, title):
     return text
 
 
-def run_grid(model: str, techniques=("lora", "lorma"), ckpt: str | None = None, out_dir: str = OUT_DIR,
-             gpus: int | None = None, skip_done: bool = True, poll: int = 60, **settings) -> str:
+def run_grid(
+    model: str,
+    techniques=("lora", "lorma"),
+    ckpt: str | None = None,
+    out_dir: str = OUT_DIR,
+    gpus: int | None = None,
+    skip_done: bool = True,
+    poll: int = 60,
+    **settings,
+) -> str:
     """Every technique on one Phase 1 model; runs are named <model>_<technique>."""
     import summ_train
+
     unknown = set(settings) - set(summ_train.DEFAULTS)
     if unknown:
         raise ValueError(f"unknown settings: {sorted(unknown)}")
@@ -119,6 +150,7 @@ def run_grid(model: str, techniques=("lora", "lorma"), ckpt: str | None = None, 
     if todo:
         if not ckpt:
             from cj_models import find_checkpoint
+
             ckpt = find_checkpoint(model)
         settings = dict(settings, max_len=_prepare(model, ckpt, settings))
         jobs = [dict(run_name=f"{model}_{t}", technique=t, settings=dict(settings, out_dir=out_dir)) for t in todo]
@@ -129,34 +161,75 @@ def run_grid(model: str, techniques=("lora", "lorma"), ckpt: str | None = None, 
 def best_run(out_dir: str, names) -> str | None:
     """The finished run (folder) with the best held-out (ROUGE-1 + ROUGE-L) / 2 among names."""
     import summ_train
-    rows = [(m["held"]["rouge_mean"], os.path.join(out_dir, n)) for n in names
-            if (m := summ_train.load_metrics(out_dir, n)) is not None
-            and os.path.exists(os.path.join(out_dir, n, "trained.pt"))]
+
+    rows = [
+        (m["held"]["rouge_mean"], os.path.join(out_dir, n))
+        for n in names
+        if (m := summ_train.load_metrics(out_dir, n)) is not None
+        and os.path.exists(os.path.join(out_dir, n, "trained.pt"))
+    ]
     return max(rows)[1] if rows else None
 
 
-def run_kd(teacher_dir: str, student_layers=0.5, kd_alpha: float = 0.5, kd_T: float = 2.0, technique: str = "full",
-           plain: bool = True, out_dir: str = OUT_DIR, gpus: int | None = None, skip_done: bool = True,
-           poll: int = 60, **settings) -> str:
+def run_kd(
+    teacher_dir: str,
+    student_layers=0.5,
+    kd_alpha: float = 0.5,
+    kd_T: float = 2.0,
+    technique: str = "full",
+    plain: bool = True,
+    out_dir: str = OUT_DIR,
+    gpus: int | None = None,
+    skip_done: bool = True,
+    poll: int = 60,
+    **settings,
+) -> str:
     """Knowledge distillation: teacher = a finished run (full size); student = the same starting model with
     student_layers of its blocks (evenly spaced), trained with the teacher (<model>_student_kd) and, for comparison,
-    without it (<model>_student)."""
+    without it."""
     with open(os.path.join(teacher_dir, "config.json")) as f:
         tcfg = json.load(f)
     with open(os.path.join(teacher_dir, "metrics.json")) as f:
         tm = json.load(f)
     model, ckpt = tm["model"], tcfg["ckpt_path"]
-    base = {k: tcfg[k] for k in ("data_root", "cache_dir", "max_len", "tgt_tokens", "enc_window", "empty_frac",
-                                 "heldout_frac", "seed", "fetch_data", "beams", "no_repeat", "len_pen", "eval_docs",
-                                 "batch_size", "grad_accum", "gen_batch", "limit_train") if k in tcfg}
+    base = {
+        k: tcfg[k]
+        for k in (
+            "data_root",
+            "cache_dir",
+            "max_len",
+            "tgt_tokens",
+            "enc_window",
+            "empty_frac",
+            "heldout_frac",
+            "seed",
+            "fetch_data",
+            "beams",
+            "no_repeat",
+            "len_pen",
+            "eval_docs",
+            "batch_size",
+            "grad_accum",
+            "gen_batch",
+            "limit_train",
+        )
+        if k in tcfg
+    }
     base.update(settings)
     base.update(out_dir=out_dir, student_layers=student_layers)
-    jobs = [dict(run_name=f"{model}_student_kd", technique=technique,
-                 settings=dict(base, kd_teacher=teacher_dir, kd_alpha=kd_alpha, kd_T=kd_T))]
+    jobs = [
+        dict(
+            run_name=f"{model}_student_kd",
+            technique=technique,
+            settings=dict(base, kd_teacher=teacher_dir, kd_alpha=kd_alpha, kd_T=kd_T),
+        )
+    ]
     if plain:
         jobs.append(dict(run_name=f"{model}_student", technique=technique, settings=dict(base)))
-    print(f"[kd] teacher {teacher_dir} ({tcfg['technique']}): held-out ROUGE-1 {tm['held']['rouge1']:.4f}, "
-          f"ROUGE-L {tm['held']['rougeL']:.4f}; student: {model} with {student_layers} of its blocks, {technique}")
+    print(
+        f"[kd] teacher {teacher_dir} ({tcfg['technique']}): held-out ROUGE-1 {tm['held']['rouge1']:.4f}, "
+        f"ROUGE-L {tm['held']['rougeL']:.4f}; student: {model} with {student_layers} of its blocks, {technique}"
+    )
     names = [j["run_name"] for j in jobs]
     todo = [j for j in jobs if not (skip_done and _done(out_dir, j["run_name"]))]
     if todo:
@@ -170,6 +243,7 @@ def run_kd(teacher_dir: str, student_layers=0.5, kd_alpha: float = 0.5, kd_T: fl
 def report(base_dirs, out_path: str | None = None) -> str:
     """One table of every finished run under base_dirs (best held-out ROUGE first) + the submission files."""
     import summ_train
+
     if isinstance(base_dirs, str):
         base_dirs = [base_dirs]
     rows = []
@@ -186,8 +260,10 @@ def report(base_dirs, out_path: str | None = None) -> str:
     else:
         text = summ_train.comparison(rows)
         text += "\n\nsubmission files (best held-out first):\n" + "\n".join(
-            f"{m['held']['rouge_mean']:.4f}  {m['submission']}" for m in sorted(rows, key=lambda m: -m["held"]["rouge_mean"])
-            if m.get("submission"))
+            f"{m['held']['rouge_mean']:.4f}  {m['submission']}"
+            for m in sorted(rows, key=lambda m: -m["held"]["rouge_mean"])
+            if m.get("submission")
+        )
     print(text)
     out_path = out_path or os.path.join(base_dirs[0], "all_results.txt")
     with open(out_path, "w") as f:
@@ -200,16 +276,23 @@ def _worker(spec_path: str) -> int:
         spec = json.load(f)
     import summ_train
     from cj_models import load_backbone
+
     max_len = spec["jobs"][0]["settings"].get("max_len", summ_train.DEFAULTS["max_len"])
     bb, info = load_backbone(spec["model"], max_len=max_len, path=spec["ckpt"])
     failed = []
     for j in spec["jobs"]:
-        s = dict(j["settings"], ckpt_path=spec["ckpt"], run_name=j["run_name"], technique=j["technique"],
-                 max_len=info["max_len"])
+        s = dict(
+            j["settings"],
+            ckpt_path=spec["ckpt"],
+            run_name=j["run_name"],
+            technique=j["technique"],
+            max_len=info["max_len"],
+        )
         try:
             summ_train.run(bb, name=spec["model"], **s)
         except Exception as e:  # noqa: BLE001
             import traceback
+
             traceback.print_exc()
             print(f"[worker] {j['run_name']} FAILED: {type(e).__name__}: {e}", flush=True)
             failed.append(j["run_name"])

@@ -1,15 +1,32 @@
-"""Shared tail of train_ner.py and ensemble.py (torch-free): dev scoring, dev-selected
-post-processing (phase2/postproc.py) and the fold3 submission."""
+"""Shared tail of train_ner.py and ensemble.py (torch-free): dev scoring, dev-selected post-processing
+(phase2/postproc.py) and the fold3 submission."""
+
 import json
 import os
 
 from phase2 import ner_data as D
 
 
-def finalize(dev_probs, test_probs, enc, tenc, texts, gold, test, train_ids, dev_ids, labels, tags,
-             id2tag, table, out, postproc=1):
-    """dev scoring + post-processing selection on dev + test submission. Shared with ensemble.py."""
+def finalize(
+    dev_probs,
+    test_probs,
+    enc,
+    tenc,
+    texts,
+    gold,
+    test,
+    train_ids,
+    dev_ids,
+    labels,
+    tags,
+    id2tag,
+    table,
+    out,
+    postproc=1,
+):
+    """dev scoring + post-processing selection on dev + test submission."""
     from phase2 import postproc as PP
+
     dev_gold = {k: gold[k] for k in dev_ids}
 
     def decode(probs, encd, txts, viterbi):
@@ -48,8 +65,7 @@ def finalize(dev_probs, test_probs, enc, tenc, texts, gold, test, train_ids, dev
         print(f"    {lab:10s} F1={v['F1']:.3f} P={v['P']:.3f} R={v['R']:.3f} (tp={v['tp']} fp={v['fp']} fn={v['fn']})")
     sc["postproc"] = {"report": report, "viterbi": use_vit, "choice": choice}
     json.dump(sc, open(os.path.join(out, "dev_scores.json"), "w"), indent=1)
-    json.dump({k: [list(x) for x in v] for k, v in pred.items()},
-              open(os.path.join(out, "dev_pred.json"), "w"))
+    json.dump({k: [list(x) for x in v] for k, v in pred.items()}, open(os.path.join(out, "dev_pred.json"), "w"))
 
     if test_probs is not None:
         tpred = decode(test_probs, tenc, test, use_vit)

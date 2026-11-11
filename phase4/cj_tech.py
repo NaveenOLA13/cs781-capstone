@@ -1,36 +1,5 @@
-"""Phase 4 fine-tuning techniques, all written by us (no peft library). Each one decides which weights of the
-Phase 1 model are trained; the classification head (pooling + linear layer) is always trained.
+"""Phase 4 fine-tuning techniques, all written by us (no peft library)."""
 
-  frozen    nothing of the Phase 1 model (reference: how much its features already know)
-  full      every weight of the Phase 1 model
-  partial   only the top third of the blocks (+ the final norm); lower blocks and embeddings stay fixed
-  unfreeze  gradual unfreezing: head only at first, then block groups from the top down, embeddings last
-  bitfit    only the bias values; a model without biases gets zero biases added to its linear layers
-  lorma     LoRMA+ (Bihany, Patel, Modi 2025): every weight matrix becomes (I + alpha/r * B A) W0;
-            W0 stays fixed, only B (d_out x r, starts at 0) and A (r x d_out) are trained
-  lora      LoRA (Hu et al. 2021): every weight matrix becomes W0 + alpha/r * B A; W0 stays fixed, only
-            B (d_out x r, starts at 0) and A (r x d_in) are trained
-  qlora     QLoRA (Dettmers et al. 2023): LoRA on top of a 4-bit copy of the fixed weights: W0 is stored as
-            4-bit NormalFloat (NF4) codes with one scale (absolute maximum) per block of 64 values, and is
-            rebuilt from them at every use (W0 itself is freed); the low-rank B A is trained in full precision.
-            Not done here: quantising the scales again ("double quantisation") and paged optimiser states.
-  adalora   AdaLoRA (Zhang et al. 2023): W0 + alpha/r0 * P diag(lambda) Q with a total rank budget that
-            shrinks during training; rank is kept where it matters most (importance scores)
-  adapter   a bottleneck layer after every block, x + up(gelu(down(x))) with d -> 64 -> d, starts as identity
-  ia3       (IA)^3 (Liu et al. 2022, T-Few): learned vectors (start at 1) that multiply activations channel-wise;
-            the Phase 1 weights stay fixed. On every linear layer of the blocks: its output (attention projections,
-            the first feed-forward layer) or, for layers that shrink the width (the second feed-forward layer), its
-            input = the feed-forward hidden activations, as in the paper; on RNN layers: their outputs. Tiny layers
-            (fewer than 32 inputs or outputs, e.g. MoE routers) are left alone.
-
-"Blocks" are the repeated layers of a transformer (an nn.ModuleList); for the encoder-decoder, whose encoder
-is a bidirectional RNN, the RNN layers play that role. LoRMA and AdaLoRA also change RNN weight matrices
-(via torch.nn.utils.parametrize; cuDNN is switched off for those RNNs so the changed weights are used).
-
-    hooks = apply(clf, "lorma", used, cfg, total_steps, log)
-    # hooks.body_params: Phase 1 / adapter parameters to optimise (head parameters are separate)
-    # hooks.on_step_start(step), hooks.extra_loss(), hooks.after_step(step, stepped), hooks.summary()
-"""
 from __future__ import annotations
 
 import math
@@ -41,28 +10,45 @@ import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
 
-TECHNIQUES = ("frozen", "full", "partial", "unfreeze", "bitfit", "lorma", "adalora", "adapter", "lora", "qlora",
-              "ia3")
-BODY_LR = {"frozen": None, "full": 3e-5, "partial": 3e-5, "unfreeze": 3e-5, "bitfit": 5e-4,
-           "lorma": 5e-4, "adalora": 5e-4, "adapter": 1e-3, "lora": 5e-4, "qlora": 5e-4, "ia3": 3e-3}
+TECHNIQUES = ("frozen", "full", "partial", "unfreeze", "bitfit", "lorma", "adalora", "adapter", "lora", "qlora", "ia3")
+BODY_LR = {
+    "frozen": None,
+    "full": 3e-5,
+    "partial": 3e-5,
+    "unfreeze": 3e-5,
+    "bitfit": 5e-4,
+    "lorma": 5e-4,
+    "adalora": 5e-4,
+    "adapter": 1e-3,
+    "lora": 5e-4,
+    "qlora": 5e-4,
+    "ia3": 3e-3,
+}
 TECH_DEFAULTS = dict(
-    partial_frac=1 / 3,          # partial: share of the blocks (from the top) that are trained
-    unfreeze_stages=4,           # unfreeze: number of stages (stage 0 = head only)
-    lorma_r=8, lorma_alpha=8.0,  # LoRMA rank and alpha (scale alpha / r)
-    adalora_r0=12, adalora_r=8, adalora_alpha=16.0,   # AdaLoRA start rank, final average rank, alpha
-    adalora_tinit=0.1, adalora_tfinal=0.2, adalora_deltaT=10, adalora_orth=0.1,
+    partial_frac=1 / 3,
+    unfreeze_stages=4,
+    lorma_r=8,
+    lorma_alpha=8.0,
+    adalora_r0=12,
+    adalora_r=8,
+    adalora_alpha=16.0,
+    adalora_tinit=0.1,
+    adalora_tfinal=0.2,
+    adalora_deltaT=10,
+    adalora_orth=0.1,
     adalora_beta=0.85,
     adapter_dim=64,
-    lora_r=8, lora_alpha=16.0,   # LoRA / QLoRA rank and alpha (scale alpha / r)
-    qlora_block=64,              # QLoRA: values per quantisation block (one scale each)
-    ia3_min_dim=32,              # (IA)^3: linear layers with fewer inputs or outputs are left alone (routers)
-    rnn_cudnn=False,             # low-rank on RNN weights: keep cuDNN (weights refreshed before every call)
+    lora_r=8,
+    lora_alpha=16.0,
+    qlora_block=64,
+    ia3_min_dim=32,
+    rnn_cudnn=False,
 )
-LOW_RANK = ("lorma", "adalora", "lora", "qlora")       # techniques that parametrize weight matrices
+LOW_RANK = ("lorma", "adalora", "lora", "qlora")
 _RNN_LAYER = re.compile(r"_l(\d+)(_reverse)?$")
 
 
-# ------------------------------------------------------------------------ structure
+# --- structure
 def blocks_of(model: nn.Module, used: set[str]):
     """(name of the nn.ModuleList of blocks, list of (index, block)) whose parameters are used; None if none."""
     best = None
@@ -79,13 +65,16 @@ def blocks_of(model: nn.Module, used: set[str]):
 
 
 def rnn_modules(model: nn.Module, used: set[str]):
-    return [(n, m) for n, m in model.named_modules()
-            if isinstance(m, nn.RNNBase) and any(f"{n}.{p}" in used for p, _ in m.named_parameters(recurse=False))]
+    return [
+        (n, m)
+        for n, m in model.named_modules()
+        if isinstance(m, nn.RNNBase) and any(f"{n}.{p}" in used for p, _ in m.named_parameters(recurse=False))
+    ]
 
 
 def layer_groups(model: nn.Module, used: set[str]):
-    """Used parameter names split into (bottom, [layer 0, ..., layer L-1], top): the layers are transformer
-    blocks, or else RNN layers; bottom = what comes before them (embeddings), top = what comes after."""
+    """Used parameter names split into (bottom, [layer 0, ..., layer L-1], top): the layers are transformer blocks, or
+    else RNN layers; bottom = what comes before them (embeddings), top = what comes after."""
     names = [n for n, _ in model.named_parameters() if n in used]
     if not names:
         raise RuntimeError("no parameter of the Phase 1 model gets a gradient for this task")
@@ -100,7 +89,7 @@ def layer_groups(model: nn.Module, used: set[str]):
         for rname, _ in rnn_modules(model, used):
             groups: dict[int, list[str]] = {}
             for n in names:
-                if n.startswith(rname + ".") and "." not in n[len(rname) + 1:]:
+                if n.startswith(rname + ".") and "." not in n[len(rname) + 1 :]:
                     m = _RNN_LAYER.search(n)
                     if m:
                         groups.setdefault(int(m.group(1)), []).append(n)
@@ -119,8 +108,8 @@ def layer_groups(model: nn.Module, used: set[str]):
 
 
 def targets(model: nn.Module, used: set[str]):
-    """Weight matrices for LoRMA / AdaLoRA: (module name, module, parameter name) of every used nn.Linear weight
-    and every used RNN weight matrix. Weights shared by several modules (tied) are skipped."""
+    """Weight matrices for LoRMA / AdaLoRA: (module name, module, parameter name) of every used nn.Linear weight and
+    every used RNN weight matrix."""
     owners = Counter(id(p) for m in model.modules() for p in m.parameters(recurse=False))
     out = []
     for mname, m in model.named_modules():
@@ -138,7 +127,7 @@ def _param_map(model):
     return dict(model.named_parameters())
 
 
-# ---------------------------------------------------------------------------- hooks
+# --- hooks
 class Hooks:
     """What the training loop calls; the base class does nothing extra."""
 
@@ -161,8 +150,8 @@ class Hooks:
 
 
 class UnfreezeHooks(Hooks):
-    """Stage s of n (equal shares of the training steps): stage 0 trains the head only; stage s trains the
-    top round(s * L / (n - 1)) layers (+ the parts above them); the last stage also the embeddings."""
+    """Stage s of n (equal shares of the training steps): stage 0 trains the head only; stage s trains the top round(s
+    * L / (n - 1)) layers (+ the parts above them); the last stage also the embeddings."""
 
     def __init__(self, params, bottom, layers, top, total_steps, stages):
         super().__init__("unfreeze", [params[n] for g in [bottom] + layers + [top] for n in g])
@@ -176,7 +165,7 @@ class UnfreezeHooks(Hooks):
         k = round(stage * len(self.layers) / (self.stages - 1))
         on = set()
         if k > 0:
-            on |= {n for g in self.layers[len(self.layers) - k:] for n in g} | set(self.top)
+            on |= {n for g in self.layers[len(self.layers) - k :] for n in g} | set(self.top)
         if stage == self.stages - 1:
             on |= set(self.bottom)
         for n, p in self.params.items():
@@ -189,11 +178,12 @@ class UnfreezeHooks(Hooks):
         if stage != self.stage:
             k = self._set(stage)
             self.stage = stage
-            self.info["schedule"].append(dict(step=step, stage=stage, layers_trained=k,
-                                              embeddings_trained=stage == self.stages - 1))
+            self.info["schedule"].append(
+                dict(step=step, stage=stage, layers_trained=k, embeddings_trained=stage == self.stages - 1)
+            )
 
 
-# ---------------------------------------------------------------------------- LoRMA
+# --- LoRMA
 class LoRMA(nn.Module):
     """Parametrization W -> (I + scale * B A) W = W + scale * B (A W), scale = alpha / r."""
 
@@ -222,10 +212,24 @@ class LoRA(nn.Module):
         return W + self.scale * (self.B @ self.A)
 
 
-# the 16 NormalFloat-4 values (QLoRA paper, appendix E / bitsandbytes): quantiles of a standard normal, scaled to [-1, 1]
-NF4 = (-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635,
-       -0.18477343022823334, -0.09105003625154495, 0.0, 0.07958029955625534, 0.16093020141124725,
-       0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0)
+NF4 = (
+    -1.0,
+    -0.6961928009986877,
+    -0.5250730514526367,
+    -0.39491748809814453,
+    -0.28444138169288635,
+    -0.18477343022823334,
+    -0.09105003625154495,
+    0.0,
+    0.07958029955625534,
+    0.16093020141124725,
+    0.24611230194568634,
+    0.33791524171829224,
+    0.44070982933044434,
+    0.5626170039176941,
+    0.7229568362236023,
+    1.0,
+)
 
 
 def nf4_quantize(W: torch.Tensor, block: int = 64):
@@ -247,13 +251,12 @@ def nf4_quantize(W: torch.Tensor, block: int = 64):
 def nf4_dequantize(packed: torch.Tensor, absmax: torch.Tensor, levels: torch.Tensor, shape, block: int = 64):
     codes = torch.stack([packed & 15, packed >> 4], 1).reshape(-1).long()
     n = math.prod(shape)
-    w = levels[codes[:absmax.numel() * block]].view(-1, block) * absmax[:, None]
+    w = levels[codes[: absmax.numel() * block]].view(-1, block) * absmax[:, None]
     return w.reshape(-1)[:n].view(*shape)
 
 
 class QLoRA(nn.Module):
-    """Parametrization W -> dequantize(NF4 codes of W0) + scale * B A. The incoming W is not used: apply() frees
-    the full-precision original after registering, so only the 4-bit codes and the block scales are kept."""
+    """Parametrization W -> dequantize(NF4 codes of W0) + scale * B A."""
 
     def __init__(self, W: torch.Tensor, r: int, alpha: float, block: int = 64):
         super().__init__()
@@ -275,10 +278,9 @@ class QLoRA(nn.Module):
         return self.weight0().to(self.B.dtype) + self.scale * (self.B @ self.A)
 
 
-# -------------------------------------------------------------------------- AdaLoRA
+# --- AdaLoRA
 class AdaLoRA(nn.Module):
-    """Parametrization W -> W + scale * P diag(lambda * mask) Q. lambda starts at 0 (no change at the start);
-    mask (0/1 per rank) is set by AdaLoRAHooks from importance scores."""
+    """Parametrization W -> W + scale * P diag(lambda * mask) Q."""
 
     def __init__(self, d_out: int, d_in: int, r: int, scale: float):
         super().__init__()
@@ -293,15 +295,15 @@ class AdaLoRA(nn.Module):
 
     def orth(self):
         eye = torch.eye(self.lam.numel(), device=self.P.device)
-        return (torch.linalg.matrix_norm(self.P.float().T @ self.P.float() - eye)
-                + torch.linalg.matrix_norm(self.Q.float() @ self.Q.float().T - eye)) / 2
+        return (
+            torch.linalg.matrix_norm(self.P.float().T @ self.P.float() - eye)
+            + torch.linalg.matrix_norm(self.Q.float() @ self.Q.float().T - eye)
+        ) / 2
 
 
 class AdaLoRAHooks(Hooks):
-    """Importance of each rank (singular triplet) = smoothed sensitivity |w * grad| times its uncertainty, summed
-    over lambda_i, the column P[:, i] and the row Q[i, :] (means). Budget (total ranks kept): r0 per matrix until
-    tinit, then a cubic decrease to r per matrix, fixed for the last tfinal share of steps. Every deltaT steps the
-    ranks with the lowest importance are masked out."""
+    """Importance of each rank (singular triplet) = smoothed sensitivity |w * grad| times its uncertainty, summed over
+    lambda_i, the column P[:, i] and the row Q[i, :] (means)."""
 
     def __init__(self, mods: list[tuple[str, AdaLoRA]], total_steps: int, cfg: dict):
         super().__init__("adalora", [p for _, m in mods for p in (m.P, m.lam, m.Q)])
@@ -330,7 +332,7 @@ class AdaLoRAHooks(Hooks):
         if step > self.total - self.t_final:
             return self.b_end, not self.final_fixed
         frac = 1 - (step - self.t_init) / max(1, self.total - self.t_final - self.t_init)
-        return int((self.b0 - self.b_end) * frac ** 3 + self.b_end), step % self.delta == 0
+        return int((self.b0 - self.b_end) * frac**3 + self.b_end), step % self.delta == 0
 
     @torch.no_grad()
     def _score(self, p):
@@ -358,7 +360,7 @@ class AdaLoRAHooks(Hooks):
         keep[torch.topk(flat, min(budget, flat.numel())).indices] = 1.0
         i = 0
         for (_, m), s in zip(self.mods, scores):
-            m.mask.copy_(keep[i:i + s.numel()].to(m.mask.dtype))
+            m.mask.copy_(keep[i : i + s.numel()].to(m.mask.dtype))
             i += s.numel()
         if step > self.total - self.t_final:
             self.final_fixed = True
@@ -368,12 +370,17 @@ class AdaLoRAHooks(Hooks):
         for name, m in self.mods:
             key = re.sub(r"(^|\.)\d+(\.|$)", r"\1*\2", name)
             by_type.setdefault(key, []).append(int(m.mask.sum().item()))
-        return dict(budget=self.budget, start_rank=self.r0, target_rank=self.r, matrices=len(self.mods),
-                    ranks_kept=sum(sum(v) for v in by_type.values()),
-                    final_rank_mean_by_layer_type={k: round(sum(v) / len(v), 2) for k, v in by_type.items()})
+        return dict(
+            budget=self.budget,
+            start_rank=self.r0,
+            target_rank=self.r,
+            matrices=len(self.mods),
+            ranks_kept=sum(sum(v) for v in by_type.values()),
+            final_rank_mean_by_layer_type={k: round(sum(v) / len(v), 2) for k, v in by_type.items()},
+        )
 
 
-# ------------------------------------------------------------------------- adapters
+# --- adapters
 class Adapter(nn.Module):
     """x + up(gelu(down(x))); up starts at zero, so the adapter starts as the identity."""
 
@@ -398,6 +405,7 @@ def _adapter_hook(adapter):
         if isinstance(out, list) and out and torch.is_tensor(out[0]):
             return [adapter(out[0])] + list(out[1:])
         raise RuntimeError(f"adapter: cannot handle a block output of type {type(out).__name__}")
+
     return hook
 
 
@@ -410,9 +418,7 @@ def _first_tensor(out):
 
 
 def _rnn_without_cudnn(rnn: nn.RNNBase, keep_cudnn: bool = False) -> None:
-    """Parametrized RNN weights are recomputed every call, so the RNN's weight list is refreshed before every call.
-    keep_cudnn=False: cuDNN is switched off for this RNN (slow on long inputs). keep_cudnn=True: cuDNN copies the
-    fresh weights into its own buffer at every call (gradients still reach them; much faster)."""
+    """Parametrized RNN weights are recomputed every call, so the RNN's weight list is refreshed before every call."""
     orig = rnn.forward
 
     def forward(*args, **kwargs):
@@ -425,7 +431,7 @@ def _rnn_without_cudnn(rnn: nn.RNNBase, keep_cudnn: bool = False) -> None:
     rnn.forward = forward
 
 
-# ---------------------------------------------------------------------------- (IA)^3
+# --- (IA)^3
 class IA3(nn.Module):
     """A learned vector l (starts at 1, so no change at the start) that multiplies a tensor channel-wise."""
 
@@ -449,28 +455,36 @@ def _ia3_out_hook(vec):
         if torch.is_tensor(out) or isinstance(out, PackedSequence):
             return scale(out)
         if isinstance(out, (tuple, list)) and out and (torch.is_tensor(out[0]) or isinstance(out[0], PackedSequence)):
-            return type(out)([scale(out[0])] + list(out[1:])) if isinstance(out, list) else \
-                (scale(out[0]),) + tuple(out[1:])
+            return (
+                type(out)([scale(out[0])] + list(out[1:]))
+                if isinstance(out, list)
+                else (scale(out[0]),) + tuple(out[1:])
+            )
         raise RuntimeError(f"(IA)^3: cannot handle an output of type {type(out).__name__}")
+
     return hook
 
 
 def _ia3_in_hook(vec):
     def hook(mod, args):
         return (vec(args[0]),) + tuple(args[1:])
+
     return hook
 
 
 def apply_ia3(clf: nn.Module, model: nn.Module, used: set[str], cfg: dict, log=print) -> Hooks:
-    lin = [(n, m) for n, m, _ in targets(model, used) if isinstance(m, nn.Linear)
-           and min(m.in_features, m.out_features) >= cfg["ia3_min_dim"]]
+    lin = [
+        (n, m)
+        for n, m, _ in targets(model, used)
+        if isinstance(m, nn.Linear) and min(m.in_features, m.out_features) >= cfg["ia3_min_dim"]
+    ]
     rnns = rnn_modules(model, used)
     if not lin and not rnns:
         raise RuntimeError("(IA)^3: no linear layers or RNN modules found")
     vecs, n_in, n_out = [], 0, 0
     dev = next(model.parameters()).device
     for _, m in lin:
-        if m.in_features > m.out_features:             # second feed-forward layer: scale its input
+        if m.in_features > m.out_features:
             v = IA3(m.in_features).to(dev)
             m.register_forward_pre_hook(_ia3_in_hook(v))
             n_in += 1
@@ -484,19 +498,21 @@ def apply_ia3(clf: nn.Module, model: nn.Module, used: set[str], cfg: dict, log=p
         r.register_forward_hook(_ia3_out_hook(v))
         vecs.append(v)
     clf.ia3 = nn.ModuleList(vecs)
-    hooks = Hooks("ia3", list(clf.ia3.parameters()),
-                  dict(vectors=len(vecs), linear_out=n_out, linear_in=n_in, rnn=len(rnns),
-                       values=sum(v.l.numel() for v in vecs)))
-    log(f"[technique] (IA)^3: {len(vecs)} learned scaling vectors ({n_out} on linear-layer outputs, {n_in} on the "
-        f"inputs of width-reducing linear layers, {len(rnns)} on RNN outputs), {hooks.info['values']} values")
+    hooks = Hooks(
+        "ia3",
+        list(clf.ia3.parameters()),
+        dict(vectors=len(vecs), linear_out=n_out, linear_in=n_in, rnn=len(rnns), values=sum(v.l.numel() for v in vecs)),
+    )
+    log(
+        f"[technique] (IA)^3: {len(vecs)} learned scaling vectors ({n_out} on linear-layer outputs, {n_in} on the "
+        f"inputs of width-reducing linear layers, {len(rnns)} on RNN outputs), {hooks.info['values']} values"
+    )
     return hooks
 
 
-# ---------------------------------------------------------------------------- apply
+# --- apply
 def apply(clf: nn.Module, technique: str, used: set[str], cfg: dict, total_steps: int, log=print) -> Hooks:
-    """Sets up `technique` on clf.encoder.model (the Phase 1 model inside the classifier). `used`: names (relative
-    to that model) of the parameters that get a gradient for this task. Returns the hooks; every Phase 1
-    parameter not in hooks.body_params is frozen."""
+    """Sets up `technique` on clf.encoder.model (the Phase 1 model inside the classifier)."""
     if technique not in TECHNIQUES:
         raise ValueError(f"technique must be one of {TECHNIQUES}")
     cfg = {**TECH_DEFAULTS, **cfg}
@@ -513,15 +529,18 @@ def apply(clf: nn.Module, technique: str, used: set[str], cfg: dict, total_steps
         hooks = Hooks(technique, [params[n] for n in params if n in used])
     elif technique == "partial":
         k = max(1, math.ceil(len(layers) * cfg["partial_frac"]))
-        names = [n for g in layers[len(layers) - k:] for n in g] + top
-        hooks = Hooks(technique, [params[n] for n in names],
-                      dict(layers_trained=k, layers=len(layers), layer_kind=kind))
+        names = [n for g in layers[len(layers) - k :] for n in g] + top
+        hooks = Hooks(
+            technique, [params[n] for n in names], dict(layers_trained=k, layers=len(layers), layer_kind=kind)
+        )
         log(f"[technique] partial: top {k} of {len(layers)} {kind} (+ {len(top)} tensors above them) are trained")
     elif technique == "unfreeze":
         hooks = UnfreezeHooks(params, bottom, layers, top, total_steps, cfg["unfreeze_stages"])
         hooks.info["layer_kind"] = kind
-        log(f"[technique] gradual unfreezing over {hooks.stages} stages of {len(layers)} {kind}: head only, "
-            f"then more {kind} from the top, embeddings in the last stage")
+        log(
+            f"[technique] gradual unfreezing over {hooks.stages} stages of {len(layers)} {kind}: head only, "
+            f"then more {kind} from the top, embeddings in the last stage"
+        )
     elif technique == "bitfit":
         biases = [params[n] for n in params if n in used and n.split(".")[-1].startswith("bias")]
         added = []
@@ -531,8 +550,10 @@ def apply(clf: nn.Module, technique: str, used: set[str], cfg: dict, total_steps
                 m.bias = nn.Parameter(torch.zeros(m.out_features, device=m.weight.device, dtype=m.weight.dtype))
                 added.append(m.bias)
         hooks = Hooks(technique, biases + added, dict(existing_biases=len(biases), added_biases=len(added)))
-        log(f"[technique] BitFit: {len(biases)} existing bias tensors"
-            + (f" + {len(added)} zero biases added to linear layers that had none" if added else ""))
+        log(
+            f"[technique] BitFit: {len(biases)} existing bias tensors"
+            + (f" + {len(added)} zero biases added to linear layers that had none" if added else "")
+        )
         if not biases and not added:
             raise RuntimeError("BitFit: the model has no bias values and no linear layers to add them to")
     elif technique in LOW_RANK:
@@ -560,7 +581,7 @@ def apply(clf: nn.Module, technique: str, used: set[str], cfg: dict, total_steps
             parametrize.register_parametrization(m, pn, pm)
             orig = m.parametrizations[pn].original
             orig.requires_grad_(False)
-            if technique == "qlora":            # the 4-bit codes replace the full-precision original
+            if technique == "qlora":
                 orig.data = torch.empty(0, device=orig.device, dtype=orig.dtype)
             mods.append((f"{mname}.{pn}" if mname else pn, pm))
             if isinstance(m, nn.RNNBase):
@@ -568,36 +589,56 @@ def apply(clf: nn.Module, technique: str, used: set[str], cfg: dict, total_steps
         for r in rnns.values():
             _rnn_without_cudnn(r, keep_cudnn=bool(cfg["rnn_cudnn"]))
         if rnns:
-            log(f"[technique] {len(rnns)} RNN module(s) with changed weights: cuDNN "
-                + ("kept (weights copied at every call)" if cfg["rnn_cudnn"] else "switched off for them"))
+            log(
+                f"[technique] {len(rnns)} RNN module(s) with changed weights: cuDNN "
+                + ("kept (weights copied at every call)" if cfg["rnn_cudnn"] else "switched off for them")
+            )
         n_lin = sum(1 for _, m, _ in tg if isinstance(m, nn.Linear))
         if technique in ("lora", "qlora"):
-            info = dict(matrices=len(mods), linear=n_lin, rnn=len(mods) - n_lin, r=cfg["lora_r"],
-                        alpha=cfg["lora_alpha"])
+            info = dict(
+                matrices=len(mods), linear=n_lin, rnn=len(mods) - n_lin, r=cfg["lora_r"], alpha=cfg["lora_alpha"]
+            )
             if technique == "qlora":
-                info.update(block=cfg["qlora_block"], quantized_params=sum(math.prod(pm.shape) for _, pm in mods),
-                            frozen_mb_4bit=q_bytes / 2 ** 20,
-                            frozen_mb_full=full_bytes / 2 ** 20, rel_error_mean=sum(q_err) / len(q_err))
+                info.update(
+                    block=cfg["qlora_block"],
+                    quantized_params=sum(math.prod(pm.shape) for _, pm in mods),
+                    frozen_mb_4bit=q_bytes / 2**20,
+                    frozen_mb_full=full_bytes / 2**20,
+                    rel_error_mean=sum(q_err) / len(q_err),
+                )
             hooks = Hooks(technique, [p for _, pm in mods for p in (pm.A, pm.B)], info)
-            log(f"[technique] {'QLoRA' if technique == 'qlora' else 'LoRA'} rank {cfg['lora_r']} (scale "
+            log(
+                f"[technique] {'QLoRA' if technique == 'qlora' else 'LoRA'} rank {cfg['lora_r']} (scale "
                 f"{cfg['lora_alpha'] / cfg['lora_r']:g}) on {len(mods)} weight matrices ({n_lin} linear, "
                 f"{len(mods) - n_lin} RNN)"
-                + (f"; fixed weights in 4-bit NF4 (blocks of {cfg['qlora_block']}): {q_bytes / 2 ** 20:.1f} MB instead "
-                   f"of {full_bytes / 2 ** 20:.1f} MB, mean relative error {info['rel_error_mean']:.3f}"
-                   if technique == "qlora" else ""))
+                + (
+                    f"; fixed weights in 4-bit NF4 (blocks of {cfg['qlora_block']}): {q_bytes / 2**20:.1f} MB instead "
+                    f"of {full_bytes / 2**20:.1f} MB, mean relative error {info['rel_error_mean']:.3f}"
+                    if technique == "qlora"
+                    else ""
+                )
+            )
         elif technique == "lorma":
-            hooks = Hooks(technique, [p for _, pm in mods for p in (pm.A, pm.B)],
-                          dict(matrices=len(mods), linear=n_lin, rnn=len(mods) - n_lin, r=cfg["lorma_r"],
-                               alpha=cfg["lorma_alpha"]))
-            log(f"[technique] LoRMA+ rank {cfg['lorma_r']} (scale {cfg['lorma_alpha'] / cfg['lorma_r']:g}) on "
-                f"{len(mods)} weight matrices ({n_lin} linear, {len(mods) - n_lin} RNN)")
+            hooks = Hooks(
+                technique,
+                [p for _, pm in mods for p in (pm.A, pm.B)],
+                dict(
+                    matrices=len(mods), linear=n_lin, rnn=len(mods) - n_lin, r=cfg["lorma_r"], alpha=cfg["lorma_alpha"]
+                ),
+            )
+            log(
+                f"[technique] LoRMA+ rank {cfg['lorma_r']} (scale {cfg['lorma_alpha'] / cfg['lorma_r']:g}) on "
+                f"{len(mods)} weight matrices ({n_lin} linear, {len(mods) - n_lin} RNN)"
+            )
         else:
             hooks = AdaLoRAHooks(mods, total_steps, cfg)
-            log(f"[technique] AdaLoRA on {len(mods)} weight matrices ({n_lin} linear, {len(mods) - n_lin} RNN): "
-                f"rank {cfg['adalora_r0']} each at the start, {cfg['adalora_r']} on average at the end")
+            log(
+                f"[technique] AdaLoRA on {len(mods)} weight matrices ({n_lin} linear, {len(mods) - n_lin} RNN): "
+                f"rank {cfg['adalora_r0']} each at the start, {cfg['adalora_r']} on average at the end"
+            )
     elif technique == "ia3":
         hooks = apply_ia3(clf, model, used, cfg, log)
-    else:  # adapter
+    else:
         found = blocks_of(model, used)
         if found:
             where = [b for _, b in found[1]]
@@ -614,6 +655,7 @@ def apply(clf: nn.Module, technique: str, used: set[str], cfg: dict, total_steps
                 t = _first_tensor(out)
                 if t is not None:
                     dims[i] = t.size(-1)
+
             return hook
 
         for i, w in enumerate(where):
@@ -633,8 +675,9 @@ def apply(clf: nn.Module, technique: str, used: set[str], cfg: dict, total_steps
         clf.adapters = adapters
         for w, a in zip(where, adapters):
             w.register_forward_hook(_adapter_hook(a))
-        hooks = Hooks(technique, list(adapters.parameters()), dict(adapters=len(where), dim=cfg["adapter_dim"],
-                                                                   where=what))
+        hooks = Hooks(
+            technique, list(adapters.parameters()), dict(adapters=len(where), dim=cfg["adapter_dim"], where=what)
+        )
         log(f"[technique] adapters (d -> {cfg['adapter_dim']} -> d, start as identity) after {what}")
 
     for p in hooks.body_params:

@@ -1,12 +1,6 @@
-"""Self-test of knowledge distillation (rr_kd.py and the kd_* settings of rr_train.py) on tiny stand-in
-models and fake data. Needs torch and peft. About two minutes.   python test_rr_kd.py -> every line PASS
+"""Self-test of knowledge distillation (rr_kd.py and the kd_* settings of rr_train.py) on tiny stand-in models and fake
+data."""
 
-Checks: the teacher term is 0 when the student already matches the teacher; the student keeps only the
-first blocks (also for a model that loops over a stored layer count) and the teacher's model is not
-changed; teacher probabilities reach the right sentences (a student taught only by a gold-like teacher
-learns the roles); bad teacher files are refused; the whole experiment (teacher out-of-fold, two
-students, comparison, reuse of finished runs).
-"""
 import json
 import os
 import sys
@@ -50,22 +44,25 @@ def _check_zip(path, data):
     assert set(pred) == set(test) and all(len(pred[k]) == len(test[k]) for k in test), path
 
 
-# ------------------------------------------------------------------------------- tests
+# --- tests
 def test_kd_loss():
     lp = torch.log_softmax(torch.randn(5, 13), -1)
-    assert kd_loss(lp, lp, 2.0).abs().item() < 1e-5                    # student = teacher -> nothing to learn
+    assert kd_loss(lp, lp, 2.0).abs().item() < 1e-5
     z = torch.randn(5, 13, requires_grad=True)
     loss = kd_loss(z, lp, 2.0)
     loss.backward()
     assert loss.item() > 0 and z.grad.abs().sum() > 0
-    q = torch.log_softmax(z.detach(), -1)                               # T = 1: plain KL(teacher || student)
+    q = torch.log_softmax(z.detach(), -1)
     want = (lp.exp() * (lp - q)).sum(-1).mean().item()
     assert abs(kd_loss(z.detach(), lp, 1.0).item() - want) < 1e-5
 
 
 def test_make_student():
-    for model_cls, blocks, fields in ((ToyLlama, "layers", []), (ToyGPT, "h", []),
-                                      (ToyLlamaCount, "layers", ["model.n_layers"])):
+    for model_cls, blocks, fields in (
+        (ToyLlama, "layers", []),
+        (ToyGPT, "h", []),
+        (ToyLlamaCount, "layers", ["model.n_layers"]),
+    ):
         bb = _bb(model_cls())
         sbb, info = KD.make_student(bb, WordTok(), keep=0.5, verbose=False)
         assert (info["blocks"], info["layers_teacher"], info["layers_student"]) == (blocks, 2, 1), info
@@ -90,7 +87,7 @@ def test_teacher_reaches_the_right_sentences():
         train = [d for d in D.load_docs(data) if d["split"] == "train"]
         li = {l: i for i, l in enumerate(labels)}
 
-        def gold_like(d):                                               # 97% on the gold role
+        def gold_like(d):
             p = torch.full((len(d["labels"]), len(labels)), 0.0025)
             p[torch.arange(len(d["labels"])), torch.tensor([li[l] for l in d["labels"]])] = 0.97
             return p.log()
@@ -99,9 +96,11 @@ def test_teacher_reaches_the_right_sentences():
         path = os.path.join(tmp, "teacher.pt")
         torch.save(good, path)
         assert [t.shape[0] for t in teacher_targets(path, train, labels)] == [len(d["labels"]) for d in train]
-        for name, broken in (("shape", {**good, "train": {**good["train"], train[0]["id"]: torch.zeros(1, 13)}}),
-                             ("missing", {**good, "train": {d["id"]: gold_like(d) for d in train[1:]}}),
-                             ("labels", {**good, "labels": labels[::-1]})):
+        for name, broken in (
+            ("shape", {**good, "train": {**good["train"], train[0]["id"]: torch.zeros(1, 13)}}),
+            ("missing", {**good, "train": {d["id"]: gold_like(d) for d in train[1:]}}),
+            ("labels", {**good, "labels": labels[::-1]}),
+        ):
             bad = os.path.join(tmp, f"bad_{name}.pt")
             torch.save(broken, bad)
             try:
@@ -110,10 +109,21 @@ def test_teacher_reaches_the_right_sentences():
             except ValueError:
                 pass
         bb = _bb(ToyLlama())
-        common = dict(data_root=data, out_dir=os.path.join(tmp, "runs"), method="full", epochs=3, b_epochs=2,
-                      batch_size=16, max_len=32, lr_backbone=3e-3, lr_head=3e-3, log_every=0, save_model=False)
+        common = dict(
+            data_root=data,
+            out_dir=os.path.join(tmp, "runs"),
+            method="full",
+            epochs=3,
+            b_epochs=2,
+            batch_size=16,
+            max_len=32,
+            lr_backbone=3e-3,
+            lr_head=3e-3,
+            log_every=0,
+            save_model=False,
+        )
         plain = run(bb, run_name="plain", **common)["metrics"]
-        taught = run(bb, run_name="taught", kd_teacher=path, kd_alpha=0.0, **common)["metrics"]   # teacher only
+        taught = run(bb, run_name="taught", kd_teacher=path, kd_alpha=0.0, **common)["metrics"]
         a_plain = plain["stage_a"]["dev"]["all"]["macro_f1_all13"]
         a_taught = taught["stage_a"]["dev"]["all"]["macro_f1_all13"]
         print(f"      Stage A dev 13-role avg: gold labels {a_plain:.3f}, gold-like teacher only {a_taught:.3f}")
@@ -142,7 +152,7 @@ def test_run_kd_end_to_end():
             lp = t["train"][d["id"]]
             assert lp.shape == (len(d["labels"]), 13)
             assert torch.allclose(lp.exp().sum(-1), torch.ones(len(d["labels"])), atol=1e-4)
-        assert sorted(sum(t["folds"], [])) == sorted(d["id"] for d in train)      # each judgment held out once
+        assert sorted(sum(t["folds"], [])) == sorted(d["id"] for d in train)
         assert len(t["dev"]) == 4 and len(t["test"]) == 4
         assert os.path.exists(os.path.join(out, "k_teacher", "teacher_fold2.pt"))
         _check_zip(os.path.join(out, "k_teacher", "stageB", "submission.zip"), data)
@@ -153,16 +163,23 @@ def test_run_kd_end_to_end():
         assert res["student_kd"]["config"]["kd_teacher"].endswith("teacher.pt")
         assert res["student"]["config"]["kd_teacher"] is None
         text = open(os.path.join(out, "k_comparison.txt")).read()
-        for s in ("KNOWLEDGE DISTILLATION SUMMARY", "student_kd", "effect of the teacher term", "Stage B, CL",
-                  "average probability of the gold role"):
+        for s in (
+            "KNOWLEDGE DISTILLATION SUMMARY",
+            "student_kd",
+            "effect of the teacher term",
+            "Stage B, CL",
+            "average probability of the gold role",
+        ):
             assert s in text, s
         rows = json.load(open(os.path.join(out, "k_comparison.json")))
         assert rows["student_kd"]["kd"]["student"]["layers_student"] == 1
-        for k, v in bb.model.state_dict().items():                               # the Phase 1 model is unchanged
+        for k, v in bb.model.state_dict().items():
             assert torch.equal(v.cpu(), before[k]), k
-        again = KD.run_kd(bb, WordTok(), prefix="k", folds=2, data_root=data, out_dir=out, **FAST)  # reused
-        assert (again["student_kd"]["stage_b"]["dev"]["all"]["macro_f1_all13"]
-                == res["student_kd"]["stage_b"]["dev"]["all"]["macro_f1_all13"])
+        again = KD.run_kd(bb, WordTok(), prefix="k", folds=2, data_root=data, out_dir=out, **FAST)
+        assert (
+            again["student_kd"]["stage_b"]["dev"]["all"]["macro_f1_all13"]
+            == res["student_kd"]["stage_b"]["dev"]["all"]["macro_f1_all13"]
+        )
 
 
 if __name__ == "__main__":
@@ -174,6 +191,7 @@ if __name__ == "__main__":
                 print(f"PASS {name}")
             except Exception as e:  # noqa: BLE001
                 import traceback
+
                 traceback.print_exc()
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}")

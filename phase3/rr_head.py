@@ -1,21 +1,5 @@
-"""Phase 3: sentence-level classification head on top of a Phase 1 model.
+"""Phase 3: sentence-level classification head on top of a Phase 1 model."""
 
-Works with any of our Phase 1 architectures without editing their code:
-  * decoders (GPT-style, Llama-style, MoE): captures the INPUT of the LM-head Linear,
-    i.e. the final hidden states [B, T, d], and stops the forward pass there, so the
-    12k-vocabulary logits are never computed.
-  * encoder-decoder: captures the OUTPUT of a named submodule (e.g. "encoder"), or uses
-    a `call` that returns the encoder states directly (mode="output").
-  * if a model defines `hidden_states(idx)`, that method is used directly.
-rr_backbone.make_backbone() picks the right option automatically.
-
-Usage
------
-    clf = SentenceClassifier(backbone, n_labels=13, pooling="last")   # decoders
-    clf = SentenceClassifier(backbone, n_labels=13, pooling="mean",
-                             module_name="encoder", mode="module_out")  # enc-dec
-    logits = clf(ids, mask)          # ids, mask: LongTensor [B, T]; mask=1 for real tokens
-"""
 from __future__ import annotations
 
 import math
@@ -29,7 +13,7 @@ class _StopForward(Exception):
     pass
 
 
-# ----------------------------------------------------------------------------- helpers
+# --- helpers
 def first_tensor(out):
     """The hidden-state tensor inside whatever a module returns (tensor, tuple, list, dict)."""
     if torch.is_tensor(out):
@@ -49,13 +33,8 @@ def first_tensor(out):
     return None
 
 
-
 def find_lm_head(model: nn.Module) -> str | None:
-    """Name of the Linear layer that maps hidden states to the vocabulary.
-    1) a Linear whose weight is tied to a token embedding, else
-    2) among Linears whose output size equals an embedding table's size, preferring those
-       outside the numbered blocks: the largest output (the vocabulary), then a typical name.
-    (A position table can be as large as a feed-forward layer, so size alone is not enough.)"""
+    """Name of the Linear layer that maps hidden states to the vocabulary."""
     embs = [m for m in model.modules() if isinstance(m, nn.Embedding)]
     if not embs:
         return None
@@ -79,13 +58,13 @@ def count_params(module: nn.Module, trainable_only: bool = True) -> int:
     seen, total = set(), 0
     for p in module.parameters():
         if id(p) in seen or (trainable_only and not p.requires_grad):
-            continue  # tied weights are counted once
+            continue
         seen.add(id(p))
         total += p.numel()
     return total
 
 
-def freeze_backbone(clf: "SentenceClassifier") -> None:
+def freeze_backbone(clf: SentenceClassifier) -> None:
     """Freeze every Phase 1 weight; pooling, position table and head stay trainable."""
     for p in clf.encoder.parameters():
         p.requires_grad_(False)
@@ -112,25 +91,20 @@ def load_phase1(model: nn.Module, path: str, min_loaded: float = 0.95) -> dict:
     if missing:
         print("[load_phase1] not loaded (first 10):", missing[:10])
     if frac < min_loaded:
-        raise RuntimeError(f"only {frac:.1%} of the model's weights were found in the checkpoint; "
-                           "check the architecture/config matches the checkpoint")
+        raise RuntimeError(
+            f"only {frac:.1%} of the model's weights were found in the checkpoint; "
+            "check the architecture/config matches the checkpoint"
+        )
     return ck
 
 
-# ------------------------------------------------------------------- hidden states
+# --- hidden states
 class HiddenStates(nn.Module):
-    """Runs a Phase 1 model and returns hidden states [B, T, d] instead of LM logits.
-
-    mode="pre_head":   input of the LM-head Linear (auto-detected, or module_name)
-    mode="module_out": output of `module_name` (first element if it returns a tuple)
-    mode="output":     `call` itself returns the hidden states (e.g. m.encoder(ids))
-    call(model, ids, mask): how to run the model; default model(ids)
-    """
+    """Runs a Phase 1 model and returns hidden states [B, T, d] instead of LM logits."""
 
     MODES = ("pre_head", "module_out", "output")
 
-    def __init__(self, model: nn.Module, module_name: str | None = None, mode: str = "pre_head",
-                 call=None):
+    def __init__(self, model: nn.Module, module_name: str | None = None, mode: str = "pre_head", call=None):
         super().__init__()
         if mode not in self.MODES:
             raise ValueError(f"mode must be one of {self.MODES}")
@@ -139,15 +113,20 @@ class HiddenStates(nn.Module):
         self.call = call or (lambda m, ids, mask: m(ids))
         self.target_name = None
         self._target = []
-        self.use_method = (callable(getattr(model, "hidden_states", None)) and module_name is None
-                           and mode != "output" and call is None)
+        self.use_method = (
+            callable(getattr(model, "hidden_states", None))
+            and module_name is None
+            and mode != "output"
+            and call is None
+        )
         if not self.use_method and mode != "output":
             name = module_name or (find_lm_head(model) if mode == "pre_head" else None)
             if name is None:
-                raise ValueError("could not find the module to read hidden states from; "
-                                 "pass module_name=... explicitly (e.g. 'lm_head' or 'encoder')")
+                raise ValueError(
+                    "could not find the module to read hidden states from; "
+                    "pass module_name=... explicitly (e.g. 'lm_head' or 'encoder')"
+                )
             self.target_name = name
-            # kept in a list so it is not registered a second time as a submodule
             self._target = [dict(model.named_modules())[name]]
 
     def forward(self, ids: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -160,14 +139,18 @@ class HiddenStates(nn.Module):
         else:
             box = {}
             if self.mode == "pre_head":
+
                 def hook(mod, args):
                     box["h"] = args[0]
                     raise _StopForward
+
                 handle = self._target[0].register_forward_pre_hook(hook)
             else:
+
                 def hook(mod, args, out):
                     box["h"] = first_tensor(out)
                     raise _StopForward
+
                 handle = self._target[0].register_forward_hook(hook)
             try:
                 self.call(self.model, ids, mask)
@@ -185,13 +168,14 @@ class HiddenStates(nn.Module):
                 f"hidden states have shape {tuple(h.shape)} but input is {tuple(ids.shape)}. "
                 "The model probably applies its LM head only to the last position at inference "
                 "(nanoGPT style). Add a method `hidden_states(self, idx)` to the model that returns "
-                "the final normed hidden states for every position.")
+                "the final normed hidden states for every position."
+            )
         return h
 
 
-# ------------------------------------------------------------------------- pooling
+# --- pooling
 class Pooler(nn.Module):
-    """Token vectors [B, T, d] -> one sentence vector [B, d]. Handles left or right padding."""
+    """Token vectors [B, T, d] -> one sentence vector [B, d]."""
 
     KINDS = ("last", "first", "mean", "max", "attn")
 
@@ -202,7 +186,7 @@ class Pooler(nn.Module):
         self.kind = kind
         if kind == "attn":
             self.score = nn.Linear(d_model, 1)
-            nn.init.zeros_(self.score.weight)   # starts as a plain mean
+            nn.init.zeros_(self.score.weight)
             nn.init.zeros_(self.score.bias)
 
     def forward(self, h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -227,26 +211,28 @@ class Pooler(nn.Module):
         return (w.unsqueeze(-1).to(h.dtype) * h).sum(1)
 
 
-# ---------------------------------------------------------------------- classifier
+# --- classifier
 class SentenceClassifier(nn.Module):
-    """Phase 1 backbone -> hidden states -> pooling -> dropout -> head -> role scores.
+    """Phase 1 backbone -> hidden states -> pooling -> dropout -> head -> role scores."""
 
-    forward(ids, mask, pool_mask=None, pos=None)
-      mask:      1 for every real token (attention / padding)
-      pool_mask: 1 for the tokens to pool over (e.g. only the target sentence when
-                 neighbouring sentences are given as context); defaults to mask
-      pos:       LongTensor [B] of position buckets (sentence position in the document),
-                 used only if pos_buckets > 0
-    """
-
-    def __init__(self, backbone: nn.Module, n_labels: int, pooling: str = "last",
-                 head: str = "linear", dropout: float = 0.1, d_model: int | None = None,
-                 module_name: str | None = None, mode: str = "pre_head", call=None,
-                 pos_buckets: int = 0, pos_dim: int = 32):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        n_labels: int,
+        pooling: str = "last",
+        head: str = "linear",
+        dropout: float = 0.1,
+        d_model: int | None = None,
+        module_name: str | None = None,
+        mode: str = "pre_head",
+        call=None,
+        pos_buckets: int = 0,
+        pos_dim: int = 32,
+    ):
         super().__init__()
         self.encoder = HiddenStates(backbone, module_name=module_name, mode=mode, call=call)
         self.n_labels = n_labels
-        self.n_prompt = 0           # set by prompt tuning (peft_methods.add_prompt_tuning)
+        self.n_prompt = 0
         self.prompt_fill_id = 1
         if d_model is None:
             d_model = self._infer_width(backbone)
@@ -258,8 +244,12 @@ class SentenceClassifier(nn.Module):
         if head == "linear":
             self.head = nn.Linear(self.feat_dim, n_labels)
         elif head == "mlp":
-            self.head = nn.Sequential(nn.Linear(self.feat_dim, self.feat_dim), nn.GELU(),
-                                      nn.Dropout(dropout), nn.Linear(self.feat_dim, n_labels))
+            self.head = nn.Sequential(
+                nn.Linear(self.feat_dim, self.feat_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.feat_dim, n_labels),
+            )
         else:
             raise ValueError("head must be 'linear' or 'mlp'")
 
@@ -300,49 +290,11 @@ class SentenceClassifier(nn.Module):
         return self.head(self.drop(self.features(ids, mask, pool_mask, pos)))
 
 
-class DocClassifier(nn.Module):
-    """Document-level context: sentence vectors of a whole judgment -> BiGRU over the
-    sentence sequence -> head per sentence. One document per forward call.
-
-    The Phase 1 backbone is run over the document's sentences in chunks; with
-    checkpointing=True activations are recomputed in the backward pass to save memory."""
-
-    def __init__(self, sent_clf: SentenceClassifier, d_ctx: int = 256, dropout: float = 0.1,
-                 chunk: int = 32, checkpointing: bool = True):
-        super().__init__()
-        self.sent = sent_clf
-        self.n_labels = sent_clf.n_labels
-        self.ctx = nn.GRU(sent_clf.feat_dim, d_ctx // 2, batch_first=True, bidirectional=True)
-        self.drop = nn.Dropout(dropout)
-        self.doc_head = nn.Linear(sent_clf.feat_dim + d_ctx, sent_clf.n_labels)
-        self.chunk = chunk
-        self.checkpointing = checkpointing
-
-    def head_parameters(self):
-        return self.sent.head_parameters() + list(self.ctx.parameters()) + list(self.doc_head.parameters())
-
-    def forward(self, ids, mask, pool_mask=None, pos=None):      # ids: [S, T] for one document
-        from torch.utils.checkpoint import checkpoint
-        vecs = []
-        for i in range(0, ids.size(0), self.chunk):
-            sl = slice(i, i + self.chunk)
-            args = (ids[sl], mask[sl], None if pool_mask is None else pool_mask[sl],
-                    None if pos is None else pos[sl])
-            if self.training and self.checkpointing and torch.is_grad_enabled():
-                vecs.append(checkpoint(self.sent.features, *args, use_reentrant=False))
-            else:
-                vecs.append(self.sent.features(*args))
-        x = torch.cat(vecs, 0).float()                            # [S, feat]
-        c, _ = self.ctx(self.drop(x).unsqueeze(0))                 # [1, S, d_ctx]
-        return self.doc_head(self.drop(torch.cat([x, c.squeeze(0)], -1)))
-
-
 N_DISTANCE_BUCKETS = 15
 
 
 def distance_buckets(S: int, device=None) -> torch.Tensor:
-    """[S, S] bucket of (j - i): how far sentence j is from sentence i and in which direction.
-    0 = same sentence; 1..7 = j after i by 1, 2, 3-4, 5-8, 9-16, 17-32, >32; 8..14 = j before i, same steps."""
+    """[S, S] bucket of (j - i): how far sentence j is from sentence i and in which direction."""
     i = torch.arange(S, device=device)
     d = i[None, :] - i[:, None]
     a = d.abs()
@@ -352,10 +304,7 @@ def distance_buckets(S: int, device=None) -> torch.Tensor:
 
 
 class SentenceAttention(nn.Module):
-    """Self-attention over the sentences of one judgment, written out by hand (queries, keys, values,
-    softmax). Every attention score also gets a learned number for the distance and direction between
-    the two sentences (distance_buckets), so the attention knows the order of the sentences. The output
-    projection starts at zero: the layer starts switched off and training turns it on where it helps."""
+    """Self-attention over the sentences of one judgment, written out by hand (queries, keys, values, softmax)."""
 
     def __init__(self, d: int, heads: int = 4, dropout: float = 0.1):
         super().__init__()
@@ -368,12 +317,12 @@ class SentenceAttention(nn.Module):
         self.dist = nn.Embedding(N_DISTANCE_BUCKETS, heads)
         nn.init.zeros_(self.dist.weight)
         self.drop = nn.Dropout(dropout)
-        self.last_weights = None                     # [B, heads, S, S] of the last call (for inspection)
+        self.last_weights = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:          # [B, S, d]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, S, d = x.shape
         q, k, v = (f(x).view(B, S, self.h, self.dk).transpose(1, 2) for f in (self.q, self.k, self.v))
-        att = q @ k.transpose(-1, -2) / math.sqrt(self.dk)       # [B, heads, S, S]
+        att = q @ k.transpose(-1, -2) / math.sqrt(self.dk)
         att = att + self.dist(distance_buckets(S, x.device)).permute(2, 0, 1).unsqueeze(0)
         w = att.softmax(-1)
         self.last_weights = w.detach()
@@ -395,17 +344,21 @@ class AttentionBlock(nn.Module):
 
 
 class ContextClassifier(nn.Module):
-    """Stage B: the sentence features of one judgment [S, F] (from a frozen Stage A) -> role scores [S, L].
-    arch="gru":      LayerNorm -> BiGRU over the sentence sequence -> [feature ; context] -> Linear
-    arch="gru_attn": the same, plus sentence attention on top of the BiGRU output (context + attention);
-                     it starts exactly as "gru" because the attention output starts at zero
-    arch="attn":     no BiGRU: Linear -> `attn_layers` attention blocks (order only from the distance
-                     numbers and the position feature) -> [feature ; context] -> Linear"""
+    """Stage B: the sentence features of one judgment [S, F] (from a frozen Stage A) -> role scores [S, L]."""
 
     ARCHS = ("gru", "gru_attn", "attn")
 
-    def __init__(self, feat_dim: int, n_labels: int, d_ctx: int = 256, dropout: float = 0.3,
-                 layers: int = 1, arch: str = "gru", heads: int = 4, attn_layers: int = 2):
+    def __init__(
+        self,
+        feat_dim: int,
+        n_labels: int,
+        d_ctx: int = 256,
+        dropout: float = 0.3,
+        layers: int = 1,
+        arch: str = "gru",
+        heads: int = 4,
+        attn_layers: int = 2,
+    ):
         super().__init__()
         if arch not in self.ARCHS:
             raise ValueError(f"arch must be one of {self.ARCHS}")
@@ -418,13 +371,19 @@ class ContextClassifier(nn.Module):
             self.blocks = nn.ModuleList([AttentionBlock(width, heads) for _ in range(attn_layers)])
         else:
             width = 2 * (d_ctx // 2)
-            self.gru = nn.GRU(feat_dim, d_ctx // 2, num_layers=layers, batch_first=True, bidirectional=True,
-                              dropout=dropout if layers > 1 else 0.0)
+            self.gru = nn.GRU(
+                feat_dim,
+                d_ctx // 2,
+                num_layers=layers,
+                batch_first=True,
+                bidirectional=True,
+                dropout=dropout if layers > 1 else 0.0,
+            )
         self.head = nn.Linear(feat_dim + width, n_labels)
-        if arch == "gru_attn":                 # created last, so the other weights start as in "gru"
+        if arch == "gru_attn":
             self.attn = SentenceAttention(width, heads)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:          # [S, F] or [1, S, F]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         single = x.dim() == 2
         if single:
             x = x.unsqueeze(0)
@@ -441,22 +400,22 @@ class ContextClassifier(nn.Module):
         return y.squeeze(0) if single else y
 
 
-# ------------------------------------------------------------------------- checks
+# --- checks
 @torch.no_grad()
-def padding_check(clf: SentenceClassifier, short_ids: list[int], long_ids: list[int],
-                  pad_id: int = 0) -> float:
-    """Max difference in the short sentence's scores alone vs. batched with a longer one.
-    ~0 means padding does not leak into predictions. A BiGRU encoder without packed
-    sequences will show a clear difference: then batch sentences of similar length."""
+def padding_check(clf: SentenceClassifier, short_ids: list[int], long_ids: list[int], pad_id: int = 0) -> float:
+    """Max difference in the short sentence's scores alone vs. batched with a longer one. ~0 means padding does not
+    leak into predictions."""
     was = clf.training
     clf.eval()
     dev = next(clf.parameters()).device
     a = torch.tensor([short_ids], device=dev)
     T = max(len(short_ids), len(long_ids))
     b = torch.full((2, T), pad_id, device=dev)
-    b[0, :len(short_ids)] = a[0]
-    b[1, :len(long_ids)] = torch.tensor(long_ids, device=dev)
-    mb = (torch.arange(T, device=dev).unsqueeze(0) < torch.tensor([[len(short_ids)], [len(long_ids)]], device=dev)).long()
+    b[0, : len(short_ids)] = a[0]
+    b[1, : len(long_ids)] = torch.tensor(long_ids, device=dev)
+    mb = (
+        torch.arange(T, device=dev).unsqueeze(0) < torch.tensor([[len(short_ids)], [len(long_ids)]], device=dev)
+    ).long()
     pos = None if getattr(clf, "pos_emb", None) is None else torch.zeros(2, dtype=torch.long, device=dev)
     alone = clf(a, torch.ones_like(a), pos=None if pos is None else pos[:1])
     batched = clf(b, mb, pos=pos)[:1]

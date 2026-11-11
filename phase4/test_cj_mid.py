@@ -1,6 +1,5 @@
-"""Self-test of mid-training (cj_mid.py) on tiny stand-in models. Needs torch. About a minute.
-    python test_cj_mid.py  -> every line PASS
-"""
+"""Self-test of mid-training (cj_mid.py) on tiny stand-in models."""
+
 import os
 import random
 import sys
@@ -14,10 +13,12 @@ import cj_mid as M  # noqa: E402
 from test_cj_train import V, ToyEncDec, ToyGPT, ToyLlama, WordTok  # noqa: E402
 
 torch.manual_seed(0)
-PHRASES = ["the appeal is allowed and the order of the high court is set aside",
-           "the petitioner submitted that the tribunal erred in law",
-           "learned counsel for the respondent relied on the judgment of this court",
-           "section 302 of the indian penal code was invoked against the accused"]
+PHRASES = [
+    "the appeal is allowed and the order of the high court is set aside",
+    "the petitioner submitted that the tribunal erred in law",
+    "learned counsel for the respondent relied on the judgment of this court",
+    "section 302 of the indian penal code was invoked against the accused",
+]
 
 
 def fake_texts(n, seed):
@@ -41,7 +42,7 @@ class ToyNanoGPT(ToyGPT):
 def test_windows():
     arrays = [np.arange(1, 6, dtype=np.int32), np.arange(10, 13, dtype=np.int32)]
     w = M.windows(arrays, eos_id=2, seq_len=3)
-    assert w.tolist() == [[1, 2, 3, 4], [5, 2, 10, 11]]           # stream 1..5, eos, 10..12, eos -> 2 windows
+    assert w.tolist() == [[1, 2, 3, 4], [5, 2, 10, 11]]
     assert M.windows(arrays, eos_id=None, seq_len=1).tolist() == [[1, 2], [3, 4], [5, 10], [11, 12]]
 
 
@@ -63,8 +64,18 @@ def test_mid_training_lowers_heldout_loss():
         torch.manual_seed(1)
         model = cls()
         before_w = {k: v.clone() for k, v in model.state_dict().items()}
-        cfg = dict(tokens=12_000, seq_len=32, batch_size=8, lr=3e-3, warmup_steps=5, eval_every=0, log_every=0,
-                   tok_workers=2, heldout_windows=32, data_parallel=False)
+        cfg = dict(
+            tokens=12_000,
+            seq_len=32,
+            batch_size=8,
+            lr=3e-3,
+            warmup_steps=5,
+            eval_every=0,
+            log_every=0,
+            tok_workers=2,
+            heldout_windows=32,
+            data_parallel=False,
+        )
         res = M.mid_train_model(model, enc, 2, fake_texts(300, 1), fake_texts(30, 2), cfg, log=lambda *a: None)
         print(f"      {cls.__name__}: held-out loss {res['heldout_before']:.3f} -> {res['heldout_after']:.3f}")
         assert res["heldout_after"] < res["heldout_before"] - 0.5, res
@@ -86,6 +97,7 @@ if __name__ == "__main__":
                 print(f"PASS {name}")
             except Exception as e:  # noqa: BLE001
                 import traceback
+
                 traceback.print_exc()
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}")

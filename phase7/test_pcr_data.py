@@ -1,11 +1,5 @@
-"""Self-test of pcr_data (no torch, a few seconds): python test_pcr_data.py -> every line PASS.
+"""Self-test of pcr_data (no torch, a few seconds): python test_pcr_data.py -> every line PASS."""
 
-Fake data: every split has its own pool of cases (random legal-ish words + a year); every query copies a few
-5-word phrases from 3-8 older pool cases (its relevant candidates) and has a later year. Checks: loading (text as a
-list of sentences), BM25 against a slow direct formula, micro-F1@7, the prediction file rules, lexical retrieval
-finds the planted citations, citation counts leave a training query's own labels out, rankers, fusion with an
-informative model score beats lexical alone.
-"""
 import json
 import math
 import os
@@ -28,7 +22,7 @@ def _sentences(words, rng):
     out, i = [], 0
     while i < len(words):
         k = rng.randint(6, 14)
-        out.append(" ".join(words[i:i + k]) + ".")
+        out.append(" ".join(words[i : i + k]) + ".")
         i += k
     return out
 
@@ -47,11 +41,11 @@ def make_fake_pcr(root, n_q=(60, 20, 20), n_pool=(150, 80, 80), seed=0, as_dict=
         for i in range(nq):
             rel = rng.sample(pool, rng.randint(3, 8))
             words = [rng.choice(WORDS) for _ in range(200)]
-            for c in rel:                                     # copied phrases from most cited cases
+            for c in rel:
                 for _ in range(rng.choice([0, 1, 3, 3])):
                     s = rng.randint(0, len(c["words"]) - 6)
                     pos = rng.randint(0, len(words))
-                    words[pos:pos] = c["words"][s:s + 5]
+                    words[pos:pos] = c["words"][s : s + 5]
             year = max(c["year"] for c in rel) + rng.randint(1, 10)
             q = dict(id=f"{split[:2]}q{i}", text=_sentences(words + ["decided", "in", str(year)], rng))
             if split != "test":
@@ -120,14 +114,14 @@ def test_lexical_ltr_fusion():
         data = PD.load_data(root, fetch=False)
         L = PD.lexical(data, ns=(1, 2, 3, 5), log=lambda *a: None)
         m5 = L["single"]["dev_bm25_5"]
-        assert m5["f1"] > 0.35, m5                   # copied 5-word phrases are found
+        assert m5["f1"] > 0.35, m5
         assert L["single"]["dev_bm25_1"]["f1"] < m5["f1"]
         P = PD.prior_counts(L, "train")
         sp = L["train"]
         pos = {c: j for j, c in enumerate(sp["pids"])}
         g0 = sp["gold"][sp["qids"][0]]
         cnt = Counter(c for g in sp["gold"].values() for c in g)
-        assert abs(P[0, pos[g0[0]]] - math.log1p(cnt[g0[0]] - 1)) < 1e-6      # own label left out
+        assert abs(P[0, pos[g0[0]]] - math.log1p(cnt[g0[0]] - 1)) < 1e-6
         path = os.path.join(tmp, "lex.pkl")
         PD.save_lexical(L, path)
         L = PD.load_lexical(path)
@@ -137,7 +131,6 @@ def test_lexical_ltr_fusion():
         sub = json.loads(zipfile.ZipFile(res["lexical_ltr"]["submission"]).read("prediction.json"))
         test_pool = {d["id"] for d in data["test"][1]}
         assert len(sub) == 20 and all(len(v) == 7 and set(v) <= test_pool for v in sub.values())
-        # an informative model score (gold + noise) fused with the lexical features beats lexical alone
         rng = np.random.default_rng(0)
 
         def fake_dense(split):
@@ -147,8 +140,16 @@ def test_lexical_ltr_fusion():
                 for c in gold_all[q]:
                     M[i, sp["pids"].index(c)] += 2.5
             return {"mean": M}
-        fr = PD.fused_submission(L, fake_dense("dev"), fake_dense("test"), os.path.join(out, "fake"), top=30,
-                                 dense_top=10, log=lambda *a: None)
+
+        fr = PD.fused_submission(
+            L,
+            fake_dense("dev"),
+            fake_dense("test"),
+            os.path.join(out, "fake"),
+            top=30,
+            dense_top=10,
+            log=lambda *a: None,
+        )
         assert fr["dev"]["f1"] > fr["lexical_logreg"]["f1"], fr
         assert fr["weights"]["mean"] > 0 and os.path.exists(fr["submission"])
         Bd = PD.build(L, "dev", top=30)
@@ -180,6 +181,7 @@ if __name__ == "__main__":
                 print(f"PASS {name}")
             except Exception as e:  # noqa: BLE001
                 import traceback
+
                 traceback.print_exc()
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}")

@@ -1,25 +1,5 @@
-"""Whole-case reading: the hierarchical (chunk-level) architecture of the best published CJPE systems, on our models.
+"""Whole-case reading: the hierarchical (chunk-level) architecture of the best published CJPE systems, on our models."""
 
-The published ILDC models do not read only the end of a judgment. They split it into chunks, encode every chunk with
-a fine-tuned language model, and combine the chunk vectors with a second, small model:
-  ILDC paper (Malik et al. 2021): XLNet fine-tuned on 512-token chunks + BiGRU over the chunk vectors (77.1 macro-F1);
-  HierBERT (Paul et al. 2022): chunk vectors of the last chunks + LSTM with attention (InLegalBERT 83.1);
-  two-level encoder (Prasad et al. 2023): chunk vectors + transformer encoder over the chunks (83.7 accuracy);
-  ToBERT / RoBERT (Pappagari et al. 2019): transformer / LSTM over chunk vectors.
-Here Stage A is one of our SFT runs (best with train_chunks > 1, i.e. fine-tuned on chunks) and Stage B is one of:
-  gru_attn     LayerNorm -> Linear -> BiGRU over the chunks -> attention pooling + last chunk -> 2 scores
-  transformer  LayerNorm -> Linear + chunk position (counted from the end) -> 2 self-attention blocks (written by us,
-               padding-aware) -> attention pooling + last chunk -> 2 scores
-  mean         LayerNorm -> Linear -> average over the chunks -> 2 scores
-and two untrained references: last (the SFT run's own prediction on the last chunk) and vote (average of the chunk
-predictions). Stage B is trained on the training cases' chunk vectors, with chunk dropout (sometimes only the last
-few chunks, sometimes without the last one) so it cannot rely on the last chunk alone; the epoch is chosen on dev.
-
-    from cj_hier import run_hier
-    run_hier("/kaggle/working/cj_runs_mid/llama_full", k=8)
-Outputs in <run>/hier_k<k>/<version>/ (dev_probs.json, test_probs.json, metrics.json, submission_tuned/,
-submission_050/) and the comparison <run>/hier_k<k>/hier.txt. Chunk vectors are cached in <run>/chunks_k<k>.pt.
-"""
 from __future__ import annotations
 
 import json
@@ -37,11 +17,24 @@ import cj_tech as T
 import cj_train as R
 
 VERSIONS = ("gru_attn", "transformer", "mean")
-HIER_DEFAULTS = dict(k=8, hidden=256, dropout=0.2, lr=1e-3, weight_decay=0.01, epochs=15, patience=4, batch=64,
-                     p_tail=0.3, p_drop_last=0.15, extract_batch=32, seed=42, device=None)
+HIER_DEFAULTS = dict(
+    k=8,
+    hidden=256,
+    dropout=0.2,
+    lr=1e-3,
+    weight_decay=0.01,
+    epochs=15,
+    patience=4,
+    batch=64,
+    p_tail=0.3,
+    p_drop_last=0.15,
+    extract_batch=32,
+    seed=42,
+    device=None,
+)
 
 
-# --------------------------------------------------------------------------- Stage A
+# --- Stage A
 def rebuild(run_dir: str, bb=None, ckpt: str | None = None, device=None, log=print):
     """The SFT run's classifier, rebuilt: Phase 1 / mid-trained model + the same technique + its trained tensors."""
     with open(os.path.join(run_dir, "config.json")) as f:
@@ -50,11 +43,15 @@ def rebuild(run_dir: str, bb=None, ckpt: str | None = None, device=None, log=pri
         name = json.load(f)["model"]
     if bb is None:
         from cj_models import load_backbone
+
         bb, _ = load_backbone(name, max_len=cfg["max_len"], path=ckpt or cfg.get("ckpt_path"), log=log)
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model, _ = R.make_model(bb, cfg, log=lambda *a: None)    # a KD student keeps only its first blocks
-    clf = bb.classifier(2, model=model, head=cfg["head"], dropout=cfg["dropout"],
-                        pooling=cfg["pooling"]).to(device).float()
+    model, _ = R.make_model(bb, cfg, log=lambda *a: None)
+    clf = (
+        bb.classifier(2, model=model, head=cfg["head"], dropout=cfg["dropout"], pooling=cfg["pooling"])
+        .to(device)
+        .float()
+    )
     g = torch.Generator().manual_seed(0)
     top = max(8, min(bb.vocab or 1000, 1000))
     probe = [torch.randint(5, top, (32,), generator=g).tolist() for _ in range(4)]
@@ -93,8 +90,8 @@ def chunk_vectors(clf, cases: list[list[list[int]]], cfg, device, pad_id, batch=
     out_f, out_p, k = [], [], 0
     for chunks in cases:
         m = len(chunks)
-        out_f.append(torch.stack(feats[k:k + m]))
-        out_p.append(torch.tensor(probs[k:k + m]))
+        out_f.append(torch.stack(feats[k : k + m]))
+        out_p.append(torch.tensor(probs[k : k + m]))
         k += m
     return out_f, out_p
 
@@ -115,23 +112,37 @@ def extract(run_dir: str, k: int = 8, bb=None, ckpt=None, device=None, batch=32,
     out = dict(k=k, stride=stride, max_len=n, run=run_dir, model=name, technique=cfg["technique"])
     t0 = time.time()
     for s, ds in data.items():
-        ids = D.encode_docs(ds, bb.encode, D.chunk_span(n, stride, k), "tail", workers=cfg["tok_workers"],
-                            cache_dir=cfg["cache_dir"], log=log)
-        wrap = lambda x: ([bb.bos_id] if bb.bos_id is not None else []) + (x or [0]) + (  # noqa: E731
-            [bb.eos_id] if bb.eos_id is not None else [])
+        ids = D.encode_docs(
+            ds,
+            bb.encode,
+            D.chunk_span(n, stride, k),
+            "tail",
+            workers=cfg["tok_workers"],
+            cache_dir=cfg["cache_dir"],
+            log=log,
+        )
+        wrap = lambda x: (
+            ([bb.bos_id] if bb.bos_id is not None else [])
+            + (x or [0])
+            + (  # noqa: E731
+                [bb.eos_id] if bb.eos_id is not None else []
+            )
+        )
         cases = [[wrap(c) for c in D.chunk_ids(x, n, stride, k)] for x in ids]
-        log(f"[hier] {s}: {len(cases)} cases, {sum(len(c) for c in cases)} chunks "
-            f"(average {sum(len(c) for c in cases) / max(1, len(cases)):.1f} per case)")
+        log(
+            f"[hier] {s}: {len(cases)} cases, {sum(len(c) for c in cases)} chunks "
+            f"(average {sum(len(c) for c in cases) / max(1, len(cases)):.1f} per case)"
+        )
         f, p = chunk_vectors(clf, cases, cfg, dev_, bb.pad_id, batch, log)
         out[s] = dict(ids=[d["id"] for d in ds], labels=[d["label"] for d in ds], feats=f, probs=p)
     out["minutes"] = (time.time() - t0) / 60
     torch.save(out, path)
-    log(f"[hier] chunk vectors saved to {path} ({os.path.getsize(path) / 2 ** 20:.0f} MB, {out['minutes']:.1f} min)")
+    log(f"[hier] chunk vectors saved to {path} ({os.path.getsize(path) / 2**20:.0f} MB, {out['minutes']:.1f} min)")
     clf.cpu()
     return out
 
 
-# --------------------------------------------------------------------------- Stage B
+# --- Stage B
 class MaskedAttention(nn.Module):
     """Self-attention over the chunks of a case, written out by hand; padded chunks are never attended to."""
 
@@ -141,7 +152,7 @@ class MaskedAttention(nn.Module):
         self.q, self.k, self.v, self.o = (nn.Linear(d, d) for _ in range(4))
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x, mask):                                  # x [B, K, d], mask [B, K] (True = real chunk)
+    def forward(self, x, mask):
         B, K, d = x.shape
         q, k, v = (f(x).view(B, K, self.h, self.dk).transpose(1, 2) for f in (self.q, self.k, self.v))
         att = q @ k.transpose(-1, -2) / math.sqrt(self.dk)
@@ -176,7 +187,7 @@ class HierHead(nn.Module):
         if version == "gru_attn":
             self.gru = nn.GRU(hidden, hidden // 2, batch_first=True, bidirectional=True)
         elif version == "transformer":
-            self.pos = nn.Embedding(k + 1, hidden)               # 0 = last chunk, 1 = the one before, ...
+            self.pos = nn.Embedding(k + 1, hidden)
             self.blocks = nn.ModuleList([Block(hidden, 4, dropout) for _ in range(2)])
         self.score = nn.Linear(hidden, 1)
         self.out = nn.Linear(hidden * (1 if version == "mean" else 2), 2)
@@ -207,14 +218,14 @@ class HierHead(nn.Module):
 
 def _pad(feats, idx, device, keep=None):
     """Right-padded batch [B, K, d] + mask for cases idx; keep[i] = (start, end) chunk range to use."""
-    sel = [feats[i] if keep is None else feats[i][keep[j][0]:keep[j][1]] for j, i in enumerate(idx)]
+    sel = [feats[i] if keep is None else feats[i][keep[j][0] : keep[j][1]] for j, i in enumerate(idx)]
     K = max(len(s) for s in sel)
     d = sel[0].size(-1)
     x = torch.zeros(len(sel), K, d, dtype=torch.float16)
     mask = torch.zeros(len(sel), K, dtype=torch.bool)
     for j, s in enumerate(sel):
-        x[j, :len(s)] = s
-        mask[j, :len(s)] = True
+        x[j, : len(s)] = s
+        mask[j, : len(s)] = True
     return x.to(device), mask.to(device)
 
 
@@ -245,15 +256,15 @@ def train_b(version, ch: dict, cfg: dict, device, log=print):
         rng.shuffle(order)
         tot, n = 0.0, 0
         for i in range(0, len(order), cfg["batch"]):
-            idx = order[i:i + cfg["batch"]]
+            idx = order[i : i + cfg["batch"]]
             keep = []
-            for c in idx:                                          # chunk dropout
+            for c in idx:
                 m = len(tr["feats"][c])
                 s, e = 0, m
                 if m > 1 and rng.random() < cfg["p_tail"]:
-                    s = m - rng.randint(1, m - 1)                  # only the last few chunks
+                    s = m - rng.randint(1, m - 1)
                 if e - s > 1 and rng.random() < cfg["p_drop_last"]:
-                    e -= 1                                         # without the last chunk
+                    e -= 1
                 keep.append((s, e))
             x, mask = _pad(tr["feats"], idx, device, keep)
             loss = F.cross_entropy(model(x, mask).float(), y[idx].to(device), weight=w)
@@ -265,8 +276,15 @@ def train_b(version, ch: dict, cfg: dict, device, log=print):
             n += len(idx)
         p = predict_b(model, dv["feats"], device)
         t, f = D.tune_threshold(dv["labels"], p)
-        hist.append(dict(epoch=ep, loss=tot / max(1, n), dev_f1_tuned=f, threshold=t,
-                         dev_f1_050=D.report(dv["labels"], p, 0.5)["macro_f1"]))
+        hist.append(
+            dict(
+                epoch=ep,
+                loss=tot / max(1, n),
+                dev_f1_tuned=f,
+                threshold=t,
+                dev_f1_050=D.report(dv["labels"], p, 0.5)["macro_f1"],
+            )
+        )
         mark = ""
         if f > best:
             best, best_ep, bad, mark = f, ep, 0, "  <- best so far"
@@ -282,7 +300,7 @@ def train_b(version, ch: dict, cfg: dict, device, log=print):
 
 def _write(out_dir, ch, p_dev, p_test, extra, data_test, p_train=None):
     os.makedirs(out_dir, exist_ok=True)
-    if p_train is not None:                                   # for knowledge distillation (teacher probabilities)
+    if p_train is not None:
         with open(os.path.join(out_dir, "train_probs.json"), "w") as f:
             json.dump(dict(zip(ch["train"]["ids"], p_train)), f)
     y = ch["dev"]["labels"]
@@ -314,28 +332,49 @@ def run_hier(run_dir: str, versions=VERSIONS, bb=None, ckpt=None, log=print, **o
     res = {}
     refs = {"last": lambda p: p[-1].item(), "vote": lambda p: p.mean().item()}
     for name, fn in refs.items():
-        res[name] = _write(os.path.join(base, name), ch, [fn(p) for p in ch["dev"]["probs"]],
-                           [fn(p) for p in ch["test"]["probs"]], dict(version=name, trained=False), test_docs,
-                           [fn(p) for p in ch["train"]["probs"]])
+        res[name] = _write(
+            os.path.join(base, name),
+            ch,
+            [fn(p) for p in ch["dev"]["probs"]],
+            [fn(p) for p in ch["test"]["probs"]],
+            dict(version=name, trained=False),
+            test_docs,
+            [fn(p) for p in ch["train"]["probs"]],
+        )
     for v in versions:
         t0 = time.time()
         model, info = train_b(v, ch, cfg, device, log)
-        res[v] = _write(os.path.join(base, v), ch, predict_b(model, ch["dev"]["feats"], device),
-                        predict_b(model, ch["test"]["feats"], device),
-                        dict(version=v, trained=True, minutes=(time.time() - t0) / 60,
-                             params=sum(p.numel() for p in model.parameters()), **info), test_docs,
-                        predict_b(model, ch["train"]["feats"], device))
-    lines = [f"Whole-case reading on {run_dir} (last {ch['k']} chunks, stride {ch['stride']}):",
-             f"{'version':14s} {'dev F1@0.5':>11s} {'dev F1@t':>9s} {'t':>5s} {'P0':>6s} {'R0':>6s} {'P1':>6s} "
-             f"{'R1':>6s}"]
+        res[v] = _write(
+            os.path.join(base, v),
+            ch,
+            predict_b(model, ch["dev"]["feats"], device),
+            predict_b(model, ch["test"]["feats"], device),
+            dict(
+                version=v,
+                trained=True,
+                minutes=(time.time() - t0) / 60,
+                params=sum(p.numel() for p in model.parameters()),
+                **info,
+            ),
+            test_docs,
+            predict_b(model, ch["train"]["feats"], device),
+        )
+    lines = [
+        f"Whole-case reading on {run_dir} (last {ch['k']} chunks, stride {ch['stride']}):",
+        f"{'version':14s} {'dev F1@0.5':>11s} {'dev F1@t':>9s} {'t':>5s} {'P0':>6s} {'R0':>6s} {'P1':>6s} {'R1':>6s}",
+    ]
     for v, m in sorted(res.items(), key=lambda kv: -kv[1]["dev_tuned"]["macro_f1"]):
         t = m["dev_tuned"]
-        lines.append(f"{v:14s} {m['dev_050']['macro_f1']:11.4f} {t['macro_f1']:9.4f} {t['threshold']:5.2f} "
-                     f"{t['class0']['precision']:6.3f} {t['class0']['recall']:6.3f} {t['class1']['precision']:6.3f} "
-                     f"{t['class1']['recall']:6.3f}")
+        lines.append(
+            f"{v:14s} {m['dev_050']['macro_f1']:11.4f} {t['macro_f1']:9.4f} {t['threshold']:5.2f} "
+            f"{t['class0']['precision']:6.3f} {t['class0']['recall']:6.3f} {t['class1']['precision']:6.3f} "
+            f"{t['class1']['recall']:6.3f}"
+        )
     best = max(res, key=lambda v: res[v]["dev_tuned"]["macro_f1"])
-    lines.append(f"'last' = the SFT run itself (last chunk only); 'vote' = average of the chunk predictions.\n"
-                 f"best on dev: {best} -> submit {res[best]['submissions']['tuned']}")
+    lines.append(
+        f"'last' = the SFT run itself (last chunk only); 'vote' = average of the chunk predictions.\n"
+        f"best on dev: {best} -> submit {res[best]['submissions']['tuned']}"
+    )
     text = "\n".join(lines)
     with open(os.path.join(base, "hier.txt"), "w") as f:
         f.write(text + "\n")
@@ -347,6 +386,7 @@ def run_hier_many(run_dirs, gpus: int | None = None, poll: int = 60, **overrides
     """run_hier for several SFT runs at once, one process per GPU (python cj_hier.py --run DIR ...)."""
     import subprocess
     import sys
+
     n_gpu = torch.cuda.device_count() if gpus is None else gpus
     here = os.path.dirname(os.path.abspath(__file__))
     queue = list(run_dirs)
@@ -361,9 +401,21 @@ def run_hier_many(run_dirs, gpus: int | None = None, poll: int = 60, **overrides
             if n_gpu:
                 env["CUDA_VISIBLE_DEVICES"] = str(gpu)
             fh = open(log_path, "w")
-            p = subprocess.Popen([sys.executable, "-u", os.path.join(here, "cj_hier.py"), "--run", run,
-                                  "--settings", json.dumps(overrides)], stdout=fh, stderr=subprocess.STDOUT,
-                                 env=env, cwd=here)
+            p = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-u",
+                    os.path.join(here, "cj_hier.py"),
+                    "--run",
+                    run,
+                    "--settings",
+                    json.dumps(overrides),
+                ],
+                stdout=fh,
+                stderr=subprocess.STDOUT,
+                env=env,
+                cwd=here,
+            )
             procs.append((p, gpu, fh, run))
             print(f"[hier] {run} on GPU {gpu} (log: {log_path})", flush=True)
         time.sleep(poll)
@@ -389,6 +441,7 @@ def run_hier_many(run_dirs, gpus: int | None = None, poll: int = 60, **overrides
 
 if __name__ == "__main__":
     import argparse
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
     ap.add_argument("--settings", default="{}")

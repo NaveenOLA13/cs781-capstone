@@ -1,14 +1,5 @@
-"""Ensemble several fine-tuned NER runs by averaging their token tag probabilities.
+"""Ensemble several fine-tuned NER runs by averaging their token tag probabilities."""
 
-All Phase 1 models share one BPE tokenizer, so every run's per-token probabilities (saved by
-train_ner.py as runs_ner/<run>/probs.npz) line up 1:1 and can simply be averaged, even across
-architectures (llama / decoder / moe / encdec). Then the same dev-selected post-processing.
-
-  python phase2/ensemble.py --runs runs_ner/llama_full_bidir runs_ner/llama_lorma_plus \
-         --run ens_llama2
-
-Runs must use the same dev split (same --split_seed / --dev_frac, no --train_on_all).
-"""
 import argparse
 import json
 import os
@@ -17,10 +8,10 @@ import sys
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
-from bpe import BPETokenizer                     # noqa: E402
-from phase2 import ner_data as D                 # noqa: E402
-from phase2.finalize import finalize             # noqa: E402
+sys.path[:0] = [ROOT, os.path.join(ROOT, "phase1")]
+from bpe import BPETokenizer  # noqa: E402
+from phase2 import ner_data as D  # noqa: E402
+from phase2.finalize import finalize  # noqa: E402
 
 
 def main():
@@ -30,7 +21,7 @@ def main():
     ap.add_argument("--run", required=True)
     ap.add_argument("--out_dir", default="runs_ner")
     ap.add_argument("--data_dir", default=None)
-    ap.add_argument("--tokenizer", default=os.path.join(ROOT, "tok/bpe12k/tokenizer.json"))
+    ap.add_argument("--tokenizer", default=os.path.join(ROOT, "phase1", "tok", "bpe12k", "tokenizer.json"))
     ap.add_argument("--postproc", type=int, default=1)
     a = ap.parse_args()
 
@@ -66,8 +57,23 @@ def main():
     out = os.path.join(a.out_dir, a.run)
     os.makedirs(out, exist_ok=True)
     json.dump(vars(a), open(os.path.join(out, "args.json"), "w"), indent=1)
-    finalize(dev_p, test_p, enc, tenc, texts, gold, test, train_ids, dev_ids, labels, tags, id2tag,
-             table, out, postproc=a.postproc)
+    finalize(
+        dev_p,
+        test_p,
+        enc,
+        tenc,
+        texts,
+        gold,
+        test,
+        train_ids,
+        dev_ids,
+        labels,
+        tags,
+        id2tag,
+        table,
+        out,
+        postproc=a.postproc,
+    )
 
 
 if __name__ == "__main__":

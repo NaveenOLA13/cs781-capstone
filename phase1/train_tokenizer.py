@@ -1,7 +1,5 @@
-"""Train the from-scratch byte-level BPE (bpe.py) on a balanced sample of the Phase-1 corpus.
+"""Train the from-scratch byte-level BPE (bpe.py) on a balanced sample of the Phase-1 corpus."""
 
-    python train_tokenizer.py --vocab_size 12000 --docs_per_source 2000 --stride 5 --out tok/bpe12k
-"""
 import argparse
 import os
 import time

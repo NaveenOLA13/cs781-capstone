@@ -13,14 +13,14 @@ writes character-span predictions for fold3.
 | `run_phase2.sh` | the experiment plan (4 backbones, full/LoRA/LoRMA₊/LoRMA_π/head-only, KD + control, ablations) |
 
 ## Kaggle quick start
-1. Attach: this repo (with `tok/bpe12k/tokenizer.json`), your Phase 1 `best.pt` files as a dataset, GPU T4.
+1. Attach: this repository (the tokenizer is `phase1/tok/bpe12k/tokenizer.json`), the Phase 1 `best.pt` files as a dataset, GPU T4.
 2. Add `HF_TOKEN` as a Kaggle secret (same as Phase 1).
-3. `cd /kaggle/working/cs-781 && python phase2/check_offsets.py`
+3. From the repository root: `python phase2/check_offsets.py`
 4. Smoke test: `python phase2/train_ner.py --phase1 <best.pt> --run smoke --max_docs 8 --epochs 1 --no_test`
 5. Run experiments from `run_phase2.sh` (several Kaggle notebooks in parallel to save time).
 6. Upload `runs_ner/<run>/sub/submission.zip` (prediction.json at zip root, every fold3 id).
 
-## Design notes (things to explain in the viva)
+## Design notes
 - **Offsets.** Pre-tokens carry a leading space (`" STATE"`), so token char spans are whitespace-stripped;
   whitespace-only tokens get label -100 and are skipped in decoding. Multi-byte UTF-8 handled byte→char.
   End offsets are exclusive (`[137,153,"RESP","STATE OF HARYANA"]` = 16 chars).
